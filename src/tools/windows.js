@@ -1,11 +1,8 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
-import {
-    findAppInCatalog,
-    loadAppCatalog,
-    normalizeAppName,
-} from '../windows/app-catalog.js';
-import { isTrustedAppPath } from '../windows/app-discovery.js';
+import { loadAppCatalog, normalizeAppName } from '../windows/app-catalog.js';
+import { resolveApp } from '../windows/app-resolution.js';
+import { launchResolvedApp } from '../windows/app-launcher.js';
 import { listRunningProcesses } from '../windows/processes.js';
 import { windowsAppWhitelist } from '../windows/app-whitelist.js';
 
@@ -119,28 +116,48 @@ export async function openApp({
         return failure('app_not_found', 'No se encontró esa aplicación en el catálogo local.');
     }
 
-    let appTargets = [];
     let appName = normalizedName;
+    let resolved = null;
 
     try {
         const catalog = await loadCatalog({ catalogPath });
-        const discoveredApp = findAppInCatalog(catalog, requestedName);
-
-        if (discoveredApp && isTrustedAppPath(discoveredApp.path, environment)) {
-            appTargets = [{ executable: discoveredApp.path, args: [] }];
-            appName = discoveredApp.name;
-        }
+        resolved = resolveApp(catalog, requestedName, environment);
     } catch {
         // Un catálogo que no se puede leer no impide usar la whitelist explícita.
     }
 
-    if (appTargets.length === 0) {
-        appTargets = windowsAppWhitelist[normalizedName]?.map(item => ({
-            executable: item.executable,
-            args: [...item.args],
-        })) ?? [];
+    if (resolved?.status === 'ambiguous') {
+        return {
+            ...failure('ambiguous_app', 'El nombre coincide con varias aplicaciones; especificá un nombre más preciso.'),
+            matches: resolved.matches.map(app => ({
+                name: app.name,
+                displayName: app.displayName ?? app.name,
+                source: app.source,
+            })),
+        };
     }
 
+    if (resolved?.status === 'found') {
+        appName = resolved.app.displayName ?? resolved.app.name;
+        try {
+            await launchResolvedApp(resolved.app, resolved.targetType, {
+                environment,
+                launchProcess,
+            });
+            return { success: true, app: appName, message: `Se inició ${appName}.` };
+        } catch {
+            return failure('app_launch_failed', `No se pudo iniciar ${appName}. Revisá que esté instalada.`);
+        }
+    }
+
+    if (resolved?.status === 'invalid_target') {
+        return failure('app_not_found', 'La aplicación encontrada no tiene un destino de inicio confiable.');
+    }
+
+    const appTargets = windowsAppWhitelist[normalizedName]?.map(item => ({
+        executable: item.executable,
+        args: [...item.args],
+    })) ?? [];
     if (appTargets.length === 0) {
         return failure('app_not_found', 'No se encontró esa aplicación en el catálogo local.');
     }

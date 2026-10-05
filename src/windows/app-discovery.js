@@ -8,10 +8,52 @@ import {
     saveAppCatalog,
 } from './app-catalog.js';
 import { resolveShortcutTarget } from './shortcut.js';
+import { discoverAppxApps } from './appx-discovery.js';
 
 const maxShortcutFiles = 2_000;
 const maxFolderDepth = 8;
 const maxShortcutSize = 1024 * 1024;
+
+function identityForApp(app) {
+    if (typeof app?.appUserModelId === 'string') return `appx:${app.appUserModelId.toLowerCase()}`;
+    if (typeof app?.path === 'string') return `lnk:${path.win32.resolve(app.path).toLowerCase()}`;
+    return null;
+}
+
+export function mergeDiscoveredApps(...sources) {
+    const byIdentity = new Map();
+    for (const apps of sources) {
+        for (const app of apps ?? []) {
+            const key = identityForApp(app);
+            if (!key) continue;
+            const existing = byIdentity.get(key);
+            if (!existing) {
+                const normalized = {
+                    ...app,
+                    aliases: [...new Set(Array.isArray(app.aliases) ? app.aliases : [])],
+                };
+                if (Array.isArray(app.processNames)) {
+                    normalized.processNames = [...new Set(app.processNames)];
+                }
+                byIdentity.set(key, normalized);
+                continue;
+            }
+            existing.aliases = [...new Set([
+                ...existing.aliases,
+                ...(Array.isArray(app.aliases) ? app.aliases : []),
+                app.name,
+                app.displayName,
+            ].filter(Boolean))];
+            existing.processNames = [...new Set([
+                ...existing.processNames,
+                ...(Array.isArray(app.processNames) ? app.processNames : []),
+            ])];
+        }
+    }
+    return [...byIdentity.values()].sort((left, right) =>
+        (left.displayName ?? left.name).localeCompare(right.displayName ?? right.name)
+    );
+}
 
 function getStartMenuDirectories(environment) {
     const programData = environment.ProgramData ?? 'C:\\ProgramData';
@@ -130,6 +172,7 @@ export async function discoverApps({
     catalogPath = appCatalogPath,
     loadCatalog = loadAppCatalog,
     saveCatalog = saveAppCatalog,
+    readAppxApps = discoverAppxApps,
 } = {}) {
     if (platform !== 'win32') {
         return {
@@ -209,11 +252,16 @@ export async function discoverApps({
             });
         }
 
-        const apps = [...discoveredByPath.values()].sort((left, right) =>
-            left.name.localeCompare(right.name)
-        );
-        const oldPaths = new Set(previousCatalog.apps.map(app => app.path.toLowerCase()));
-        const newCount = apps.filter(app => !oldPaths.has(app.path.toLowerCase())).length;
+        const shortcutApps = [...discoveredByPath.values()];
+        const appxResult = await readAppxApps({ platform, environment });
+        // If AppX inventory temporarily fails, retain the last known modern apps.
+        // A successful empty inventory is meaningful and removes stale entries.
+        const appxApps = appxResult.success
+            ? appxResult.apps
+            : previousCatalog.apps.filter(app => app.source === 'appx');
+        const apps = mergeDiscoveredApps(shortcutApps, appxApps);
+        const oldIdentities = new Set(previousCatalog.apps.map(identityForApp).filter(Boolean));
+        const newCount = apps.filter(app => !oldIdentities.has(identityForApp(app))).length;
         await saveCatalog(apps, { catalogPath });
 
         return {

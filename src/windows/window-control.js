@@ -4,7 +4,7 @@ import {
     loadAppCatalog,
     normalizeAppName,
 } from './app-catalog.js';
-import { isTrustedAppPath } from './app-discovery.js';
+import { resolveApp } from './app-resolution.js';
 import { windowsAppWhitelist } from './app-whitelist.js';
 import { listRunningProcesses } from './processes.js';
 
@@ -270,25 +270,22 @@ function targetApplication(requestedName, catalog, environment = process.env) {
         return { kind: 'application', name: builtIn[0], processNames };
     }
 
-    const apps = Array.isArray(catalog?.apps) ? catalog.apps : [];
-    const aliasesFor = app => [app.name, ...(Array.isArray(app.aliases) ? app.aliases : [])];
-    const byAlias = app => aliasesFor(app).some(alias => normalizeAppName(alias) === query);
-    let matches = apps.filter(byAlias);
-    if (matches.length === 0 && query) {
-        matches = apps.filter(app => aliasesFor(app)
-            .some(alias => normalizeAppName(alias).startsWith(`${query} `)));
-    }
-    if (matches.length > 1) return { kind: 'ambiguous_application' };
-    if (
-        matches.length === 1 &&
-        typeof matches[0].path === 'string' &&
-        isTrustedAppPath(matches[0].path, environment)
-    ) {
-        return {
-            kind: 'application',
-            name: matches[0].name,
-            processNames: [path.win32.basename(matches[0].path).toLowerCase()],
-        };
+    const resolved = resolveApp(catalog, requestedName, environment);
+    if (resolved.status === 'ambiguous') return { kind: 'ambiguous_application' };
+    if (resolved.status === 'found') {
+        const app = resolved.app;
+        const processNames = Array.isArray(app.processNames) ? [...app.processNames] : [];
+        if (processNames.length === 0 && typeof app.path === 'string') {
+            processNames.push(path.win32.basename(app.path).toLowerCase());
+        }
+        // The manifest executable is metadata only; its basename is used solely
+        // to compare against the operating system's already-running process list.
+        if (processNames.length === 0 && typeof app.executable === 'string') {
+            const executableName = path.win32.basename(app.executable);
+            if (/^[^\\/:]+\.exe$/iu.test(executableName)) processNames.push(executableName.toLowerCase());
+        }
+        if (processNames.length === 0) return { kind: 'process_identity_unavailable', name: app.name };
+        return { kind: 'application', name: app.displayName ?? app.name, processNames };
     }
     return null;
 }
@@ -345,6 +342,13 @@ export async function isAppRunning({
             application?.kind === 'ambiguous_application'
                 ? 'El nombre coincide con varias aplicaciones del catálogo.'
                 : 'No se encontró esa aplicación en el catálogo ni en la lista conocida.'
+        );
+    }
+
+    if (application.kind === 'process_identity_unavailable') {
+        return failure(
+            'process_identity_unavailable',
+            'Se encontró la aplicación, pero Windows no expone un proceso asociado para comprobar si está abierta.'
         );
     }
 

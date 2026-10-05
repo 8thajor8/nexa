@@ -62,25 +62,40 @@ export function normalizeAppName(value) {
         .replace(/\s+app$/u, '');
 }
 
-export function findAppInCatalog(catalog, requestedName) {
+export function resolveAppInCatalog(catalog, requestedName) {
     const query = normalizeAppName(requestedName);
 
     if (!query) {
-        return null;
+        return { status: 'not_found', app: null, matches: [] };
     }
 
-    const matches = catalog.apps.filter(app =>
-        [app.name, ...(Array.isArray(app.aliases) ? app.aliases : [])]
+    const apps = Array.isArray(catalog?.apps) ? catalog.apps : [];
+    const namesFor = app => [app.name, app.displayName, ...(Array.isArray(app.aliases) ? app.aliases : [])];
+    const uniqueApps = matches => [...new Map(matches.map(app => [app, app])).values()];
+    const matches = uniqueApps(apps.filter(app =>
+        namesFor(app)
             .some(alias => normalizeAppName(alias) === query)
-    );
+    ));
 
-    if (matches.length === 1) return matches[0];
-    if (matches.length > 1) return null;
+    if (matches.length === 1) return { status: 'found', app: matches[0], matches };
+    if (matches.length > 1) return { status: 'ambiguous', app: null, matches };
 
-    const prefixMatches = catalog.apps.filter(app =>
-        [app.name, ...(Array.isArray(app.aliases) ? app.aliases : [])]
-            .some(alias => normalizeAppName(alias).startsWith(`${query} `))
-    );
+    const prefixMatches = uniqueApps(apps.filter(app =>
+        namesFor(app)
+            .some(alias => normalizeAppName(alias).startsWith(query))
+    ));
 
-    return prefixMatches.length === 1 ? prefixMatches[0] : null;
+    if (prefixMatches.length === 1) {
+        return { status: 'found', app: prefixMatches[0], matches: prefixMatches };
+    }
+    return {
+        status: prefixMatches.length > 1 ? 'ambiguous' : 'not_found',
+        app: null,
+        matches: prefixMatches,
+    };
+}
+
+export function findAppInCatalog(catalog, requestedName) {
+    const result = resolveAppInCatalog(catalog, requestedName);
+    return result.status === 'found' ? result.app : null;
 }

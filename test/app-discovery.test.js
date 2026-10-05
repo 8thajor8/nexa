@@ -96,6 +96,7 @@ test('discover_apps builds and persists a structured catalogue from Start Menu s
             directories: [startMenu],
             fileSystem,
             catalogPath,
+            readAppxApps: async () => ({ success: true, apps: [] }),
         });
         const catalog = await loadAppCatalog({ catalogPath, read: readFile });
 

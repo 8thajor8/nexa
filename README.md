@@ -17,11 +17,17 @@ Pedile a Nexa el clima de una ciudad, por ejemplo: “¿Qué tiempo hace en Barc
 Nexa incluye herramientas controladas para interactuar con Windows:
 
 - `open_app` abre una aplicación por nombre lógico, desde el catálogo local o la whitelist explícita.
-- `discover_apps` actualiza el catálogo leyendo accesos directos `.lnk` del menú Inicio del usuario y del equipo. Solo inspecciona esas carpetas conocidas; no escanea el disco ni ejecuta aplicaciones o scripts.
+- `discover_apps` actualiza el catálogo unificado leyendo accesos directos `.lnk` del menú Inicio y aplicaciones AppX/MSIX registradas. Solo inspecciona ubicaciones e identidades conocidas por Windows; no escanea el disco ni inicia aplicaciones durante el discovery.
 - `open_url` abre solo URLs absolutas `http://` o `https://` en el navegador predeterminado.
 - `get_open_apps` consulta el snapshot de procesos de Windows mediante Tool Help y devuelve como máximo 100 procesos con nombre y PID.
 
-El catálogo se guarda localmente en `data/apps.json` y está excluido de Git porque contiene rutas del equipo. `discover_apps` lo reconstruye; `open_app` normaliza nombres y aliases, busca coincidencias exactas o un prefijo que identifique una sola aplicación, y ejecuta el destino almacenado sin argumentos proporcionados por el modelo. Para aplicaciones descubiertas solo se aceptan ejecutables bajo ubicaciones normales de instalación (Program Files, LocalAppData/Programs o ProgramData); se descartan intérpretes y rutas fuera de esas ubicaciones. GPT recibe nombres lógicos, nunca las rutas ejecutables.
+### Unified Windows App Discovery
+
+`data/apps.json` es un catálogo generado/cacheado por `discover_apps`, no una lista mantenida manualmente. Mantiene el origen de cada entrada (`common_start_menu`, `user_start_menu` o `appx`) y los metadatos necesarios para localizarla y, cuando es posible, relacionarla con su proceso. Si la consulta AppX falla temporalmente, el catálogo conserva las entradas AppX ya conocidas y actualiza los accesos directos; una consulta exitosa sin resultados elimina las entradas modernas obsoletas.
+
+`open_app` normaliza nombres, display names y aliases, resuelve coincidencias exactas o un prefijo inequívoco, y devuelve `ambiguous_app` con las opciones cuando hay varias coincidencias. Las aplicaciones tradicionales se inician solo si su ejecutable está bajo ubicaciones confiables. Las aplicaciones AppX/MSIX se inician a través de Explorer con un AppUserModelId validado. El inventario AppX usa una consulta fija y controlada de Windows, sin parámetros del modelo; el ejecutable de un manifiesto solo se usa como metadata para relacionar procesos y nunca como destino de lanzamiento.
+
+GPT recibe únicamente el nombre lógico de la aplicación. No hay shell arbitrario, PowerShell genérico, rutas de lanzamiento ni argumentos libres proporcionados por el modelo.
 
 La whitelist de `src/windows/app-whitelist.js` sigue siendo un fallback para `chrome`, `edge`, `notepad`, `calculator`, `explorer`, `spotify` y `discord`. Para agregar otra aplicación explícita, agregá su nombre lógico y una ruta fija bajo `windowsAppWhitelist`; mantené sus argumentos fijos y escritos en el código.
 
