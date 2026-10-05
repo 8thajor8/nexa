@@ -5,12 +5,16 @@ export const toolPermissions = Object.freeze({
     forget: 'write',
     get_weather: 'external_read',
     web_search: 'external_read',
+    open_app: 'action',
+    open_url: 'action',
+    get_open_apps: 'read',
 });
 
 export const defaultPermissionPolicy = Object.freeze({
     read: true,
     external_read: true,
     write: true,
+    action: true,
     destructive: false,
 });
 

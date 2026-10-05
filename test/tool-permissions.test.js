@@ -16,6 +16,9 @@ test('existing local tools declare their intended permissions', () => {
         forget: 'write',
         get_weather: 'external_read',
         web_search: 'external_read',
+        open_app: 'action',
+        open_url: 'action',
+        get_open_apps: 'read',
     });
 
     for (const registration of localToolRegistry.values()) {
@@ -29,6 +32,8 @@ test('the default policy allows current permissions and denies unknown ones', ()
         assert.equal(checkToolPermission(registration).allowed, true);
     }
     assert.equal(checkToolPermission({ permission: 'destructive' }).allowed, false);
+    assert.equal(defaultPermissionPolicy.action, true);
+    assert.equal(defaultPermissionPolicy.destructive, false);
 
     assert.deepEqual(
         checkToolPermission({ permission: 'not_configured' }),

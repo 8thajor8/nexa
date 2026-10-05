@@ -4,6 +4,11 @@ import { recallRegistration } from './recall.js';
 import { forgetRegistration } from './forget.js';
 import { getWeatherRegistration } from './weather.js';
 import {
+    getOpenAppsRegistration,
+    openAppRegistration,
+    openUrlRegistration,
+} from './windows.js';
+import {
     checkToolPermission,
     defaultPermissionPolicy,
     toolPermissions,
@@ -15,6 +20,9 @@ const localRegistrations = [
     recallRegistration,
     forgetRegistration,
     getWeatherRegistration,
+    openAppRegistration,
+    openUrlRegistration,
+    getOpenAppsRegistration,
 ].map(registration => ({
     ...registration,
     permission: toolPermissions[registration.definition.name],
