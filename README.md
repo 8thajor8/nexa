@@ -82,6 +82,14 @@ UI Automation y Window Management comparten `matchWindows` sobre el mismo snapsh
 
 Para depurar el ciclo de referencias durante el desarrollo, activar `NEXA_UI_AUTOMATION_DEBUG=true`. Los diagnósticos incluyen la herramienta, el tipo de operación, el resultado y el motivo de invalidación; al escribir texto registran solo su longitud, nunca el contenido.
 
+### WhatsApp Desktop
+
+La integración específica está en `src/integrations/whatsapp/`. `whatsapp_open_chat` abre o enfoca WhatsApp, busca el contacto, abre el resultado único y verifica el nombre accesible del encabezado. `whatsapp_prepare_message` repite esa verificación, localiza el composer, comprueba que esté vacío y deja el texto como borrador. Informa `sent: false` y el flujo no busca ni invoca el control Enviar.
+
+El contacto y los controles se resuelven por metadatos UI Automation (tipo, nombre, AutomationId, patrón soportado y contexto accesible), con variantes en español e inglés. Si la búsqueda o identidad del chat es ambigua, no actúa. Los borradores existentes no se sobrescriben; la respuesta incluye su longitud, sin exponer el contenido. La app debe aparecer en el catálogo local de `discover_apps`. La interfaz de WhatsApp puede cambiar y los controles no accesibles producen un error seguro. La interacción requiere Windows y WhatsApp Desktop abierto o instalado.
+
+**Sending messages is intentionally not implemented yet.** No existe una tool de envío; esta etapa solo prepara borradores. La integración usa el catálogo, Window Management y el proveedor fijo de UI Automation. No acepta HWND/PID del modelo y no usa coordenadas, OCR, shell, PowerShell arbitrario, teclado ni portapapeles.
+
 El agente cuenta como máximo cinco rondas que solicitan herramientas (`maxToolIterations`). Si la quinta ronda usa herramientas, se permite un turno final del modelo con las herramientas deshabilitadas para redactar la respuesta; ese turno no puede ejecutar otra acción. `NEXA_AGENT_DEBUG=true` registra número de ronda, herramienta, resumen seguro de argumentos, resultado y tipo de respuesta del modelo sin imprimir valores de texto.
 
 Las pruebas automatizadas usan un proveedor simulado y no requieren aplicaciones abiertas. Para validarlo localmente, ejecutá `npm start`, abrí Calculator o Notepad, pedile a Nexa `inspeccioná los controles de Notepad`, y probá después `buscá el campo de edición de Notepad` o `leé el valor de ui_1` usando la referencia que Nexa haya recibido. La inspección real requiere una sesión interactiva de Windows y una aplicación abierta.

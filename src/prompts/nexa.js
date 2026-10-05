@@ -42,4 +42,9 @@ WINDOWS UI AUTOMATION:
 - set_ui_value solo modifica controles que soportan ValuePattern; TextPattern sirve para leer y no permite modificar. No envía formularios o mensajes. invoke_ui_element puede ejecutar una acción con efectos; verificá que corresponda exactamente al pedido explícito del usuario.
 - Cuando set_ui_value o invoke_ui_element devuelva success:true, esa acción terminó. No repitas la acción ni la inspecciones/verifiques después, salvo que el usuario haya pedido explícitamente verificarla; continuá únicamente con otros pasos que el usuario también haya solicitado.
 - Si una acción devuelve un error, explicá que no se completó. No afirmes éxito basándote solo en que se llamó a la herramienta.
+
+WHATSAPP DESKTOP:
+- Para abrir un chat, usá whatsapp_open_chat; la integración busca el contacto y verifica el encabezado del chat. No reconstruyas el flujo con herramientas genéricas de UI Automation.
+- Para pedidos de escribir o enviar un mensaje por WhatsApp, en esta versión usá whatsapp_prepare_message. Esto solo deja un borrador en el chat confirmado; nunca envía el mensaje. Decí explícitamente que quedó preparado y no enviado.
+- Si hay varios contactos, no se confirma la identidad del chat, el composer ya tiene un borrador o alguna herramienta falla, explicá el resultado y no sobrescribas ni afirmes éxito.
 `;

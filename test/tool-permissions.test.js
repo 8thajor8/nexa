@@ -41,6 +41,8 @@ test('existing local tools declare their intended permissions', () => {
         invoke_ui_element: 'action',
         set_ui_value: 'action',
         get_ui_value: 'read',
+        whatsapp_open_chat: 'action',
+        whatsapp_prepare_message: 'action',
         spotify_get_current_track: 'external_read',
         spotify_search: 'external_read',
         spotify_get_devices: 'external_read',

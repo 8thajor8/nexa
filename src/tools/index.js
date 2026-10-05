@@ -4,6 +4,7 @@ import { recallRegistration } from './recall.js';
 import { forgetRegistration } from './forget.js';
 import { getWeatherRegistration } from './weather.js';
 import { spotifyRegistrations } from './spotify.js';
+import { whatsappRegistrations } from '../integrations/whatsapp/index.js';
 import {
     closeWindowRegistration,
     focusWindowRegistration,
@@ -61,6 +62,7 @@ const localRegistrations = [
     restoreWindowRegistration,
     closeWindowRegistration,
     ...uiAutomationRegistrations,
+    ...whatsappRegistrations,
     ...spotifyRegistrations,
 ].map(registration => ({
     ...registration,
