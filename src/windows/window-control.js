@@ -14,6 +14,7 @@ const showNormal = 1;
 const showMinimized = 6;
 const showMaximized = 3;
 const windowMessageClose = 0x0010;
+const modernWindowHostProcesses = new Set(['applicationframehost.exe', 'wwahost.exe']);
 
 function failure(code, message, extra = {}) {
     return { success: false, error: { code, message }, ...extra };
@@ -267,7 +268,7 @@ function targetApplication(requestedName, catalog, environment = process.env) {
     if (builtIn) {
         const processNames = builtIn[1].map(item => path.win32.basename(item.executable).toLowerCase());
         if (processNames.length === 0) processNames.push(`${query.replace(/\s+/gu, '')}.exe`);
-        return { kind: 'application', name: builtIn[0], processNames };
+        return { kind: 'application', name: builtIn[0], processNames, modernWindowTitles: [builtIn[0]] };
     }
 
     const resolved = resolveApp(catalog, requestedName, environment);
@@ -284,8 +285,11 @@ function targetApplication(requestedName, catalog, environment = process.env) {
             const executableName = path.win32.basename(app.executable);
             if (/^[^\\/:]+\.exe$/iu.test(executableName)) processNames.push(executableName.toLowerCase());
         }
-        if (processNames.length === 0) return { kind: 'process_identity_unavailable', name: app.name };
-        return { kind: 'application', name: app.displayName ?? app.name, processNames };
+        const isAppx = app.source === 'appx';
+        const modernWindowTitles = isAppx
+            ? [app.displayName, app.name, app.packageName, ...(Array.isArray(app.aliases) ? app.aliases : [])].filter(Boolean)
+            : [];
+        return { kind: 'application', name: app.displayName ?? app.name, processNames, modernWindowTitles };
     }
     return null;
 }
@@ -298,7 +302,14 @@ export function matchWindows(windows, target, catalog, environment = process.env
 
     if (application) {
         const processNames = new Set(application.processNames);
-        const matches = windows.filter(window => processNames.has(window.process.toLowerCase()));
+        const modernWindowTitles = new Set(application.modernWindowTitles.map(normalizeAppName));
+        const matches = windows.filter(window => {
+            const process = String(window.process ?? '').toLowerCase();
+            if (processNames.has(process)) return true;
+            if (modernWindowTitles.size === 0) return false;
+            if (!modernWindowHostProcesses.has(process)) return false;
+            return modernWindowTitles.has(normalizeAppName(window.title));
+        });
         return { kind: 'application', app: application.name, matches };
     }
 
@@ -322,6 +333,7 @@ export async function isAppRunning({
     loadCatalog = loadAppCatalog,
     catalogPath,
     environment = process.env,
+    readSnapshot = readWindowsSnapshot,
 } = {}) {
     if (platform !== 'win32') {
         return failure('unsupported_platform', 'is_app_running solo está disponible en Windows.');
@@ -345,17 +357,24 @@ export async function isAppRunning({
         );
     }
 
-    if (application.kind === 'process_identity_unavailable') {
-        return failure(
-            'process_identity_unavailable',
-            'Se encontró la aplicación, pero Windows no expone un proceso asociado para comprobar si está abierta.'
-        );
-    }
-
     const processNames = new Set(application.processNames);
-    const processes = processResult.processes.filter(processInfo =>
+    let processes = processResult.processes.filter(processInfo =>
         processNames.has(processInfo.name.toLowerCase())
     );
+    if (processes.length === 0) {
+        let snapshot;
+        try {
+            snapshot = await readSnapshot({ platform, listProcesses });
+        } catch {
+            snapshot = null;
+        }
+        if (snapshot?.success) {
+            const windowMatch = matchWindows(snapshot.windows, requested, catalog, environment);
+            if (windowMatch.kind === 'application' && windowMatch.matches.length > 0) {
+                processes = windowMatch.matches.map(window => ({ name: window.process, pid: window.pid }));
+            }
+        }
+    }
     return {
         success: true,
         running: processes.length > 0,

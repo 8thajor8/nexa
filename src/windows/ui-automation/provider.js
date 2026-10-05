@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadAppCatalog } from '../app-catalog.js';
-import { matchWindows, readWindowsSnapshot, isAppRunning } from '../window-control.js';
+import { matchWindows, readWindowsSnapshot } from '../window-control.js';
 
 const providerScript = fileURLToPath(new URL('./uia-provider.ps1', import.meta.url));
 const maxOutputBytes = 1_000_000;
@@ -13,23 +13,14 @@ function failure(code, message) {
 
 export async function resolveAppWindow(app, {
     platform = process.platform,
-    checkRunning = isAppRunning,
     readSnapshot = readWindowsSnapshot,
     loadCatalog = loadAppCatalog,
+    environment = process.env,
 } = {}) {
     if (platform !== 'win32') return failure('ui_automation_unavailable', 'La automatización UI solo está disponible en Windows.');
     if (typeof app !== 'string' || !app.trim() || app.length > 120 || /[\u0000-\u001f\u007f]/u.test(app)) {
         return failure('invalid_app', 'Indicá el nombre de una aplicación conocida.');
     }
-
-    let running;
-    try {
-        running = await checkRunning({ args: { app: app.trim() }, platform });
-    } catch {
-        return failure('app_not_running', 'No se pudo comprobar si la aplicación está abierta.');
-    }
-    if (!running?.success) return running ?? failure('app_not_running', 'No se pudo comprobar si la aplicación está abierta.');
-    if (!running.running) return failure('app_not_running', `La aplicación «${app.trim()}» no está abierta.`);
 
     let snapshot;
     try {
@@ -45,11 +36,14 @@ export async function resolveAppWindow(app, {
     } catch {
         catalog = { version: 1, apps: [] };
     }
-    const match = matchWindows(snapshot.windows, app.trim(), catalog);
+    const match = matchWindows(snapshot.windows, app.trim(), catalog, environment);
     if (match.kind === 'ambiguous' || match.matches.length > 1) {
         return failure('ambiguous_window', 'Hay varias ventanas de esa aplicación; cerrá o seleccioná una para continuar.');
     }
-    if (match.matches.length === 0) return failure('window_not_found', `No se encontró una ventana visible para «${app.trim()}».`);
+    if (match.kind !== 'application') {
+        return failure('app_not_found', 'La UI Automation solo puede resolver una aplicación conocida del catálogo o la lista segura.');
+    }
+    if (match.matches.length === 0) return failure('app_not_running', `No se encontró una ventana abierta para «${app.trim()}».`);
     return { success: true, app: match.app ?? app.trim(), window: match.matches[0] };
 }
 

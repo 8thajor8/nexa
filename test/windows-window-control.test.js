@@ -87,6 +87,7 @@ test('is_app_running returns a structured false result and rejects unknown names
     const notRunning = await isAppRunning({
         args: { app: 'Spotify' }, platform: 'win32', loadCatalog,
         listProcesses: async () => taskList([{ name: 'chrome.exe', pid: 42 }]),
+        readSnapshot: async () => ({ success: true, windows: [] }),
     });
     assert.deepEqual(notRunning, {
         success: true, running: false, app: 'spotify', processes: [],
@@ -98,6 +99,40 @@ test('is_app_running returns a structured false result and rejects unknown names
     });
     assert.equal(unknown.success, false);
     assert.equal(unknown.error.code, 'app_not_found');
+});
+
+test('is_app_running recognizes an AppX app when its visible window belongs to the generic frame host', async () => {
+    const app = {
+        name: 'Example Notes', displayName: 'Example Notes', aliases: ['Notes'], source: 'appx',
+        appUserModelId: 'Example.Package_123abc!App', launchable: true, processNames: ['notes.exe'],
+    };
+    const result = await isAppRunning({
+        args: { app: 'Notes' },
+        platform: 'win32',
+        loadCatalog: async () => ({ version: 1, apps: [app] }),
+        listProcesses: async () => taskList([{ name: 'ApplicationFrameHost.exe', pid: 404 }]),
+        readSnapshot: async () => ({ success: true, windows: [{
+            id: '0x454', title: 'Example Notes', process: 'ApplicationFrameHost.exe', pid: 404,
+        }] }),
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.running, true);
+    assert.deepEqual(result.processes, [{ name: 'ApplicationFrameHost.exe', pid: 404 }]);
+});
+
+test('is_app_running and UI Automation share the built-in modern-window matcher', async () => {
+    const result = await isAppRunning({
+        args: { app: 'Calculator' },
+        platform: 'win32',
+        loadCatalog: async () => ({ version: 1, apps: [] }),
+        listProcesses: async () => taskList([{ name: 'ApplicationFrameHost.exe', pid: 505 }]),
+        readSnapshot: async () => ({ success: true, windows: [{
+            id: '0x505', title: 'Calculator', process: 'ApplicationFrameHost.exe', pid: 505,
+        }] }),
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.running, true);
+    assert.equal(result.processes[0].name, 'ApplicationFrameHost.exe');
 });
 
 test('is_app_running resolves discovered apps through the existing catalog', async () => {

@@ -3,7 +3,7 @@ import test from 'node:test';
 import { createUiAutomation, defaultUiLimits } from '../src/windows/ui-automation/elements.js';
 import { executeTool, localToolRegistry } from '../src/tools/index.js';
 import { defaultPermissionPolicy, toolPermissions } from '../src/tools/permissions.js';
-import { resolveAppWindow, runWindowsUiAutomation } from '../src/windows/ui-automation/provider.js';
+import { inspectAppUi, resolveAppWindow, runWindowsUiAutomation } from '../src/windows/ui-automation/provider.js';
 
 function sampleElement(overrides = {}) {
     return {
@@ -180,19 +180,95 @@ test('UI Automation tools are registered with read/action permissions and permis
 test('app resolution requires a running known application and the native provider is Windows-only', async () => {
     const notRunning = await resolveAppWindow('Notepad', {
         platform: 'win32',
-        checkRunning: async () => ({ success: true, running: false }),
+        readSnapshot: async () => ({ success: true, windows: [] }),
+        loadCatalog: async () => ({ version: 1, apps: [] }),
     });
     assert.equal(notRunning.error.code, 'app_not_running');
     const unavailable = await runWindowsUiAutomation({ operation: 'inspect', windowHandle: '0x1' }, { platform: 'linux' });
     assert.equal(unavailable.error.code, 'ui_automation_unavailable');
 });
 
+test('UI app resolution finds a traditional Win32 window by its known executable', async () => {
+    const window = { id: '0x234', _handle: 0x234n, title: 'Project - Ableton Live', process: 'ableton live.exe', pid: 88 };
+    const result = await resolveAppWindow('Ableton', {
+        platform: 'win32',
+        readSnapshot: async () => ({ success: true, windows: [window] }),
+        loadCatalog: async () => ({ version: 1, apps: [{
+            name: 'Ableton Live 12', aliases: ['Ableton'], path: 'C:\\Program Files\\Ableton\\Live 12\\Ableton Live.exe',
+        }] }),
+        environment: { ProgramFiles: 'C:\\Program Files' },
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.window._handle, 0x234n);
+});
+
+test('modern AppX identity resolves its ApplicationFrameHost-owned window by exact known title', async () => {
+    const app = {
+        name: 'Example Notes', displayName: 'Example Notes', aliases: ['Notes'], packageName: 'Example.Package',
+        source: 'appx', appUserModelId: 'Example.Package_123abc!App', launchable: true,
+        processNames: ['example-notes.exe'],
+    };
+    const window = { id: '0x345', _handle: 0x345n, title: 'Example Notes', process: 'ApplicationFrameHost.exe', pid: 99 };
+    const result = await resolveAppWindow('Notes', {
+        platform: 'win32',
+        readSnapshot: async () => ({ success: true, windows: [window] }),
+        loadCatalog: async () => ({ version: 1, apps: [app] }),
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.window._handle, 0x345n);
+    assert.equal(result.app, 'Example Notes');
+});
+
+test('the built-in Calculator alias resolves a modern frame-host window without process-name equality', async () => {
+    const window = { id: '0x789', _handle: 0x789n, title: 'Calculator', process: 'ApplicationFrameHost.exe', pid: 121 };
+    const result = await resolveAppWindow('Calculator', {
+        platform: 'win32',
+        readSnapshot: async () => ({ success: true, windows: [window] }),
+        loadCatalog: async () => ({ version: 1, apps: [] }),
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.window._handle, 0x789n);
+});
+
+test('the resolved modern window handle is passed to the fixed UI Automation provider', async () => {
+    let request;
+    const window = { id: '0xabc', _handle: 0xabcn, title: 'Example Notes', process: 'ApplicationFrameHost.exe', pid: 99 };
+    const result = await inspectAppUi('Example Notes', {
+        windowOptions: {
+            platform: 'win32',
+            readSnapshot: async () => ({ success: true, windows: [window] }),
+            loadCatalog: async () => ({ version: 1, apps: [{
+                name: 'Example Notes', displayName: 'Example Notes', aliases: [], source: 'appx',
+                appUserModelId: 'Example.Package_123abc!App', launchable: true, processNames: ['different.exe'],
+            }] }),
+        },
+        provider: async value => { request = value; return { success: true, elements: [], truncated: false }; },
+    });
+    assert.equal(result.success, true);
+    assert.equal(request.operation, 'inspect');
+    assert.equal(request.windowHandle, '0xabc');
+});
+
+test('modern app window ambiguity is preserved instead of choosing a matching title', async () => {
+    const app = {
+        name: 'Example Notes', displayName: 'Example Notes', source: 'appx',
+        appUserModelId: 'Example.Package_123abc!App', launchable: true, processNames: ['notes.exe'],
+    };
+    const windows = [
+        { id: '0x1', _handle: 1n, title: 'Example Notes', process: 'ApplicationFrameHost.exe', pid: 10 },
+        { id: '0x2', _handle: 2n, title: 'Example Notes', process: 'ApplicationFrameHost.exe', pid: 11 },
+    ];
+    const result = await resolveAppWindow('Example Notes', {
+        platform: 'win32', readSnapshot: async () => ({ success: true, windows }),
+        loadCatalog: async () => ({ version: 1, apps: [app] }),
+    });
+    assert.equal(result.error.code, 'ambiguous_window');
+});
+
 test('app resolution reuses known process/window matching and rejects multiple windows', async () => {
-    const checkRunning = async () => ({ success: true, running: true });
     const window = { id: '0x123', _handle: 0x123n, title: 'Untitled - Notepad', process: 'notepad.exe', pid: 44 };
     const resolve = async windows => resolveAppWindow('Notepad', {
         platform: 'win32',
-        checkRunning,
         readSnapshot: async () => ({ success: true, windows }),
         loadCatalog: async () => ({ version: 1, apps: [] }),
     });
