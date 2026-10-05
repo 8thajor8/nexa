@@ -1,5 +1,4 @@
-import { openWhatsAppChat } from './navigation.js';
-import { prepareWhatsAppMessage } from './composer.js';
+import { openWhatsAppChat, prepareWhatsAppMessage, getWhatsAppBridgeStatus } from './bridge/index.js';
 
 function functionTool(name, description, properties) {
     return {
@@ -38,6 +37,12 @@ export const whatsappPrepareMessageTool = functionTool(
     },
 );
 
+export const whatsappGetStatusTool = functionTool(
+    'whatsapp_get_status',
+    'Devuelve solo el estado de conexión de WhatsApp Web; nunca credenciales ni datos de sesión.',
+    {},
+);
+
 export const whatsappRegistrations = [
     {
         definition: whatsappOpenChatTool,
@@ -47,5 +52,6 @@ export const whatsappRegistrations = [
             return { success: true, completed: true, contact: opened.contact, chatOpened: true, sent: false };
         },
     },
-    { definition: whatsappPrepareMessageTool, execute: prepareWhatsAppMessage },
+    { definition: whatsappPrepareMessageTool, execute: async ({ args } = {}) => prepareWhatsAppMessage(args?.contact, args?.message) },
+    { definition: whatsappGetStatusTool, execute: getWhatsAppBridgeStatus },
 ];

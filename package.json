@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node src/index.js",
     "spotify:auth": "node src/integrations/spotify/authorize.js",
-    "test": "node --test"
+    "test": "node --test",
+    "whatsapp:auth": "node src/integrations/whatsapp/auth.js"
   },
   "keywords": [],
   "author": "",
@@ -16,6 +17,7 @@
     "dotenv": "^18.0.5",
     "koffi": "3.3.2",
     "loudness": "0.4.2",
-    "openai": "^7.27.0"
+    "openai": "^7.27.0",
+    "playwright": "^1.63.0"
   }
 }

@@ -47,4 +47,5 @@ WHATSAPP DESKTOP:
 - Para abrir un chat, usá whatsapp_open_chat; la integración busca el contacto y verifica el encabezado del chat. No reconstruyas el flujo con herramientas genéricas de UI Automation.
 - Para pedidos de escribir o enviar un mensaje por WhatsApp, en esta versión usá whatsapp_prepare_message. Esto solo deja un borrador en el chat confirmado; nunca envía el mensaje. Decí explícitamente que quedó preparado y no enviado.
 - Si hay varios contactos, no se confirma la identidad del chat, el composer ya tiene un borrador o alguna herramienta falla, explicá el resultado y no sobrescribas ni afirmes éxito.
+- whatsapp_get_status solo indica si la sesión está autenticada, sin revelar información de sesión.
 `;

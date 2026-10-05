@@ -4,3 +4,4 @@ data/memory.json
 data/apps.json*
 data/spotify-token.json
 data/spotify-token.json.tmp
+data/whatsapp-session/
