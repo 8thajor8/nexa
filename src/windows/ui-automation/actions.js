@@ -33,15 +33,15 @@ export const inspectUiTool = functionTool('inspect_ui',
         maxTextLength: { type: 'integer', minimum: 20, maximum: 300, description: 'Máximo de caracteres de nombre (usar 160 normalmente).' },
     });
 export const findUiElementTool = functionTool('find_ui_element',
-    'Busca determinísticamente un control accesible. Dejá vacíos los criterios que no uses; si hay ambigüedad, agregá criterios.', {
+    'Resuelve en una sola consulta un control accesible por criterios determinísticos y devuelve una referencia ui_* lista para usar. No hace falta llamar antes a inspect_ui cuando ya sabés qué control buscás. Dejá vacíos los criterios que no uses; si hay ambigüedad, agregá criterios.', {
         app: appProperty,
         name: { type: 'string', maxLength: 160, description: 'Nombre total o parcial; cadena vacía para omitir.' },
         controlType: { type: 'string', maxLength: 80, description: 'Tipo como Button, Edit o ListItem; cadena vacía para omitir.' },
         automationId: { type: 'string', maxLength: 160, description: 'AutomationId exacto; cadena vacía para omitir.' },
     });
-export const focusUiElementTool = functionTool('focus_ui_element', 'Enfoca un control accesible previamente inspeccionado.', { ref: refProperty });
-export const invokeUiElementTool = functionTool('invoke_ui_element', 'Invoca el patrón accesible de acción de un control. La acción puede tener efectos; inspeccioná antes de invocarla.', { ref: refProperty });
-export const setUiValueTool = functionTool('set_ui_value', 'Establece texto en un control editable que soporte el patrón Value. Esto solo escribe; no envía formularios ni mensajes.', {
+export const focusUiElementTool = functionTool('focus_ui_element', 'Enfoca un control accesible previamente resuelto. Usalo solo si el usuario pidió enfocar el control; no es necesario antes de invoke_ui_element o set_ui_value.', { ref: refProperty });
+export const invokeUiElementTool = functionTool('invoke_ui_element', 'Invoca directamente el patrón UI Automation Invoke de un control resuelto; no necesita focus_ui_element antes. La acción puede tener efectos y debe corresponder al pedido explícito del usuario.', { ref: refProperty });
+export const setUiValueTool = functionTool('set_ui_value', 'Establece texto solo si el control admite ValuePattern. TextPattern permite leer, pero no modificar; este control no envía formularios ni mensajes.', {
     ref: refProperty,
     value: { type: 'string', maxLength: 2000, description: 'Texto para el control accesible.' },
 });

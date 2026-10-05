@@ -78,6 +78,10 @@ export function runWindowsUiAutomation(request, {
         if (
             !Array.isArray(locator?.path) || locator.path.length === 0 || locator.path.length > 16 ||
             locator.path.some(index => !Number.isInteger(index) || index < 0 || index > 500) ||
+            !Array.isArray(locator.runtimeId) || locator.runtimeId.length > 32 || locator.runtimeId.some(id => !Number.isInteger(id)) ||
+            !Array.isArray(locator.ancestry) || locator.ancestry.length > 16 || locator.ancestry.some(parent =>
+                !['name', 'controlType', 'automationId'].every(key => typeof parent?.[key] === 'string' && parent[key].length <= 300)
+            ) ||
             !['name', 'controlType', 'automationId'].every(key => typeof expected?.[key] === 'string' && expected[key].length <= 300)
         ) return Promise.resolve(failure('invalid_request', 'La referencia interna UI Automation no es válida.'));
     }
@@ -161,7 +165,7 @@ export async function useAppUiElement(app, locator, operation, value, options = 
     const resolved = await (options.resolveWindow ?? resolveAppWindow)(app, options.windowOptions);
     if (!resolved.success) return resolved;
     if (options.windowId && resolved.window.id !== options.windowId) {
-        return failure('stale_ui_reference', 'La ventana cambió desde la inspección; inspeccioná nuevamente.');
+        return { ...failure('stale_ui_reference', 'La ventana cambió desde la inspección; inspeccioná nuevamente.'), reason: 'window_changed' };
     }
     const handle = resolved.window?._handle;
     if (handle === undefined || handle === null) return failure('window_not_found', 'No se pudo identificar la ventana resuelta.');

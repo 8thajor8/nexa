@@ -7,6 +7,10 @@ function Result-Failure($code, $message) {
     return @{ success = $false; error = @{ code = $code; message = $message } }
 }
 
+function Result-Stale($message, $reason) {
+    return @{ success = $false; error = @{ code = 'stale_ui_reference'; message = $message; reason = $reason }; reason = $reason }
+}
+
 function Get-ElementMetadata($element, $maxTextLength) {
     $current = $element.Current
     $patterns = [System.Collections.Generic.List[string]]::new()
@@ -21,7 +25,7 @@ function Get-ElementMetadata($element, $maxTextLength) {
     return @{
         name = ([string]$current.Name).Substring(0, [Math]::Min(([string]$current.Name).Length, $maxTextLength))
         controlType = ([string]$current.ControlType.ProgrammaticName -replace '^ControlType\.', '')
-        automationId = [string]$current.AutomationId
+        automationId = ([string]$current.AutomationId).Substring(0, [Math]::Min(([string]$current.AutomationId).Length, 300))
         enabled = [bool]$current.IsEnabled
         focusable = [bool]$current.IsKeyboardFocusable
         patterns = @($patterns.ToArray())
@@ -39,31 +43,80 @@ function Get-ControlChildren($element) {
     return ,$children.ToArray()
 }
 
-function Same-Metadata($actual, $expected) {
-    foreach ($key in @('name', 'controlType', 'automationId')) {
-        if ([string]$actual[$key] -cne [string]$expected.$key) { return $false }
+function Get-Identity($element) {
+    $current = $element.Current
+    $name = [string]$current.Name
+    $automationId = [string]$current.AutomationId
+    return @{
+        name = $name.Substring(0, [Math]::Min($name.Length, 300))
+        controlType = ([string]$current.ControlType.ProgrammaticName -replace '^ControlType\.', '')
+        automationId = $automationId.Substring(0, [Math]::Min($automationId.Length, 300))
+    }
+}
+
+function Identity-Matches($actual, $expected) {
+    if ([string]$actual.controlType -cne [string]$expected.controlType) { return $false }
+    if ([string]$expected.automationId) {
+        return [string]$actual.automationId -ceq [string]$expected.automationId
+    }
+    if ([string]$expected.name) {
+        return [string]$actual.name -ceq [string]$expected.name
     }
     return $true
 }
 
+function Same-Ancestry($actual, $expected) {
+    $actual = @($actual)
+    $expected = @($expected)
+    if ($expected.Count -eq 0) { return $true }
+    if ($actual.Count -lt $expected.Count) { return $false }
+    $offset = $actual.Count - $expected.Count
+    for ($index = 0; $index -lt $expected.Count; $index++) {
+        if (-not (Identity-Matches $actual[$offset + $index] $expected[$index])) { return $false }
+    }
+    return $true
+}
+
+function Get-TreeEntries($root, $maxDepth = 8, $maxNodes = 1000) {
+    $queue = [System.Collections.Generic.Queue[object]]::new()
+    $entries = [System.Collections.Generic.List[object]]::new()
+    $children = Get-ControlChildren $root
+    for ($index = 0; $index -lt $children.Count -and $index -lt $maxNodes; $index++) {
+        $queue.Enqueue(@{ element = $children[$index]; path = @($index); depth = 1; ancestry = @() })
+    }
+    $visited = 0
+    while ($queue.Count -gt 0 -and $visited -lt $maxNodes) {
+        $entry = $queue.Dequeue()
+        $visited++
+        $entry.identity = Get-Identity $entry.element
+        $entry.runtimeId = @($entry.element.GetRuntimeId())
+        $entries.Add($entry)
+        if ($entry.depth -ge $maxDepth) { continue }
+        $children = Get-ControlChildren $entry.element
+        $ancestry = @($entry.ancestry) + @($entry.identity)
+        for ($index = 0; $index -lt $children.Count; $index++) {
+            if ($visited + $queue.Count -ge $maxNodes) { break }
+            $queue.Enqueue(@{ element = $children[$index]; path = @($entry.path) + @($index); depth = $entry.depth + 1; ancestry = $ancestry })
+        }
+    }
+    return ,@($entries.ToArray())
+}
+
 function Resolve-Element($root, $request) {
-    $path = @($request.locator.path)
-    if ($path.Count -eq 0 -or $path.Count -gt 16) { return $null }
-    $element = $root
-    foreach ($index in $path) {
-        if ($index -isnot [int] -or $index -lt 0) { return $null }
-        $children = Get-ControlChildren $element
-        if ($index -ge $children.Count) { return $null }
-        $element = $children[$index]
+    $entries = Get-TreeEntries $root
+    $identityMatches = @($entries | Where-Object { Identity-Matches $_.identity $request.expected })
+    $savedRuntimeId = @($request.locator.runtimeId)
+    if ($savedRuntimeId.Count -gt 0) {
+        $runtimeMatches = @($identityMatches | Where-Object { ($_.runtimeId -join ',') -ceq ($savedRuntimeId -join ',') })
+        if ($runtimeMatches.Count -eq 1) { return @{ status = 'found'; element = $runtimeMatches[0].element } }
     }
-    if ($request.locator.runtimeId) {
-        $actualRuntimeId = @($element.GetRuntimeId())
-        $savedRuntimeId = @($request.locator.runtimeId)
-        if (($actualRuntimeId -join ',') -cne ($savedRuntimeId -join ',')) { return $null }
-    }
-    $actual = Get-ElementMetadata $element 300
-    if (-not (Same-Metadata $actual $request.expected)) { return $null }
-    return $element
+
+    $contextMatches = @($identityMatches | Where-Object { Same-Ancestry $_.ancestry $request.locator.ancestry })
+    if ($contextMatches.Count -eq 1) { return @{ status = 'found'; element = $contextMatches[0].element } }
+    if ($contextMatches.Count -gt 1) { return @{ status = 'ambiguous' } }
+    if ($identityMatches.Count -eq 1) { return @{ status = 'found'; element = $identityMatches[0].element } }
+    if ($identityMatches.Count -gt 1) { return @{ status = 'ambiguous' } }
+    return @{ status = 'missing' }
 }
 
 try {
@@ -85,7 +138,7 @@ try {
             $queue = [System.Collections.Generic.Queue[object]]::new()
             $rootChildren = Get-ControlChildren $root
             for ($index = 0; $index -lt $rootChildren.Count; $index++) {
-                $queue.Enqueue(@{ element = $rootChildren[$index]; path = @($index); depth = 1 })
+                $queue.Enqueue(@{ element = $rootChildren[$index]; path = @($index); depth = 1; ancestry = @() })
             }
             $items = [System.Collections.Generic.List[object]]::new()
             $visited = 0
@@ -95,13 +148,23 @@ try {
                 $visited++
                 $metadata = Get-ElementMetadata $entry.element $maxTextLength
                 if ($metadata.name -or $metadata.patterns.Count -gt 0) {
-                    $items.Add(@{ path = @($entry.path); runtimeId = @($entry.element.GetRuntimeId()); name = $metadata.name; controlType = $metadata.controlType; automationId = $metadata.automationId; enabled = $metadata.enabled; focusable = $metadata.focusable; patterns = $metadata.patterns })
+                    $items.Add(@{
+                        locator = @{ path = @($entry.path); runtimeId = @($entry.element.GetRuntimeId()); ancestry = @($entry.ancestry) }
+                        identity = Get-Identity $entry.element
+                        name = $metadata.name
+                        controlType = $metadata.controlType
+                        automationId = $metadata.automationId
+                        enabled = $metadata.enabled
+                        focusable = $metadata.focusable
+                        patterns = $metadata.patterns
+                    })
                 }
                 if ($entry.depth -lt $maxDepth) {
                     $children = Get-ControlChildren $entry.element
+                    $ancestry = @($entry.ancestry) + @((Get-Identity $entry.element))
                     for ($index = 0; $index -lt $children.Count; $index++) {
                         if ($visited + $queue.Count -ge $maxElements) { $truncated = $true; break }
-                        $queue.Enqueue(@{ element = $children[$index]; path = @($entry.path) + @($index); depth = $entry.depth + 1 })
+                        $queue.Enqueue(@{ element = $children[$index]; path = @($entry.path) + @($index); depth = $entry.depth + 1; ancestry = $ancestry })
                     }
                 } elseif ((Get-ControlChildren $entry.element).Count -gt 0) {
                     $truncated = $true
@@ -110,10 +173,14 @@ try {
             if ($queue.Count -gt 0 -or $visited -ge $maxElements) { $truncated = $true }
             $response = @{ success = $true; elements = @($items.ToArray()); truncated = $truncated }
         } else {
-            $element = Resolve-Element $root $request
-            if ($null -eq $element) {
-                $response = Result-Failure 'stale_ui_reference' 'El control cambió o ya no está disponible.'
+            $resolved = Resolve-Element $root $request
+            if ($resolved.status -eq 'missing') {
+                $response = Result-Stale 'El control ya no está disponible.' 'element_disappeared'
+            } elseif ($resolved.status -eq 'ambiguous') {
+                $response = Result-Failure 'ambiguous_element' 'La referencia coincide ahora con varios controles.'
+                $response.error.reason = 're_resolution_ambiguous'
             } else {
+                $element = $resolved.element
                 $current = $element.Current
                 if (-not $current.IsEnabled) {
                     $response = Result-Failure 'element_disabled' 'El control está deshabilitado.'
@@ -135,9 +202,14 @@ try {
                         'set_value' {
                             $pattern = $null
                             if (-not $element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
-                                $response = Result-Failure 'pattern_not_supported' 'El control no soporta el patrón Value.'
+                                $pattern = $null
+                                if ($element.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$pattern)) {
+                                    $response = Result-Failure 'text_pattern_read_only' 'El control solo expone TextPattern, que permite leer el texto pero no modificarlo. No se usó teclado ni portapapeles.'
+                                } else {
+                                    $response = Result-Failure 'pattern_not_supported' 'El control no expone un patrón compatible para modificar su valor.'
+                                }
                             } elseif ($pattern.Current.IsReadOnly) {
-                                $response = Result-Failure 'pattern_not_supported' 'El control de texto es de solo lectura.'
+                                $response = Result-Failure 'element_read_only' 'El control expone ValuePattern, pero está marcado como solo lectura.'
                             } else {
                                 $pattern.SetValue([string]$request.value)
                                 $response = @{ success = $true; action = 'set_value'; sensitivity = 'may_be_sensitive' }

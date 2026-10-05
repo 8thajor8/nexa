@@ -7,7 +7,8 @@ import { resolveAppWindow, runWindowsUiAutomation } from '../src/windows/ui-auto
 
 function sampleElement(overrides = {}) {
     return {
-        locator: { path: [0], runtimeId: [10, 20] },
+        locator: { path: [0], runtimeId: [10, 20], ancestry: [] },
+        identity: { name: 'Enviar', controlType: 'Button', automationId: 'send' },
         name: 'Enviar',
         controlType: 'Button',
         automationId: 'send',
@@ -100,6 +101,65 @@ test('pattern failures and disabled controls remain structured and never report 
     const disabled = createService({ useResult: { success: false, error: { code: 'element_disabled', message: 'disabled' } } });
     const disabledRef = (await disabled.service.inspectUi({ args: { app: 'Notepad', maxDepth: 4, maxElements: 80, maxTextLength: 160 } })).elements[0].ref;
     assert.equal((await disabled.service.setUiValue({ args: { ref: disabledRef, value: 'x' } })).error.code, 'element_disabled');
+});
+
+test('Notepad-style provider locator can be reused immediately to set an editable value', async () => {
+    const providerElement = {
+        locator: { path: [1, 0], runtimeId: [42, 7], ancestry: [{ name: 'Document', controlType: 'Pane', automationId: 'doc' }] },
+        identity: { name: 'Editor', controlType: 'Edit', automationId: 'Text Area' },
+        name: 'Editor', controlType: 'Edit', automationId: 'Text Area', enabled: true, patterns: ['Value'],
+    };
+    const { service, calls } = createService({ elements: [providerElement], useResult: { success: true, action: 'set_value' } });
+    const found = await service.findUiElement({ args: { app: 'Notepad', name: 'Editor', controlType: 'Edit' } });
+    assert.equal(found.success, true);
+    const updated = await service.setUiValue({ args: { ref: found.element.ref, value: 'guitarra Ibanez' } });
+    assert.equal(updated.success, true);
+    assert.equal(calls.filter(call => call[0] === 'inspect').length, 1);
+    const useCall = calls.find(call => call[0] === 'use');
+    assert.equal(useCall[2], providerElement.locator);
+    assert.equal(useCall[3], 'set_value');
+    assert.deepEqual(useCall[5].expected, providerElement.identity);
+});
+
+test('Calculator-style find then invoke needs one discovery and one action without focus', async () => {
+    const seven = sampleElement({ name: '7', controlType: 'Button', automationId: 'num7', patterns: ['Invoke'] });
+    const { service, calls } = createService({ elements: [seven], useResult: { success: true, action: 'invoke' } });
+    const found = await service.findUiElement({ args: { app: 'Calculator', name: '7', controlType: 'Button' } });
+    const invoked = await service.invokeUiElement({ args: { ref: found.element.ref } });
+    assert.equal(invoked.success, true);
+    assert.equal(calls.filter(call => call[0] === 'inspect').length, 1);
+    assert.deepEqual(calls.filter(call => call[0] === 'use').map(call => call[3]), ['invoke']);
+});
+
+test('TextPattern-only edit control reports a precise read-only failure', async () => {
+    const { service } = createService({
+        elements: [sampleElement({ name: 'Editor', controlType: 'Edit', automationId: 'edit', patterns: ['Text'] })],
+        useResult: { success: false, error: { code: 'text_pattern_read_only', message: 'TextPattern is read-only.' } },
+    });
+    const found = await service.findUiElement({ args: { app: 'Notepad', controlType: 'Edit' } });
+    const result = await service.setUiValue({ args: { ref: found.element.ref, value: 'test' } });
+    assert.equal(result.success, false);
+    assert.equal(result.error.code, 'text_pattern_read_only');
+});
+
+test('optional diagnostics record reference lifecycle without logging entered text', async () => {
+    const diagnostics = [];
+    const secretText = 'texto privado 91f3';
+    const instrumented = createUiAutomation({
+        now: () => 100,
+        logger: (event, details) => diagnostics.push({ event, details }),
+        inspect: async () => ({ success: true, app: 'Notepad', windowId: '0x123', elements: [sampleElement()] }),
+        useElement: async () => ({ success: true }),
+    });
+    instrumented.clearReferences();
+    const ref = (await instrumented.findUiElement({ args: { app: 'Notepad', name: 'Enviar' } })).element.ref;
+    await instrumented.setUiValue({ args: { ref, value: secretText } });
+    const serialized = JSON.stringify(diagnostics);
+    assert.match(serialized, /reference_created/);
+    assert.match(serialized, /reference_reused/);
+    assert.match(serialized, /tool_result/);
+    assert.match(serialized, /valueLength/);
+    assert.equal(serialized.includes(secretText), false);
 });
 
 test('UI Automation tools are registered with read/action permissions and permission denial blocks execution', async () => {
