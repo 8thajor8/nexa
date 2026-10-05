@@ -27,6 +27,14 @@ test('existing local tools declare their intended permissions', () => {
         mute_volume: 'action',
         unmute_volume: 'action',
         media_play_pause: 'action',
+        is_app_running: 'read',
+        get_active_window: 'read',
+        list_windows: 'read',
+        focus_window: 'action',
+        maximize_window: 'action',
+        minimize_window: 'action',
+        restore_window: 'action',
+        close_window: 'action',
     });
 
     for (const registration of localToolRegistry.values()) {

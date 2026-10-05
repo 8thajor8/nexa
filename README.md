@@ -19,11 +19,11 @@ Nexa incluye herramientas controladas para interactuar con Windows:
 - `open_app` abre una aplicación por nombre lógico, desde el catálogo local o la whitelist explícita.
 - `discover_apps` actualiza el catálogo leyendo accesos directos `.lnk` del menú Inicio del usuario y del equipo. Solo inspecciona esas carpetas conocidas; no escanea el disco ni ejecuta aplicaciones o scripts.
 - `open_url` abre solo URLs absolutas `http://` o `https://` en el navegador predeterminado.
-- `get_open_apps` consulta `tasklist.exe` con formato CSV y parámetros fijos, y devuelve como máximo 100 procesos con nombre y PID.
+- `get_open_apps` consulta el snapshot de procesos de Windows mediante Tool Help y devuelve como máximo 100 procesos con nombre y PID.
 
 El catálogo se guarda localmente en `data/apps.json` y está excluido de Git porque contiene rutas del equipo. `discover_apps` lo reconstruye; `open_app` normaliza nombres y aliases, busca coincidencias exactas o un prefijo que identifique una sola aplicación, y ejecuta el destino almacenado sin argumentos proporcionados por el modelo. Para aplicaciones descubiertas solo se aceptan ejecutables bajo ubicaciones normales de instalación (Program Files, LocalAppData/Programs o ProgramData); se descartan intérpretes y rutas fuera de esas ubicaciones. GPT recibe nombres lógicos, nunca las rutas ejecutables.
 
-La whitelist de `src/tools/windows.js` sigue siendo un fallback para `chrome`, `edge`, `notepad`, `calculator`, `explorer`, `spotify` y `discord`. Para agregar otra aplicación explícita, agregá su nombre lógico y una ruta fija bajo `windowsAppWhitelist`; mantené sus argumentos fijos y escritos en el código.
+La whitelist de `src/windows/app-whitelist.js` sigue siendo un fallback para `chrome`, `edge`, `notepad`, `calculator`, `explorer`, `spotify` y `discord`. Para agregar otra aplicación explícita, agregá su nombre lógico y una ruta fija bajo `windowsAppWhitelist`; mantené sus argumentos fijos y escritos en el código.
 
 ### Archivos, volumen y multimedia
 
@@ -34,3 +34,11 @@ Las herramientas `list_directory` y `read_file` solo trabajan dentro de `Desktop
 Estas tools también pasan por la permission policy central: `list_directory`, `read_file` y `get_volume` son `read`; los cambios de volumen y Play/Pause son `action`. La política predeterminada permite ambas categorías. El control de volumen usa la dependencia `loudness`; el envío de la tecla multimedia usa Koffi para llamar una sola API fija de Windows. Ambas acciones rechazan plataformas distintas de Windows.
 
 No existe shell arbitrario ni PowerShell genérico. Tampoco existen `write_file`, `delete_file`, movimiento o renombrado de archivos, apagado ni reinicio. Las carpetas y operaciones están limitadas por código; el modelo no puede elegir un ejecutable o comando de sistema.
+
+### Ventanas de Windows
+
+Nexa puede consultar procesos y ventanas visibles con `is_app_running`, `get_active_window` y `list_windows`. La consulta de una aplicación usa todos los procesos reportados por Windows, no solo los primeros 100 que devuelve `get_open_apps`. `list_windows` incluye título, proceso, PID e identificador interno; ese identificador solo se devuelve como información y ninguna herramienta de control acepta HWND o PID como argumento.
+
+Para controlar una ventana, Nexa usa `focus_window`, `maximize_window`, `minimize_window`, `restore_window` o `close_window` con un nombre lógico de aplicación o criterio de título. Si el criterio coincide con más de una ventana, la acción se rechaza y devuelve las coincidencias para que se pueda precisar. `close_window` envía una solicitud normal de cierre a la ventana; no termina el proceso. Su resultado confirma que Windows aceptó el mensaje, no que la aplicación ya haya terminado. Windows puede rechazar el cambio de foco según su política de primer plano.
+
+Ejemplos: “¿Está Spotify abierto?”, “¿Cuál es mi ventana activa?”, “¿Qué ventanas tengo abiertas?”, “Seleccioná Chrome”, “Maximizá Spotify”, “Minimizá Chrome”, “Restaurá Chrome” y “Cerrá Spotify”. Estas herramientas usan las categorías centrales `read` y `action` y una API Win32 fija mediante Koffi. No ejecutan shell, PowerShell, `taskkill` ni comandos externos elegidos por el modelo.

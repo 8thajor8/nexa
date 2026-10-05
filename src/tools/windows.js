@@ -1,4 +1,4 @@
-import { execFile, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import path from 'node:path';
 import {
     findAppInCatalog,
@@ -6,59 +6,17 @@ import {
     normalizeAppName,
 } from '../windows/app-catalog.js';
 import { isTrustedAppPath } from '../windows/app-discovery.js';
+import { listRunningProcesses } from '../windows/processes.js';
+import { windowsAppWhitelist } from '../windows/app-whitelist.js';
 
 const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? 'C:\\Windows';
-const programFiles = process.env.ProgramFiles;
-const programFilesX86 = process.env['ProgramFiles(x86)'];
-const localAppData = process.env.LOCALAPPDATA;
-const roamingAppData = process.env.APPDATA;
+export { windowsAppWhitelist };
 
 const windowsPath = (root, ...parts) => root
     ? path.win32.join(root, ...parts)
     : null;
 
-const target = (executable, args = []) => Object.freeze({
-    executable,
-    args: Object.freeze(args),
-});
-
-const fixedTargets = (...executables) => Object.freeze(
-    executables
-        .filter(Boolean)
-        .map(executable => target(executable))
-);
-
-export const windowsAppWhitelist = Object.freeze({
-    chrome: fixedTargets(
-        windowsPath(programFilesX86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-        windowsPath(programFiles, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-        windowsPath(localAppData, 'Google', 'Chrome', 'Application', 'chrome.exe')
-    ),
-    edge: fixedTargets(
-        windowsPath(programFilesX86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-        windowsPath(programFiles, 'Microsoft', 'Edge', 'Application', 'msedge.exe')
-    ),
-    notepad: fixedTargets(windowsPath(systemRoot, 'System32', 'notepad.exe')),
-    calculator: fixedTargets(windowsPath(systemRoot, 'System32', 'calc.exe')),
-    explorer: fixedTargets(windowsPath(systemRoot, 'explorer.exe')),
-    spotify: fixedTargets(
-        windowsPath(localAppData, 'Programs', 'Spotify', 'Spotify.exe'),
-        windowsPath(roamingAppData, 'Spotify', 'Spotify.exe'),
-        windowsPath(programFiles, 'Spotify', 'Spotify.exe')
-    ),
-    discord: Object.freeze([
-        ...(windowsPath(localAppData, 'Discord', 'Update.exe')
-            ? [target(
-                windowsPath(localAppData, 'Discord', 'Update.exe'),
-                ['--processStart', 'Discord.exe']
-            )]
-            : []),
-    ]),
-});
-
 const maxListedProcesses = 100;
-const processListTimeoutMs = 5_000;
-const processListMaxBuffer = 256 * 1024;
 
 export const openAppTool = {
     type: 'function',
@@ -264,96 +222,21 @@ export async function openUrl({ args, launchProcess = launchDetachedProcess, pla
     }
 }
 
-function runTaskList() {
-    return new Promise((resolve, reject) => {
-        execFile(
-            windowsPath(systemRoot, 'System32', 'tasklist.exe'),
-            ['/FO', 'CSV', '/NH'],
-            {
-                encoding: 'utf8',
-                timeout: processListTimeoutMs,
-                maxBuffer: processListMaxBuffer,
-                windowsHide: true,
-                shell: false,
-            },
-            (error, stdout) => {
-                if (error) {
-                    reject(error);
-                    return;
-                }
-
-                resolve(stdout);
-            }
-        );
-    });
-}
-
-function parseCsvRow(line) {
-    const fields = [];
-    let field = '';
-    let insideQuotes = false;
-
-    for (let index = 0; index < line.length; index += 1) {
-        const character = line[index];
-
-        if (character === '"') {
-            if (insideQuotes && line[index + 1] === '"') {
-                field += '"';
-                index += 1;
-            } else {
-                insideQuotes = !insideQuotes;
-            }
-        } else if (character === ',' && !insideQuotes) {
-            fields.push(field);
-            field = '';
-        } else {
-            field += character;
-        }
-    }
-
-    fields.push(field);
-    return fields;
-}
-
-function parseTaskList(output) {
-    return output
-        .split(/\r?\n/u)
-        .filter(line => line.trim())
-        .map(parseCsvRow)
-        .map(([name, rawPid]) => ({
-            name: name?.replace(/^\uFEFF/u, ''),
-            pid: Number(rawPid),
-        }))
-        .filter(processInfo =>
-            typeof processInfo.name === 'string' &&
-            processInfo.name.length > 0 &&
-            Number.isSafeInteger(processInfo.pid) &&
-            processInfo.pid > 0
-        );
-}
-
-export async function getOpenApps({ listProcesses = runTaskList, platform = process.platform } = {}) {
+export async function getOpenApps({ listProcesses, platform = process.platform } = {}) {
     if (platform !== 'win32') {
         return failure('unsupported_platform', 'get_open_apps solo está disponible en Windows.');
     }
+    const result = await listRunningProcesses({ listProcesses, platform });
+    if (!result.success) return result;
 
-    try {
-        const allProcesses = parseTaskList(await listProcesses());
-        const processes = allProcesses.slice(0, maxListedProcesses);
-
-        return {
-            success: true,
-            count: processes.length,
-            totalCount: allProcesses.length,
-            truncated: allProcesses.length > maxListedProcesses,
-            processes,
-        };
-    } catch {
-        return failure(
-            'process_list_failed',
-            'No se pudieron consultar los procesos de Windows.'
-        );
-    }
+    const processes = result.processes.slice(0, maxListedProcesses);
+    return {
+        success: true,
+        count: processes.length,
+        totalCount: result.processes.length,
+        truncated: result.processes.length > maxListedProcesses,
+        processes,
+    };
 }
 
 export const openAppRegistration = {

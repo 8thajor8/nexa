@@ -3,6 +3,16 @@ import { rememberRegistration } from './remember.js';
 import { recallRegistration } from './recall.js';
 import { forgetRegistration } from './forget.js';
 import { getWeatherRegistration } from './weather.js';
+import {
+    closeWindowRegistration,
+    focusWindowRegistration,
+    getActiveWindowRegistration,
+    isAppRunningRegistration,
+    listWindowsRegistration,
+    maximizeWindowRegistration,
+    minimizeWindowRegistration,
+    restoreWindowRegistration,
+} from '../windows/window-control.js';
 import { discoverAppsRegistration } from '../windows/app-discovery.js';
 import { listDirectoryRegistration, readFileRegistration } from '../windows/filesystem.js';
 import {
@@ -40,6 +50,14 @@ const localRegistrations = [
     muteVolumeRegistration,
     unmuteVolumeRegistration,
     mediaPlayPauseRegistration,
+    isAppRunningRegistration,
+    getActiveWindowRegistration,
+    listWindowsRegistration,
+    focusWindowRegistration,
+    maximizeWindowRegistration,
+    minimizeWindowRegistration,
+    restoreWindowRegistration,
+    closeWindowRegistration,
 ].map(registration => ({
     ...registration,
     permission: toolPermissions[registration.definition.name],
