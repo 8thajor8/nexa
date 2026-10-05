@@ -24,6 +24,13 @@ export const toolPermissions = Object.freeze({
     minimize_window: 'action',
     restore_window: 'action',
     close_window: 'action',
+    spotify_get_current_track: 'external_read',
+    spotify_search: 'external_read',
+    spotify_get_devices: 'external_read',
+    spotify_play: 'action',
+    spotify_pause: 'action',
+    spotify_next: 'action',
+    spotify_previous: 'action',
 });
 
 export const defaultPermissionPolicy = Object.freeze({

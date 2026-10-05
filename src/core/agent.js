@@ -3,6 +3,7 @@ import { config } from '../config.js';
 import { NEXA_INSTRUCTIONS } from '../prompts/nexa.js';
 import { loadMemory, memoryToPrompt, saveMemory } from '../memory/memory.js';
 import { getToolsForModel, executeTool } from '../tools/index.js';
+import { formatSpotifyToolResult, isSpotifyTool, spotifyModelSafeOutput } from '../tools/spotify.js';
 
 export async function createAgent({ permissionPolicy } = {}) {
     const memory = await loadMemory();
@@ -19,6 +20,7 @@ ${memoryToPrompt(memory)}
     const conversation = [];
 
     async function run(userMessage) {
+        const spotifyMessages = [];
         conversation.push({
             role: 'user',
             content: userMessage,
@@ -38,7 +40,7 @@ ${memoryToPrompt(memory)}
             );
 
             if (toolCalls.length === 0) {
-                return response.output_text;
+                return [response.output_text, ...spotifyMessages].filter(Boolean).join('\n\n');
             }
 
             for (const toolCall of toolCalls) {
@@ -54,10 +56,14 @@ ${memoryToPrompt(memory)}
                     }
                 );
 
+                const isSpotify = isSpotifyTool(toolCall.name);
+                const output = isSpotify ? spotifyModelSafeOutput(toolCall.name, result) : result;
+                if (isSpotify) spotifyMessages.push(formatSpotifyToolResult(toolCall.name, result));
+
                 conversation.push({
                     type: 'function_call_output',
                     call_id: toolCall.call_id,
-                    output: JSON.stringify(result),
+                    output: JSON.stringify(output),
                 });
             }
         }

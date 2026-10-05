@@ -3,6 +3,7 @@ import { rememberRegistration } from './remember.js';
 import { recallRegistration } from './recall.js';
 import { forgetRegistration } from './forget.js';
 import { getWeatherRegistration } from './weather.js';
+import { spotifyRegistrations } from './spotify.js';
 import {
     closeWindowRegistration,
     focusWindowRegistration,
@@ -58,6 +59,7 @@ const localRegistrations = [
     minimizeWindowRegistration,
     restoreWindowRegistration,
     closeWindowRegistration,
+    ...spotifyRegistrations,
 ].map(registration => ({
     ...registration,
     permission: toolPermissions[registration.definition.name],

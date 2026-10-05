@@ -17,6 +17,7 @@ test('open_app launches only a whitelisted application target', async () => {
     const result = await openApp({
         args: { app: 'notepad' },
         platform: 'win32',
+        loadCatalog: async () => ({ apps: [] }),
         launchProcess: async (...args) => calls.push(args),
     });
 

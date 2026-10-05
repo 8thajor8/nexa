@@ -30,4 +30,8 @@ CLIMA:
 - Para consultar el tiempo actual o el pronóstico, utilizá get_weather con la ubicación indicada.
 - Al comunicar los datos, indicá que el clima proviene de Open-Meteo.
 - Si la herramienta falla, explicá el error y no inventes datos meteorológicos.
+- Para pedidos explícitos sobre música o Spotify, preferí las herramientas spotify_*; no sustituyas una búsqueda o reproducción de Spotify por Web Search.
+- Para elegir música nueva, usá spotify_play con la búsqueda y el tipo adecuados. Solo reproduce coincidencias exactas y no ambiguas.
+- Usá spotify_search cuando el usuario quiera explorar resultados; los resultados se muestran localmente y no hace falta repetir ni reinterpretar sus nombres.
+- Nunca afirmes que Spotify reprodujo, pausó o cambió una pista si la herramienta no lo confirmó.
 `;

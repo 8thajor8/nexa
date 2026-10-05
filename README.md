@@ -41,6 +41,25 @@ Estas tools también pasan por la permission policy central: `list_directory`, `
 
 No existe shell arbitrario ni PowerShell genérico. Tampoco existen `write_file`, `delete_file`, movimiento o renombrado de archivos, apagado ni reinicio. Las carpetas y operaciones están limitadas por código; el modelo no puede elegir un ejecutable o comando de sistema.
 
+### Spotify
+
+La integración de Spotify está en `src/integrations/spotify/` y usa la Web API con OAuth Authorization Code + PKCE. Es independiente de los controles multimedia globales de Windows: `media_play_pause` sigue enviando una tecla multimedia del sistema, mientras que `spotify_*` usa la cuenta y los dispositivos Spotify Connect autorizados. Spotify Desktop también se puede abrir o consultar por separado con `open_app`, `is_app_running` y `focus_window`.
+
+Las herramientas disponibles son `spotify_get_current_track`, `spotify_get_devices`, `spotify_search`, `spotify_play`, `spotify_pause`, `spotify_next` y `spotify_previous`. Las lecturas y búsquedas usan `external_read`; las acciones de reproducción usan `action`. `spotify_play` acepta una búsqueda y un tipo (`track`, `artist` o `album`), consulta Spotify y solo inicia un resultado exacto y no ambiguo. Con una búsqueda vacía reanuda lo que ya está en reproducción. `spotify_search` devuelve como máximo cinco resultados y Nexa los presenta con un enlace al elemento correspondiente en Spotify.
+
+Spotify requiere una aplicación creada manualmente en [Spotify Developer Dashboard](https://developer.spotify.com/dashboard). En **Edit Settings**, agregá exactamente `http://127.0.0.1:8888/callback` como Redirect URI. Copiá el Client ID a tu `.env`:
+
+```env
+SPOTIFY_CLIENT_ID=el_client_id_de_tu_app
+SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
+```
+
+No se necesita Client Secret: PKCE permite la autorización sin guardar un secreto de aplicación. Podés partir de `.env.example`. Para la autorización inicial, ejecutá `npm run spotify:auth`, abrí el enlace que muestra la terminal, iniciá sesión y aceptá los permisos. El callback local intercambia el código y guarda los tokens en `data/spotify-token.json`; ese archivo está excluido de Git y los access tokens se renuevan automáticamente. Si Spotify revoca el refresh token, repetí la autorización.
+
+La autorización solicita estos scopes: `user-read-currently-playing`, `user-read-playback-state` y `user-modify-playback-state`. La API necesita un dispositivo Spotify Connect disponible para reproducir y pausar; los endpoints de control de reproducción requieren Spotify Premium. En Development Mode, Spotify también requiere que la cuenta propietaria de la app tenga Premium y limita una app nueva a cinco usuarios. Nexa no abre Spotify Desktop en silencio si no hay un dispositivo; informa el problema para que puedas abrirlo y reintentar.
+
+Los datos de Spotify se presentan directamente desde Nexa con atribución y enlaces a Spotify. Las [condiciones de Spotify](https://developer.spotify.com/policy) prohíben introducir Spotify Content en un modelo de IA, así que los resultados con nombres de pistas, artistas, álbumes o dispositivos se filtran antes de devolver el resultado de una tool al modelo; el modelo recibe únicamente un estado de control mínimo. Spotify Search no se convierte en una búsqueda web alternativa cuando falla.
+
 ### Ventanas de Windows
 
 Nexa puede consultar procesos y ventanas visibles con `is_app_running`, `get_active_window` y `list_windows`. La consulta de una aplicación usa todos los procesos reportados por Windows, no solo los primeros 100 que devuelve `get_open_apps`. `list_windows` incluye título, proceso, PID e identificador interno; ese identificador solo se devuelve como información y ninguna herramienta de control acepta HWND o PID como argumento.

@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node src/index.js",
+    "spotify:auth": "node src/integrations/spotify/authorize.js",
     "test": "node --test"
   },
   "keywords": [],
