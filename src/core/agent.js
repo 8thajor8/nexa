@@ -2,9 +2,9 @@ import { askOpenAI } from '../brain/openai.js';
 import { config } from '../config.js';
 import { NEXA_INSTRUCTIONS } from '../prompts/nexa.js';
 import { loadMemory, memoryToPrompt, saveMemory } from '../memory/memory.js';
-import { tools, executeTool } from '../tools/index.js';
+import { getToolsForModel, executeTool } from '../tools/index.js';
 
-export async function createAgent() {
+export async function createAgent({ permissionPolicy } = {}) {
     const memory = await loadMemory();
 
     function getInstructions() {
@@ -28,7 +28,7 @@ ${memoryToPrompt(memory)}
             const response = await askOpenAI({
                 instructions: getInstructions(),
                 input: conversation,
-                tools,
+                tools: getToolsForModel(permissionPolicy),
             });
 
             conversation.push(...response.output);
@@ -50,6 +50,7 @@ ${memoryToPrompt(memory)}
                     {
                         memory,
                         saveMemory,
+                        permissionPolicy,
                     }
                 );
 
