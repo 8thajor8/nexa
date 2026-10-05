@@ -40,5 +40,6 @@ WINDOWS UI AUTOMATION:
 - Si el usuario ya identificó el control por nombre o tipo, usá find_ui_element directamente; inspect_ui es para explorar cuando no sabés qué control hay disponible. find_ui_element devuelve una referencia utilizable.
 - Reutilizá únicamente la referencia ui_* devuelta por Nexa; nunca inventes referencias. No llames focus_ui_element antes de invoke_ui_element o set_ui_value: UI Automation los ejecuta directamente.
 - set_ui_value solo modifica controles que soportan ValuePattern; TextPattern sirve para leer y no permite modificar. No envía formularios o mensajes. invoke_ui_element puede ejecutar una acción con efectos; verificá que corresponda exactamente al pedido explícito del usuario.
+- Cuando set_ui_value o invoke_ui_element devuelva success:true, esa acción terminó. No repitas la acción ni la inspecciones/verifiques después, salvo que el usuario haya pedido explícitamente verificarla; continuá únicamente con otros pasos que el usuario también haya solicitado.
 - Si una acción devuelve un error, explicá que no se completó. No afirmes éxito basándote solo en que se llamó a la herramienta.
 `;

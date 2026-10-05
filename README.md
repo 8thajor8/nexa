@@ -80,4 +80,6 @@ Las herramientas `inspect_ui`, `find_ui_element` y `get_ui_value` tienen permiso
 
 Para depurar el ciclo de referencias durante el desarrollo, activar `NEXA_UI_AUTOMATION_DEBUG=true`. Los diagnósticos incluyen la herramienta, el tipo de operación, el resultado y el motivo de invalidación; al escribir texto registran solo su longitud, nunca el contenido.
 
+El agente cuenta como máximo cinco rondas que solicitan herramientas (`maxToolIterations`). Si la quinta ronda usa herramientas, se permite un turno final del modelo con las herramientas deshabilitadas para redactar la respuesta; ese turno no puede ejecutar otra acción. `NEXA_AGENT_DEBUG=true` registra número de ronda, herramienta, resumen seguro de argumentos, resultado y tipo de respuesta del modelo sin imprimir valores de texto.
+
 Las pruebas automatizadas usan un proveedor simulado y no requieren aplicaciones abiertas. Para validarlo localmente, ejecutá `npm start`, abrí Calculator o Notepad, pedile a Nexa `inspeccioná los controles de Notepad`, y probá después `buscá el campo de edición de Notepad` o `leé el valor de ui_1` usando la referencia que Nexa haya recibido. La inspección real requiere una sesión interactiva de Windows y una aplicación abierta.
