@@ -15,4 +15,3 @@ export function createOpenAISpeechProvider({ clientFactory = getOpenAIClient, se
         },
     };
 }
-
