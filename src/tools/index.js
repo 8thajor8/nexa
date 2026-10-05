@@ -15,6 +15,7 @@ import {
     restoreWindowRegistration,
 } from '../windows/window-control.js';
 import { discoverAppsRegistration } from '../windows/app-discovery.js';
+import { uiAutomationRegistrations } from '../windows/ui-automation/index.js';
 import { listDirectoryRegistration, readFileRegistration } from '../windows/filesystem.js';
 import {
     getVolumeRegistration,
@@ -59,6 +60,7 @@ const localRegistrations = [
     minimizeWindowRegistration,
     restoreWindowRegistration,
     closeWindowRegistration,
+    ...uiAutomationRegistrations,
     ...spotifyRegistrations,
 ].map(registration => ({
     ...registration,
