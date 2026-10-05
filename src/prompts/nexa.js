@@ -23,4 +23,9 @@ REGLA IMPORTANTE:
 Las herramientas representan acciones reales que puede ejecutar Nexa.
 No afirmes que una acción fue realizada hasta recibir el resultado
 de la herramienta correspondiente.
+
+CLIMA:
+- Para consultar el tiempo actual o el pronóstico, utilizá get_weather con la ubicación indicada.
+- Al comunicar los datos, indicá que el clima proviene de Open-Meteo.
+- Si la herramienta falla, explicá el error y no inventes datos meteorológicos.
 `;

@@ -2,6 +2,7 @@ import { getCurrentTimeRegistration } from './time.js';
 import { rememberRegistration } from './remember.js';
 import { recallRegistration } from './recall.js';
 import { forgetRegistration } from './forget.js';
+import { getWeatherRegistration } from './weather.js';
 
 export const localToolRegistry = new Map(
     [
@@ -9,6 +10,7 @@ export const localToolRegistry = new Map(
         rememberRegistration,
         recallRegistration,
         forgetRegistration,
+        getWeatherRegistration,
     ].map(registration => [registration.definition.name, registration])
 );
 
