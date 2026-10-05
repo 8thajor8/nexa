@@ -8,6 +8,7 @@ export const toolPermissions = Object.freeze({
     open_app: 'action',
     open_url: 'action',
     get_open_apps: 'read',
+    discover_apps: 'read',
 });
 
 export const defaultPermissionPolicy = Object.freeze({

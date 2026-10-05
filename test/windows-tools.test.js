@@ -34,7 +34,7 @@ test('open_app rejects arbitrary commands without launching a process', async ()
     });
 
     assert.equal(result.success, false);
-    assert.equal(result.error.code, 'app_not_allowed');
+    assert.equal(result.error.code, 'app_not_found');
     assert.equal(launched, false);
 });
 

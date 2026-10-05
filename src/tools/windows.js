@@ -1,5 +1,11 @@
 import { execFile, spawn } from 'node:child_process';
 import path from 'node:path';
+import {
+    findAppInCatalog,
+    loadAppCatalog,
+    normalizeAppName,
+} from '../windows/app-catalog.js';
+import { isTrustedAppPath } from '../windows/app-discovery.js';
 
 const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? 'C:\\Windows';
 const programFiles = process.env.ProgramFiles;
@@ -50,7 +56,6 @@ export const windowsAppWhitelist = Object.freeze({
     ]),
 });
 
-const appNames = Object.keys(windowsAppWhitelist);
 const maxListedProcesses = 100;
 const processListTimeoutMs = 5_000;
 const processListMaxBuffer = 256 * 1024;
@@ -64,8 +69,9 @@ export const openAppTool = {
         properties: {
             app: {
                 type: 'string',
-                enum: appNames,
-                description: 'Aplicación permitida que se quiere abrir.',
+                minLength: 1,
+                maxLength: 120,
+                description: 'Nombre lógico de una aplicación descubierta o incluida en la whitelist.',
             },
         },
         required: ['app'],
@@ -136,19 +142,49 @@ export function launchDetachedProcess(executable, args = [], spawnProcess = spaw
     });
 }
 
-export async function openApp({ args, launchProcess = launchDetachedProcess, platform = process.platform } = {}) {
+export async function openApp({
+    args,
+    launchProcess = launchDetachedProcess,
+    platform = process.platform,
+    environment = process.env,
+    catalogPath,
+    loadCatalog = loadAppCatalog,
+} = {}) {
     if (platform !== 'win32') {
         return failure('unsupported_platform', 'open_app solo está disponible en Windows.');
     }
 
-    const app = typeof args?.app === 'string' ? args.app.trim().toLowerCase() : '';
-    const appTargets = windowsAppWhitelist[app];
+    const requestedName = typeof args?.app === 'string' ? args.app.trim() : '';
+    const normalizedName = normalizeAppName(requestedName);
 
-    if (!appTargets) {
-        return failure(
-            'app_not_allowed',
-            `La aplicación solicitada no está en la whitelist: ${args?.app ?? ''}.`
-        );
+    if (!normalizedName || /[\\/:]/u.test(requestedName)) {
+        return failure('app_not_found', 'No se encontró esa aplicación en el catálogo local.');
+    }
+
+    let appTargets = [];
+    let appName = normalizedName;
+
+    try {
+        const catalog = await loadCatalog({ catalogPath });
+        const discoveredApp = findAppInCatalog(catalog, requestedName);
+
+        if (discoveredApp && isTrustedAppPath(discoveredApp.path, environment)) {
+            appTargets = [{ executable: discoveredApp.path, args: [] }];
+            appName = discoveredApp.name;
+        }
+    } catch {
+        // Un catálogo que no se puede leer no impide usar la whitelist explícita.
+    }
+
+    if (appTargets.length === 0) {
+        appTargets = windowsAppWhitelist[normalizedName]?.map(item => ({
+            executable: item.executable,
+            args: [...item.args],
+        })) ?? [];
+    }
+
+    if (appTargets.length === 0) {
+        return failure('app_not_found', 'No se encontró esa aplicación en el catálogo local.');
     }
 
     for (const appTarget of appTargets) {
@@ -156,8 +192,8 @@ export async function openApp({ args, launchProcess = launchDetachedProcess, pla
             await launchProcess(appTarget.executable, [...appTarget.args]);
             return {
                 success: true,
-                app,
-                message: `Se inició ${app}.`,
+                app: appName,
+                message: `Se inició ${appName}.`,
             };
         } catch {
             // Probar la siguiente ruta permitida para la misma aplicación.
@@ -166,7 +202,7 @@ export async function openApp({ args, launchProcess = launchDetachedProcess, pla
 
     return failure(
         'app_launch_failed',
-        `No se pudo iniciar ${app}. Revisá que esté instalada.`
+        `No se pudo iniciar ${appName}. Revisá que esté instalada.`
     );
 }
 

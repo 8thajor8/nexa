@@ -19,6 +19,7 @@ test('existing local tools declare their intended permissions', () => {
         open_app: 'action',
         open_url: 'action',
         get_open_apps: 'read',
+        discover_apps: 'read',
     });
 
     for (const registration of localToolRegistry.values()) {

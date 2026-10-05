@@ -14,10 +14,15 @@ Pedile a Nexa el clima de una ciudad, por ejemplo: “¿Qué tiempo hace en Barc
 
 ## Windows Tools
 
-Nexa incluye tres herramientas controladas para interactuar con Windows:
+Nexa incluye herramientas controladas para interactuar con Windows:
 
-- `open_app` inicia aplicaciones por nombre lógico usando una whitelist definida en `src/tools/windows.js` (`chrome`, `edge`, `notepad`, `calculator`, `explorer`, `spotify` y `discord`). Para ampliarla, agregá una clave y destinos ejecutables fijos a `windowsAppWhitelist`; no agregues argumentos provenientes del modelo.
+- `open_app` abre una aplicación por nombre lógico, desde el catálogo local o la whitelist explícita.
+- `discover_apps` actualiza el catálogo leyendo accesos directos `.lnk` del menú Inicio del usuario y del equipo. Solo inspecciona esas carpetas conocidas; no escanea el disco ni ejecuta aplicaciones o scripts.
 - `open_url` abre solo URLs absolutas `http://` o `https://` en el navegador predeterminado.
 - `get_open_apps` consulta `tasklist.exe` con formato CSV y parámetros fijos, y devuelve como máximo 100 procesos con nombre y PID.
 
-Las acciones pasan por la permission policy antes de ejecutarse. No hay shell arbitrario, PowerShell genérico, escritura/borrado de archivos ni apagado o reinicio.
+El catálogo se guarda localmente en `data/apps.json` y está excluido de Git porque contiene rutas del equipo. `discover_apps` lo reconstruye; `open_app` normaliza nombres y aliases, busca coincidencias exactas o un prefijo que identifique una sola aplicación, y ejecuta el destino almacenado sin argumentos proporcionados por el modelo. Para aplicaciones descubiertas solo se aceptan ejecutables bajo ubicaciones normales de instalación (Program Files, LocalAppData/Programs o ProgramData); se descartan intérpretes y rutas fuera de esas ubicaciones. GPT recibe nombres lógicos, nunca las rutas ejecutables.
+
+La whitelist de `src/tools/windows.js` sigue siendo un fallback para `chrome`, `edge`, `notepad`, `calculator`, `explorer`, `spotify` y `discord`. Para agregar otra aplicación explícita, agregá su nombre lógico y una ruta fija bajo `windowsAppWhitelist`; mantené sus argumentos fijos y escritos en el código.
+
+Las herramientas pasan por la permission policy antes de ejecutarse. No hay shell arbitrario, PowerShell genérico, escritura/borrado de archivos ni apagado o reinicio.

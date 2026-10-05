@@ -3,6 +3,7 @@ import { rememberRegistration } from './remember.js';
 import { recallRegistration } from './recall.js';
 import { forgetRegistration } from './forget.js';
 import { getWeatherRegistration } from './weather.js';
+import { discoverAppsRegistration } from '../windows/app-discovery.js';
 import {
     getOpenAppsRegistration,
     openAppRegistration,
@@ -20,6 +21,7 @@ const localRegistrations = [
     recallRegistration,
     forgetRegistration,
     getWeatherRegistration,
+    discoverAppsRegistration,
     openAppRegistration,
     openUrlRegistration,
     getOpenAppsRegistration,
