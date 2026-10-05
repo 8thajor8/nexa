@@ -1,0 +1,168 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { access, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { createAudioStore } from '../src/speech/audio-store.js';
+import { createSpeechService } from '../src/speech/service.js';
+import { speechConfig, speechStyles, voiceIdentity, getSpeechInstructions } from '../src/speech/config.js';
+import { createOpenAISpeechProvider } from '../src/speech/providers/openai.js';
+import { generateSpeechTool, playAudioTool, speechRegistrations } from '../src/speech/index.js';
+import { checkToolPermission } from '../src/tools/permissions.js';
+import { createWindowsAudioPlayer } from '../src/speech/windows-player.js';
+
+async function fixture(t, { maxTemporaryAgeMs = 60_000 } = {}) {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'nexa-speech-test-'));
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const directories = {
+        temporaryDirectory: path.join(root, 'data', 'temp', 'audio'),
+        persistentDirectory: path.join(root, 'data', 'audio'),
+        maxTemporaryAgeMs,
+    };
+    const store = createAudioStore(directories);
+    const calls = { generated: [], played: [] };
+    const provider = { async synthesize(options) { calls.generated.push(options); return Buffer.from('RIFF-mock-wav'); } };
+    const player = async filePath => { calls.played.push(filePath); return { success: true }; };
+    return { root, directories, store, calls, provider, player, service: createSpeechService({ provider, store, player }) };
+}
+
+test('generates temporary audio with opaque ID, never returns a path, then plays and cleans it', async t => {
+    const f = await fixture(t);
+    const generated = await f.service.generate({ text: 'Hola Jor', style: 'normal' });
+    assert.deepEqual(generated, {
+        success: true,
+        audioId: generated.audioId,
+        temporary: true,
+        format: 'wav',
+    });
+    assert.match(generated.audioId, /^audio_[a-f0-9]{24}$/u);
+    assert.equal(JSON.stringify(generated).includes('audio\\'), false);
+    const audioPath = f.store.get(generated.audioId).filePath;
+    assert.equal((await readFile(audioPath)).toString(), 'RIFF-mock-wav');
+
+    const played = await f.service.play(generated.audioId);
+    assert.deepEqual(played, { success: true, audioId: generated.audioId, played: true, temporary: true });
+    assert.equal(f.calls.played[0], audioPath);
+    await assert.rejects(access(audioPath));
+    assert.equal(f.store.get(generated.audioId), null);
+});
+
+test('persisted audio survives playback and service shutdown cleanup', async t => {
+    const f = await fixture(t);
+    const generated = await f.service.generate({ text: 'Conservar', persist: true });
+    const second = await f.service.generate({ text: 'Conservar también', persist: true });
+    assert.equal(generated.temporary, false);
+    const audioPath = f.store.get(generated.audioId).filePath;
+    assert.equal((await f.service.play(generated.audioId)).success, true);
+    await f.service.close();
+    assert.equal((await readFile(audioPath)).toString(), 'RIFF-mock-wav');
+    const reopenedStore = createAudioStore(f.directories);
+    await reopenedStore.initialize();
+    assert.equal(reopenedStore.get(generated.audioId).filePath, audioPath);
+    assert(reopenedStore.get(second.audioId));
+});
+
+test('supports every fixed style while keeping a shared voice identity', async t => {
+    const f = await fixture(t);
+    for (const style of Object.keys(speechStyles)) {
+        assert.equal((await f.service.generate({ text: 'Hola', style })).success, true);
+    }
+    assert.equal(Object.keys(speechStyles).join(','), 'normal,professional,alert,sassy,calm');
+    assert(f.calls.generated.every(item => item.instructions.includes(voiceIdentity)));
+    assert.notEqual(getSpeechInstructions('normal'), getSpeechInstructions('calm'));
+});
+
+test('rejects unsupported styles, oversized text and invalid options before provider call', async t => {
+    const f = await fixture(t);
+    assert.equal((await f.service.generate({ text: 'hola', style: 'pirate' })).error.code, 'invalid_speech_style');
+    assert.equal((await f.service.generate({ text: 'x'.repeat(speechConfig.maxTextLength + 1) })).error.code, 'text_too_long');
+    assert.equal((await f.service.generate({ text: 'hola', persist: 'yes' })).error.code, 'invalid_persist_option');
+    assert.equal(f.calls.generated.length, 0);
+});
+
+test('provider failures are sanitized and do not leak their error details', async t => {
+    const f = await fixture(t);
+    f.provider.synthesize = async () => { throw new Error('api_key=super-secret response body'); };
+    const result = await f.service.generate({ text: 'hola' });
+    assert.deepEqual(result, { success: false, error: { code: 'speech_generation_failed', message: 'El proveedor de voz no pudo generar el audio.' } });
+    assert.doesNotMatch(JSON.stringify(result), /secret|api_key|response body/iu);
+});
+
+test('playback only resolves IDs registered during this process; paths and unknown IDs are rejected', async t => {
+    const f = await fixture(t);
+    assert.equal((await f.service.play('C:\\Users\\Jor\\private.wav')).error.code, 'audio_not_found');
+    assert.equal((await f.service.play('audio_000000000000000000000000')).error.code, 'audio_not_found');
+    assert.equal(f.calls.played.length, 0);
+});
+
+test('provider abstraction can be replaced without changing the service API', async t => {
+    const f = await fixture(t);
+    let used = false;
+    const service = createSpeechService({ store: f.store, player: f.player, provider: {
+        async synthesize({ text, instructions }) { used = true; return Buffer.from(`${text}:${instructions.includes('female-presenting')}`); },
+    } });
+    const result = await service.generate({ text: 'other engine' });
+    assert.equal(used, true);
+    assert.equal(result.success, true);
+});
+
+test('startup cleanup deletes only expired Nexa temp files within its dedicated directory', async t => {
+    const f = await fixture(t, { maxTemporaryAgeMs: 1000 });
+    await f.store.initialize();
+    const oldName = `audio_${'a'.repeat(24)}.wav`;
+    const stalePath = path.join(f.directories.temporaryDirectory, oldName);
+    const unrelatedPath = path.join(f.directories.temporaryDirectory, 'keep.wav');
+    const outsidePath = path.join(f.root, oldName);
+    await writeFile(stalePath, 'stale');
+    await writeFile(unrelatedPath, 'keep');
+    await writeFile(outsidePath, 'outside');
+    const oldDate = new Date(Date.now() - 10_000);
+    await utimes(stalePath, oldDate, oldDate);
+    await utimes(outsidePath, oldDate, oldDate);
+    const result = await f.store.cleanupOldTemporaryAudio();
+    assert.deepEqual(result, { success: true, removed: 1 });
+    assert.deepEqual((await readdir(f.directories.temporaryDirectory)).sort(), ['keep.wav']);
+    assert.equal((await readFile(outsidePath)).toString(), 'outside');
+});
+
+test('shutdown deletes unplayed temporary files but leaves persistent audio', async t => {
+    const f = await fixture(t);
+    const temporary = await f.service.generate({ text: 'Temporal' });
+    const persistent = await f.service.generate({ text: 'Persistente', persist: true });
+    const temporaryPath = f.store.get(temporary.audioId).filePath;
+    const persistentPath = f.store.get(persistent.audioId).filePath;
+    await f.service.close();
+    await assert.rejects(access(temporaryPath));
+    await access(persistentPath);
+});
+
+test('OpenAI provider uses centralized model, voice, instructions, WAV format and current SDK endpoint', async () => {
+    let request;
+    const provider = createOpenAISpeechProvider({ clientFactory: () => ({ audio: { speech: { async create(options) {
+        request = options;
+        return { async arrayBuffer() { return Uint8Array.from([1, 2, 3]).buffer; } };
+    } } } }) });
+    assert.deepEqual(await provider.synthesize({ text: 'Hola', instructions: 'Nexa voice' }), Buffer.from([1, 2, 3]));
+    assert.deepEqual(request, {
+        model: 'gpt-4o-mini-tts', voice: 'marin', input: 'Hola', instructions: 'Nexa voice', response_format: 'wav',
+    });
+});
+
+test('Windows playback uses the fixed native audio API and rejects other platforms', async () => {
+    let played;
+    const windowsPlayer = createWindowsAudioPlayer({ platform: 'win32', playSound: async audioPath => { played = audioPath; } });
+    assert.deepEqual(await windowsPlayer('internal-controlled-audio.wav'), { success: true });
+    assert.equal(played, 'internal-controlled-audio.wav');
+    const unsupported = await createWindowsAudioPlayer({ platform: 'linux' })('ignored.wav');
+    assert.equal(unsupported.error.code, 'unsupported_platform');
+});
+
+test('public schemas constrain style and expose only opaque identifiers', () => {
+    assert.deepEqual(generateSpeechTool.parameters.properties.style.enum, ['normal', 'professional', 'alert', 'sassy', 'calm']);
+    assert.equal(generateSpeechTool.parameters.properties.text.maxLength, 3000);
+    assert.deepEqual(Object.keys(playAudioTool.parameters.properties), ['audioId']);
+    assert.equal(playAudioTool.parameters.properties.audioId.pattern, '^audio_[a-f0-9]{24}$');
+    assert.deepEqual(speechRegistrations.map(item => item.definition.name), ['generate_speech', 'play_audio']);
+    assert.equal(checkToolPermission({ permission: 'external_read' }).allowed, true);
+    assert.equal(checkToolPermission({ permission: 'action' }).allowed, true);
+});

@@ -96,6 +96,18 @@ Instalá el navegador Playwright una vez con `npx playwright install chromium`, 
 
 El siguiente batch debe aplicar una **External Communication Identity Policy** (presentación de Nexa y confirmación requerida) antes de habilitar cualquier envío real.
 
+### Nexa Voice / Speech Foundation
+
+`src/speech/` separa el `SpeechService` de sus providers. El provider actual usa el SDK OpenAI existente (`audio.speech.create`, endpoint `/v1/audio/speech`) y el cliente compartido/API key de Nexa. La configuración central `src/speech/config.js` selecciona `gpt-4o-mini-tts`, `marin` y salida WAV para que Windows pueda reproducirla con la API nativa WinMM `PlaySoundW` sin shell ni reproductor arbitrario. OpenAI recomienda `gpt-4o-mini-tts` para TTS y `marin`/`cedar` por calidad; las voces están optimizadas para inglés, por lo que el acento español rioplatense se indica al modelo y debe evaluarse escuchando una muestra.
+
+La identidad fija pide una voz femenina joven adulta, inteligente, segura, conversacional, cálida y clara, con acento porteño sutil y sin tono de locutora. Los estilos permitidos (`normal`, `professional`, `alert`, `sassy`, `calm`) cambian solamente la interpretación. El modelo elige un estilo de ese enum, nunca envía instrucciones libres al provider. `generate_speech` limita el texto a 3000 caracteres y devuelve un `audioId` opaco; `play_audio` acepta únicamente una referencia emitida por Nexa, nunca una ruta.
+
+Por defecto los WAV se guardan en `data/temp/audio/`, se reproducen sincrónicamente y se borran al terminar la reproducción o al cerrar Nexa. Al iniciar se eliminan temporales reconocidos con más de 24 horas. La limpieza inspecciona únicamente archivos WAV con nombre generado dentro de esa carpeta. `persist=true` conserva el WAV en `data/audio/`; el índice local solo contiene IDs generados y permite resolverlos tras reiniciar Nexa. Ambos directorios y el índice están excluidos de Git. Errores del provider y del reproductor se sanitizan y el modelo nunca recibe rutas ni bytes de audio.
+
+El servicio recibe un provider con `synthesize({ text, instructions, format })`, así futuros providers podrán agregarse sin cambiar las tools. Esta etapa no implementa streaming, STT, micrófono, wake word ni Realtime conversation.
+
+Para la prueba de voz, ejecutá `npm start` y pedile: `Nexa, generá y reproducí un audio diciendo: “Hola Jor, soy Nexa. Parece que finalmente me diste una voz.”` La salida temporal se elimina luego de escucharse; si querés conservarla, pedí explícitamente guardar el audio.
+
 El agente cuenta como máximo cinco rondas que solicitan herramientas (`maxToolIterations`). Si la quinta ronda usa herramientas, se permite un turno final del modelo con las herramientas deshabilitadas para redactar la respuesta; ese turno no puede ejecutar otra acción. `NEXA_AGENT_DEBUG=true` registra número de ronda, herramienta, resumen seguro de argumentos, resultado y tipo de respuesta del modelo sin imprimir valores de texto.
 
 Las pruebas automatizadas usan un proveedor simulado y no requieren aplicaciones abiertas. Para validarlo localmente, ejecutá `npm start`, abrí Calculator o Notepad, pedile a Nexa `inspeccioná los controles de Notepad`, y probá después `buscá el campo de edición de Notepad` o `leé el valor de ui_1` usando la referencia que Nexa haya recibido. La inspección real requiere una sesión interactiva de Windows y una aplicación abierta.

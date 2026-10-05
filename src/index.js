@@ -4,6 +4,9 @@ import { stdin as input, stdout as output } from 'node:process';
 
 import { createAgent } from './core/agent.js';
 import { closeWhatsAppBrowser } from './integrations/whatsapp/bridge/session.js';
+import { closeSpeechService, initializeSpeechService } from './speech/service.js';
+
+await initializeSpeechService();
 
 const rl = readline.createInterface({
     input,
@@ -45,4 +48,5 @@ try {
 } finally {
     rl.close();
     await closeWhatsAppBrowser();
+    await closeSpeechService();
 }

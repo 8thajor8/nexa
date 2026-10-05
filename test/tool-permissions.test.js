@@ -44,6 +44,8 @@ test('existing local tools declare their intended permissions', () => {
         whatsapp_open_chat: 'action',
         whatsapp_prepare_message: 'action',
         whatsapp_get_status: 'read',
+        generate_speech: 'external_read',
+        play_audio: 'action',
         spotify_get_current_track: 'external_read',
         spotify_search: 'external_read',
         spotify_get_devices: 'external_read',
