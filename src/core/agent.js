@@ -7,12 +7,14 @@ import { tools, executeTool } from '../tools/index.js';
 export async function createAgent() {
     const memory = await loadMemory();
 
-    const instructions = `
+    function getInstructions() {
+        return `
 ${NEXA_INSTRUCTIONS}
 
 MEMORIA ACTUAL DEL USUARIO:
 ${memoryToPrompt(memory)}
 `;
+    }
 
     const conversation = [];
 
@@ -24,7 +26,7 @@ ${memoryToPrompt(memory)}
 
         for (let iteration = 0; iteration < config.maxToolIterations; iteration++) {
             const response = await askOpenAI({
-                instructions,
+                instructions: getInstructions(),
                 input: conversation,
                 tools,
             });
