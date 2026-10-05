@@ -4,6 +4,14 @@ import { recallRegistration } from './recall.js';
 import { forgetRegistration } from './forget.js';
 import { getWeatherRegistration } from './weather.js';
 import { discoverAppsRegistration } from '../windows/app-discovery.js';
+import { listDirectoryRegistration, readFileRegistration } from '../windows/filesystem.js';
+import {
+    getVolumeRegistration,
+    mediaPlayPauseRegistration,
+    muteVolumeRegistration,
+    setVolumeRegistration,
+    unmuteVolumeRegistration,
+} from '../windows/audio.js';
 import {
     getOpenAppsRegistration,
     openAppRegistration,
@@ -25,6 +33,13 @@ const localRegistrations = [
     openAppRegistration,
     openUrlRegistration,
     getOpenAppsRegistration,
+    listDirectoryRegistration,
+    readFileRegistration,
+    getVolumeRegistration,
+    setVolumeRegistration,
+    muteVolumeRegistration,
+    unmuteVolumeRegistration,
+    mediaPlayPauseRegistration,
 ].map(registration => ({
     ...registration,
     permission: toolPermissions[registration.definition.name],

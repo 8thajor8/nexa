@@ -13,6 +13,8 @@
   "description": "",
   "dependencies": {
     "dotenv": "^18.0.5",
+    "koffi": "3.3.2",
+    "loudness": "0.4.2",
     "openai": "^7.27.0"
   }
 }

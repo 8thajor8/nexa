@@ -20,6 +20,13 @@ test('existing local tools declare their intended permissions', () => {
         open_url: 'action',
         get_open_apps: 'read',
         discover_apps: 'read',
+        list_directory: 'read',
+        read_file: 'read',
+        get_volume: 'read',
+        set_volume: 'action',
+        mute_volume: 'action',
+        unmute_volume: 'action',
+        media_play_pause: 'action',
     });
 
     for (const registration of localToolRegistry.values()) {
