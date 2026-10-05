@@ -1,5 +1,131 @@
 import { SpotifyApiError, spotifyClient } from './client.js';
 import { chooseUnambiguousResult, searchSpotify, spotifyFailure } from './search.js';
+import { openApp } from '../../tools/windows.js';
+import { mediaPlayPause } from '../../windows/audio.js';
+import { controlWindow, getActiveWindow, isAppRunning } from '../../windows/window-control.js';
+
+const recoveryDelaysMs = [500, 1000, 1500, 2000];
+
+function wait(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function chooseSpotifyDevice(devices) {
+    const usable = devices.filter(device =>
+        typeof device?.id === 'string' && device.id.length > 0 && device.is_restricted !== true
+    );
+    if (usable.length === 0) return { status: 'none' };
+
+    const active = usable.filter(device => device.is_active === true);
+    if (active.length === 1) return { status: 'found', device: active[0] };
+    if (active.length > 1) return { status: 'ambiguous' };
+
+    const desktop = usable.filter(device =>
+        device.type === 'computer' && /spotify|desktop|laptop|pc/iu.test(device.name ?? '')
+    );
+    if (desktop.length === 1) return { status: 'found', device: desktop[0] };
+    if (desktop.length > 1 || usable.length > 1) return { status: 'ambiguous' };
+    return { status: 'found', device: usable[0] };
+}
+
+function recoveryError(code, message) {
+    return { success: false, error: { code, message } };
+}
+
+async function getRawDevices(client) {
+    const response = await client.request('/me/player/devices');
+    return Array.isArray(response?.devices) ? response.devices : [];
+}
+
+async function activateRunningSpotify({ adapters, client }) {
+    const focused = await adapters.focusSpotify();
+    if (!focused?.success) return;
+
+    // Only send the global toggle after confirming Spotify is foreground and
+    // Spotify reports a known paused item. Never toggle unknown or playing state.
+    const [activeWindow, current] = await Promise.all([
+        adapters.getActiveWindow(),
+        getCurrentSpotifyTrack({ client }),
+    ]);
+    if (
+        activeWindow?.success && activeWindow.window?.process?.toLowerCase() === 'spotify.exe' &&
+        current?.success && current.track && current.playing === false
+    ) {
+        await adapters.playPause();
+    }
+}
+
+const defaultRecoveryAdapters = {
+    isSpotifyRunning: () => isAppRunning({ args: { app: 'spotify' } }),
+    openSpotify: () => openApp({ args: { app: 'spotify' } }),
+    focusSpotify: () => controlWindow({ target: 'spotify', action: 'focus' }),
+    getActiveWindow: () => getActiveWindow(),
+    playPause: () => mediaPlayPause(),
+    wait,
+};
+
+export async function ensureSpotifyDevice({
+    client = spotifyClient,
+    adapters = {},
+} = {}) {
+    adapters = { ...defaultRecoveryAdapters, ...adapters };
+    let devices;
+    try {
+        devices = await getRawDevices(client);
+    } catch {
+        return recoveryError('device_activation_failed', 'No se pudieron consultar los dispositivos de Spotify.');
+    }
+
+    let selected = chooseSpotifyDevice(devices);
+    if (selected.status === 'found') return { success: true, device: selected.device, recovered: false };
+    if (selected.status === 'ambiguous') {
+        return recoveryError('ambiguous_device', 'Spotify informa varios dispositivos posibles y ninguno está activo.');
+    }
+
+    let running;
+    try {
+        running = await adapters.isSpotifyRunning();
+    } catch {
+        return recoveryError('device_activation_failed', 'No se pudo comprobar si Spotify está abierto.');
+    }
+    if (!running?.success) {
+        return recoveryError('device_activation_failed', 'No se pudo comprobar si Spotify está abierto.');
+    }
+
+    if (running.running) {
+        try {
+            await activateRunningSpotify({ adapters, client });
+        } catch {
+            // Continue bounded device discovery; media activation is optional.
+        }
+    } else {
+        let launched;
+        try {
+            launched = await adapters.openSpotify();
+        } catch {
+            launched = null;
+        }
+        if (!launched?.success) {
+            return recoveryError('spotify_launch_failed', launched?.error?.message ?? 'No se pudo abrir Spotify Desktop.');
+        }
+    }
+
+    for (const delay of recoveryDelaysMs) {
+        await adapters.wait(delay);
+        try {
+            devices = await getRawDevices(client);
+        } catch {
+            continue;
+        }
+        selected = chooseSpotifyDevice(devices);
+        if (selected.status === 'found') return { success: true, device: selected.device, recovered: true };
+        if (selected.status === 'ambiguous') {
+            return recoveryError('ambiguous_device', 'Spotify informa varios dispositivos posibles y ninguno está activo.');
+        }
+    }
+
+    return recoveryError('device_timeout', 'Spotify Desktop no apareció como dispositivo Connect dentro del tiempo esperado.');
+}
 
 function spotifyLink(value) {
     try {
@@ -54,7 +180,7 @@ export async function getSpotifyDevices({ client = spotifyClient } = {}) {
     }
 }
 
-async function sendPlaybackCommand(client, action, { method = 'PUT', body } = {}) {
+async function sendPlaybackCommand(client, action, { method = 'PUT', body, query } = {}) {
     try {
         const endpoint = {
             pause: '/me/player/pause',
@@ -63,18 +189,22 @@ async function sendPlaybackCommand(client, action, { method = 'PUT', body } = {}
             play: '/me/player/play',
         }[action];
         if (!endpoint) throw new SpotifyApiError('spotify_action_invalid', 'Acción de reproducción no válida.');
-        await client.request(endpoint, { method, ...(body ? { body } : {}) });
+        await client.request(endpoint, {
+            method,
+            ...(body && Object.keys(body).length > 0 ? { body } : {}),
+            ...(query ? { query } : {}),
+        });
         return { success: true, action, confirmed: true };
     } catch (error) {
         return spotifyFailure(error);
     }
 }
 
-export async function playSpotify({ query = '', type = 'track', client = spotifyClient } = {}) {
+export async function playSpotify({ query = '', type = 'track', client = spotifyClient, recoveryAdapters } = {}) {
     if (typeof query !== 'string' || query.length > 200 || !['track', 'artist', 'album'].includes(type)) {
         return { success: false, error: { code: 'spotify_query_invalid', message: 'La búsqueda o el tipo de contenido no es válido.' } };
     }
-    if (!query.trim()) return sendPlaybackCommand(client, 'play');
+    if (!query.trim()) return playWithDeviceRecovery(client, {}, recoveryAdapters);
 
     const search = await searchSpotify(query, type, { client });
     if (!search.success) return search;
@@ -96,10 +226,28 @@ export async function playSpotify({ query = '', type = 'track', client = spotify
     const body = item.type === 'track'
         ? { uris: [item.uri] }
         : { context_uri: item.uri };
-    const result = await sendPlaybackCommand(client, 'play', { body });
+    const result = await playWithDeviceRecovery(client, body, recoveryAdapters);
     return result.success
         ? { ...result, selected: { type: item.type, name: item.name, artists: item.artists, spotifyUrl: item.spotifyUrl } }
         : result;
+}
+
+async function playWithDeviceRecovery(client, body, recoveryAdapters) {
+    const firstAttempt = await sendPlaybackCommand(client, 'play', { body });
+    if (firstAttempt.success || firstAttempt.error?.code !== 'spotify_no_device') return firstAttempt;
+
+    const recovery = await ensureSpotifyDevice({ client, ...(recoveryAdapters ? { adapters: recoveryAdapters } : {}) });
+    if (!recovery.success) return recovery;
+
+    const retried = await sendPlaybackCommand(client, 'play', {
+        body,
+        query: { device_id: recovery.device.id },
+    });
+    if (retried.success) return { ...retried, recovered: recovery.recovered };
+    if (retried.error?.code === 'spotify_no_device') {
+        return recoveryError('playback_failed', 'El dispositivo apareció, pero Spotify no aceptó la reproducción.');
+    }
+    return retried;
 }
 
 export async function pauseSpotify({ client = spotifyClient } = {}) {

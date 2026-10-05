@@ -7,6 +7,7 @@ import { SpotifyClient } from '../src/integrations/spotify/client.js';
 import {
     getCurrentSpotifyTrack,
     getSpotifyDevices,
+    ensureSpotifyDevice,
     nextSpotifyTrack,
     pauseSpotify,
     playSpotify,
@@ -34,6 +35,24 @@ const track = {
     uri: 'spotify:track:abc123',
     external_urls: { spotify: 'https://open.spotify.com/track/abc123' },
 };
+
+const recoveredDevice = { id: 'desktop-123', name: 'Spotify Desktop', type: 'computer', is_active: false, is_restricted: false };
+
+function recoveryAdapters(overrides = {}) {
+    return {
+        isSpotifyRunning: async () => ({ success: true, running: false }),
+        openSpotify: async () => ({ success: true }),
+        focusSpotify: async () => ({ success: true }),
+        getActiveWindow: async () => ({ success: true, window: null }),
+        playPause: async () => ({ success: true }),
+        wait: async () => {},
+        ...overrides,
+    };
+}
+
+function spotifyNoDevice() {
+    return Object.assign(new Error('No device'), { code: 'spotify_no_device' });
+}
 
 test('spotify_search validates queries, limits results, normalizes items and links to Spotify', async () => {
     let request;
@@ -93,6 +112,144 @@ test('spotify_play with an empty query resumes without fabricating a URI', async
     const result = await playSpotify({ query: '', type: 'track', client: { request: async (...args) => { call = args; } } });
     assert.equal(result.success, true);
     assert.deepEqual(call, ['/me/player/play', { method: 'PUT' }]);
+});
+
+test('device recovery returns a ready device immediately and prefers the active device', async () => {
+    const active = { ...recoveredDevice, id: 'active', is_active: true };
+    let requests = 0;
+    const result = await ensureSpotifyDevice({
+        client: { request: async () => { requests += 1; return { devices: [recoveredDevice, active] }; } },
+        adapters: recoveryAdapters({ openSpotify: async () => assert.fail('should not launch Spotify') }),
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.device.id, 'active');
+    assert.equal(result.recovered, false);
+    assert.equal(requests, 1);
+});
+
+test('playback launches closed Spotify, retries device discovery, then retries the original track', async () => {
+    const calls = [];
+    let deviceChecks = 0;
+    let launches = 0;
+    const result = await playSpotify({
+        query: 'Hypnotized Purple Disco Machine',
+        client: { request: async (endpoint, options) => {
+            calls.push([endpoint, options]);
+            if (endpoint === '/search') return { tracks: { items: [track] } };
+            if (endpoint === '/me/player/play' && !options?.query) throw spotifyNoDevice();
+            if (endpoint === '/me/player/devices') {
+                deviceChecks += 1;
+                return { devices: deviceChecks === 1 ? [] : [recoveredDevice] };
+            }
+            return null;
+        } },
+        recoveryAdapters: recoveryAdapters({
+            openSpotify: async () => { launches += 1; return { success: true }; },
+        }),
+    });
+    assert.equal(result.success, true);
+    assert.equal(result.recovered, true);
+    assert.equal(result.selected.name, 'Hypnotized');
+    assert.equal(launches, 1);
+    assert.deepEqual(calls.filter(([endpoint]) => endpoint === '/me/player/play').map(([, options]) => options), [
+        { method: 'PUT', body: { uris: ['spotify:track:abc123'] } },
+        { method: 'PUT', body: { uris: ['spotify:track:abc123'] }, query: { device_id: 'desktop-123' } },
+    ]);
+});
+
+test('running Spotify is focused and media toggle is skipped while audio is already playing', async () => {
+    let toggles = 0;
+    let focused = 0;
+    let checks = 0;
+    const result = await ensureSpotifyDevice({
+        client: { request: async endpoint => {
+            if (endpoint === '/me/player/devices') return { devices: ++checks === 1 ? [] : [recoveredDevice] };
+            if (endpoint === '/me/player/currently-playing') return { is_playing: true, item: track };
+            return null;
+        } },
+        adapters: recoveryAdapters({
+            isSpotifyRunning: async () => ({ success: true, running: true }),
+            focusSpotify: async () => { focused += 1; return { success: true }; },
+            getActiveWindow: async () => ({ success: true, window: { process: 'Spotify.exe' } }),
+            playPause: async () => { toggles += 1; },
+        }),
+    });
+    assert.equal(result.success, true);
+    assert.equal(focused, 1);
+    assert.equal(toggles, 0);
+});
+
+test('device recovery reports launch failure, timeout, and ambiguous devices without choosing remotely', async () => {
+    const launchFailure = await ensureSpotifyDevice({
+        client: { request: async () => ({ devices: [] }) },
+        adapters: recoveryAdapters({ openSpotify: async () => ({ success: false, error: { message: 'Launch denied' } }) }),
+    });
+    assert.equal(launchFailure.error.code, 'spotify_launch_failed');
+
+    const timeout = await ensureSpotifyDevice({
+        client: { request: async () => ({ devices: [] }) },
+        adapters: recoveryAdapters(),
+    });
+    assert.equal(timeout.error.code, 'device_timeout');
+
+    const ambiguous = await ensureSpotifyDevice({
+        client: { request: async () => ({ devices: [
+            { id: 'speaker', name: 'Living room', type: 'speaker', is_active: false },
+            { id: 'phone', name: 'Phone', type: 'smartphone', is_active: false },
+        ] }) },
+        adapters: recoveryAdapters({ openSpotify: async () => assert.fail('should not open for ambiguity') }),
+    });
+    assert.equal(ambiguous.error.code, 'ambiguous_device');
+
+    const activationFailure = await ensureSpotifyDevice({
+        client: { request: async () => ({ devices: [] }) },
+        adapters: recoveryAdapters({ isSpotifyRunning: async () => ({ success: false }) }),
+    });
+    assert.equal(activationFailure.error.code, 'device_activation_failed');
+});
+
+test('recovered playback reports playback_failed if Spotify rejects the selected device again', async () => {
+    const result = await playSpotify({
+        query: 'Hypnotized Purple Disco Machine',
+        client: { request: async (endpoint, options) => {
+            if (endpoint === '/search') return { tracks: { items: [track] } };
+            if (endpoint === '/me/player/play') throw spotifyNoDevice();
+            if (endpoint === '/me/player/devices') return { devices: [recoveredDevice] };
+            return null;
+        } },
+        recoveryAdapters: recoveryAdapters(),
+    });
+    assert.equal(result.success, false);
+    assert.equal(result.error.code, 'playback_failed');
+});
+
+test('media Play/Pause is used only for a known paused Spotify item in its foreground window', async () => {
+    let toggles = 0;
+    let checks = 0;
+    const result = await ensureSpotifyDevice({
+        client: { request: async endpoint => {
+            if (endpoint === '/me/player/devices') return { devices: ++checks === 1 ? [] : [recoveredDevice] };
+            if (endpoint === '/me/player/currently-playing') return { is_playing: false, item: track };
+            return null;
+        } },
+        adapters: recoveryAdapters({
+            isSpotifyRunning: async () => ({ success: true, running: true }),
+            getActiveWindow: async () => ({ success: true, window: { process: 'Spotify.exe' } }),
+            playPause: async () => { toggles += 1; },
+        }),
+    });
+    assert.equal(result.success, true);
+    assert.equal(toggles, 1);
+});
+
+test('informational Spotify calls never launch or activate Spotify', async () => {
+    let request;
+    await searchSpotify('Purple Disco Machine', 'artist', { client: { request: async (...args) => {
+        request = args;
+        return { artists: { items: [] } };
+    } } });
+    assert.equal(request[0], '/search');
+    assert.equal((await getSpotifyDevices({ client: { request: async () => ({ devices: [] }) } })).success, true);
 });
 
 test('pause, next, and previous send their documented methods and require 204 confirmation', async () => {
