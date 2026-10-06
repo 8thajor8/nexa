@@ -14,6 +14,7 @@ import { digitalCastingOutputs, generateVoiceCastingSamples } from '../src/speec
 import { normalizeWavLengths } from '../src/speech/wav.js';
 import { createVoiceFxProcessor, measureVoiceFxDifference, voiceFxProfiles } from '../src/speech/voice-fx.js';
 import { nexaVoiceIdentity } from '../src/speech/voice-identity.js';
+import { novaPortenaInstructions } from '../src/speech/voice-casting-profiles.js';
 
 const passthroughIdentityProcessor = { async process(audio) { return Buffer.from(audio); } };
 
@@ -121,6 +122,9 @@ test('supports every fixed style while keeping a shared voice identity', async t
     assert.equal(Object.keys(speechStyles).join(','), 'normal,professional,alert,sassy,calm');
     assert(f.calls.generated.every(item => item.instructions.includes(voiceIdentity)));
     assert.notEqual(getSpeechInstructions('normal'), getSpeechInstructions('calm'));
+    assert.equal(voiceIdentity.startsWith(novaPortenaInstructions), true);
+    assert.match(getSpeechInstructions('normal'), /warm, lively, relaxed conversational delivery/iu);
+    assert.doesNotMatch(speechStyles.normal, /balanced, friendly tone|corporate|confident, clever/iu);
 });
 
 test('production voice config selects Nova and enables the separate identity processor by default', () => {

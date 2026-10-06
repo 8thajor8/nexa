@@ -1,4 +1,6 @@
 // Original personality casting prompts are kept as development reference.
+export const novaPortenaInstructions = 'Speak casually in natural Buenos Aires Rioplatense Spanish. Use voseo and Argentine musicality naturally when the text allows. Sound young and relaxed. Keep naturalness more important than accent intensity; do not imitate stereotypes or exaggerate the Argentine accent.';
+
 export const castingVariants = Object.freeze([
     Object.freeze({
         name: 'nova-natural',
@@ -13,7 +15,7 @@ export const castingVariants = Object.freeze([
     Object.freeze({
         name: 'nova-portena',
         voice: 'nova',
-        instructions: 'Speak casually in natural Buenos Aires Rioplatense Spanish. Use voseo and Argentine musicality naturally when the text allows. Sound young and relaxed. Keep naturalness more important than accent intensity; do not imitate stereotypes or exaggerate the Argentine accent.',
+        instructions: novaPortenaInstructions,
     }),
     Object.freeze({
         name: 'nova-nexa',

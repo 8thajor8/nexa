@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { novaPortenaInstructions } from './voice-casting-profiles.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 
@@ -16,16 +17,14 @@ export const speechConfig = Object.freeze({
 });
 
 export const voiceIdentity = [
-    'Speak in Spanish with a subtle, natural Buenos Aires / Rioplatense Argentine accent.',
-    'Sound like a young woman in her mid-to-late twenties: casual, confident, clever and spontaneous.',
-    'Warm and energetic, with natural changes in rhythm, intonation and pauses.',
-    'It should feel like a real person talking to someone she knows well.',
-    'Keep the accent noticeable but never exaggerated.',
-    'Avoid virtual-assistant, GPS, corporate-presenter, announcer, narrator, customer-service, overly polished, or robotic delivery.',
+    novaPortenaInstructions,
+    'Use a youthful adult feminine voice. Be warm, friendly, lively and spontaneous, like you enjoy chatting with someone you know well.',
+    'Let wit and a playful edge come naturally. Keep confidence relaxed and approachable.',
+    'Never sound cold, overly serious, corporate, announcer-like, or as if presenting a script.',
 ].join(' ');
 
 export const speechStyles = Object.freeze({
-    normal: 'Speak naturally and conversationally, with a balanced, friendly tone.',
+    normal: 'Use a warm, lively, relaxed conversational delivery. Let your personality and enjoyment show; keep the playfulness subtle and natural.',
     professional: 'Use a composed, precise and confident tone while staying natural and approachable.',
     alert: 'Sound attentive and clear, with gentle urgency but no alarmist or exaggerated delivery.',
     sassy: 'Add subtle wit and playful confidence; keep it kind and never theatrical or mean.',
