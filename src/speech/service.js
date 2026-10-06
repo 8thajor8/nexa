@@ -49,9 +49,19 @@ export function createSpeechService({
         if (!initialized.success) return initialized;
         const reference = store.get(audioId);
         if (!reference || !await store.isAvailable(audioId)) return failure('audio_not_found', 'No existe un audio disponible con ese identificador.');
-        const result = await player(reference.filePath);
+        let result;
+        try { result = await player(reference.filePath); }
+        catch { result = failure('audio_playback_failed', 'Windows no pudo reproducir el audio.'); }
+        finally {
+            // A temporary file is one-shot: an explicit playback attempt ends
+            // its lifecycle whether playback succeeded or failed. The store
+            // verifies the ID, directory and file type before deleting it.
+            if (reference.temporary) {
+                try { await store.removeTemporary(audioId); }
+                catch { /* Startup/shutdown cleanup remains a second safeguard. */ }
+            }
+        }
         if (!result?.success) return result?.error ? result : failure('audio_playback_failed', 'Windows no pudo reproducir el audio.');
-        if (reference.temporary) await store.removeTemporary(audioId);
         return { success: true, audioId, played: true, temporary: reference.temporary };
     }
 

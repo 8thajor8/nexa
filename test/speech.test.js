@@ -10,7 +10,7 @@ import { createOpenAISpeechProvider } from '../src/speech/providers/openai.js';
 import { generateSpeechTool, playAudioTool, speechRegistrations } from '../src/speech/index.js';
 import { checkToolPermission } from '../src/tools/permissions.js';
 import { createWindowsAudioPlayer } from '../src/speech/windows-player.js';
-import { castingVoices, castingText, castingInstructions, generateVoiceCastingSamples } from '../src/speech/voice-casting.js';
+import { castingVariants, castingText, generateVoiceCastingSamples } from '../src/speech/voice-casting.js';
 import { normalizeWavLengths } from '../src/speech/wav.js';
 
 async function fixture(t, { maxTemporaryAgeMs = 60_000 } = {}) {
@@ -62,6 +62,27 @@ test('persisted audio survives playback and service shutdown cleanup', async t =
     await reopenedStore.initialize();
     assert.equal(reopenedStore.get(generated.audioId).filePath, audioPath);
     assert(reopenedStore.get(second.audioId));
+});
+
+test('failed or thrown playback attempts remove temporary audio but preserve persistent audio', async t => {
+    const f = await fixture(t);
+    const service = createSpeechService({
+        provider: f.provider,
+        store: f.store,
+        player: async () => { throw new Error('native playback failed'); },
+    });
+    const temporary = await service.generate({ text: 'Una sola vez' });
+    const temporaryPath = f.store.get(temporary.audioId).filePath;
+    const failedTemporary = await service.play(temporary.audioId);
+    assert.equal(failedTemporary.error.code, 'audio_playback_failed');
+    await assert.rejects(access(temporaryPath));
+    assert.equal(f.store.get(temporary.audioId), null);
+
+    const persistent = await service.generate({ text: 'Conservar', persist: true });
+    const persistentPath = f.store.get(persistent.audioId).filePath;
+    const failedPersistent = await service.play(persistent.audioId);
+    assert.equal(failedPersistent.error.code, 'audio_playback_failed');
+    await access(persistentPath);
 });
 
 test('supports every fixed style while keeping a shared voice identity', async t => {
@@ -183,7 +204,7 @@ test('Windows playback opens WAV through MCI, waits for completion, closes it, a
     assert.equal(invalidPath.error.code, 'invalid_audio_reference');
 });
 
-test('voice casting writes one sample per fixed supported voice and shares identical text/instructions', async t => {
+test('Nova personality casting writes four samples with fixed model, voice, text and WAV format', async t => {
     const f = await fixture(t);
     const outputDirectory = path.join(f.root, 'voice-casting');
     const requests = [];
@@ -191,21 +212,24 @@ test('voice casting writes one sample per fixed supported voice and shares ident
         outputDirectory,
         provider: { async synthesize(options) { requests.push(options); return Buffer.from(`wav:${options.voice}`); } },
     });
-    assert.deepEqual(samples.map(item => item.voice), ['coral', 'nova', 'shimmer', 'sage']);
-    assert.deepEqual(castingVoices, samples.map(item => item.voice));
-    assert(requests.every(item => item.text === castingText && item.instructions === castingInstructions && item.format === 'wav'));
-    for (const sample of samples) assert.equal((await readFile(sample.path)).toString(), `wav:${sample.voice}`);
+    assert.deepEqual(samples.map(item => item.name), ['nova-natural', 'nova-canchera', 'nova-portena', 'nova-nexa']);
+    assert(samples.every(item => item.voice === 'nova'));
+    assert(requests.every(item => item.voice === 'nova' && item.text === castingText && item.format === 'wav'));
+    assert.equal(new Set(requests.map(item => item.instructions)).size, 4);
+    assert.equal(castingVariants.length, 4);
+    assert(requests.every((item, index) => item.instructions === castingVariants[index].instructions));
+    for (const sample of samples) assert.equal((await readFile(sample.path)).toString(), 'wav:nova');
 });
 
-test('voice casting provider errors do not invoke live OpenAI in test and only fixed voice names are output', async t => {
+test('Nova casting uses only fixed variant instructions and reports provider errors', async t => {
     const f = await fixture(t);
     const requests = [];
     const result = await generateVoiceCastingSamples({ outputDirectory: path.join(f.root, 'cast'), provider: {
-        async synthesize(options) { requests.push(options); if (options.voice === 'nova') throw new Error('mock provider failure'); return Buffer.from('sample'); },
+        async synthesize(options) { requests.push(options); if (options.instructions === castingVariants[1].instructions) throw new Error('mock provider failure'); return Buffer.from('sample'); },
     } }).catch(error => error);
     assert.match(result.message, /mock provider failure/u);
-    assert.deepEqual(requests.map(item => item.voice), ['coral', 'nova']);
-    assert.deepEqual(castingVoices, ['coral', 'nova', 'shimmer', 'sage']);
+    assert.deepEqual(requests.map(item => item.voice), ['nova', 'nova']);
+    assert.deepEqual(requests.map(item => item.instructions), castingVariants.slice(0, 2).map(item => item.instructions));
 });
 
 test('public schemas constrain style and expose only opaque identifiers', () => {

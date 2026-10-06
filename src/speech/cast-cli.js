@@ -4,7 +4,7 @@ import { generateVoiceCastingSamples } from './voice-casting.js';
 try {
     const samples = await generateVoiceCastingSamples();
     console.log('Muestras de voz generadas:');
-    for (const sample of samples) console.log(`- ${sample.voice}: ${sample.path}`);
+    for (const sample of samples) console.log(`- ${sample.name} (${sample.voice}): ${sample.path}`);
     console.log('Escuchalas y elegí; Nexa conserva marin como voz predeterminada.');
 } catch (error) {
     const status = Number.isInteger(error?.status) ? ` (HTTP ${error.status})` : '';
