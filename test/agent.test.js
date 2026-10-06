@@ -132,3 +132,15 @@ test('agent debug summary reports tool rounds and safe argument metadata', async
     assert.match(serialized, /"length":13/);
     assert.equal(serialized.includes('secret phrase'), false);
 });
+
+test('agent passes the exact current user message and a stable private session id to tools', async () => {
+    const contexts = [];
+    const { agent } = await makeAgent({
+        responses: [toolResponse(functionCall('confirm_pending_action', { actionId: 'action_0123456789abcdef0123456789abcdef' })), finalResponse('No se ejecutó.')],
+        execute: async (_name, _args, context) => { contexts.push(context); return { success: false }; },
+    });
+    await agent.run('confirmar envío action_0123456789abcdef0123456789abcdef');
+    assert.equal(contexts.length, 1);
+    assert.equal(contexts[0].userMessage, 'confirmar envío action_0123456789abcdef0123456789abcdef');
+    assert.match(contexts[0].sessionId, /^[0-9a-f-]{36}$/u);
+});

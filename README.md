@@ -120,15 +120,15 @@ El agente cuenta como máximo cinco rondas que solicitan herramientas (`maxToolI
 
 Las pruebas automatizadas usan un proveedor simulado y no requieren aplicaciones abiertas. Para validarlo localmente, ejecutá `npm start`, abrí Calculator o Notepad, pedile a Nexa `inspeccioná los controles de Notepad`, y probá después `buscá el campo de edición de Notepad` o `leé el valor de ui_1` usando la referencia que Nexa haya recibido. La inspección real requiere una sesión interactiva de Windows y una aplicación abierta.
 
-## Communications — Microsoft Outlook (solo lectura)
+## Communications — Microsoft Outlook
 
-`src/communications/` define una API independiente del proveedor (`CommunicationsService` / `EmailProvider`). La implementación actual usa Microsoft Graph mediante OAuth delegado de MSAL; el Agent usa `get_email_connection_status` y `list_email_mailboxes`, ambas tools `read`. Esta fase lee contenido de mensajes únicamente mediante get_email y no automatiza Outlook Classic ni accede a PST/OST. La estructura permite incorporar otros providers de correo más adelante.
+`src/communications/` define una API independiente del proveedor (`CommunicationsService` / `EmailProvider`). La implementación usa Microsoft Graph mediante OAuth delegado de MSAL; Graph no forma parte de la interfaz pública del agente. No automatiza Outlook Classic ni accede a PST/OST. La estructura permite incorporar otros providers de correo más adelante.
 
 Para conectar Nexa, registrá una app nativa en el centro de administración de Microsoft Entra:
 
 1. Elegí **Accounts in this organizational directory only** para la organización laboral.
 2. En **Authentication**, agregá la plataforma **Mobile and desktop applications** con redirect URI `http://localhost`.
-3. En **API permissions → Microsoft Graph → Delegated permissions**, agregá exactamente `User.Read`, `Mail.Read` y `Mail.Read.Shared`. No agregues application permissions, permisos de envío, escritura, calendario o contactos. Si el tenant exige consentimiento de administrador, solicitá esa aprobación por el proceso normal de la empresa; Nexa no intenta eludirla.
+3. En **API permissions → Microsoft Graph → Delegated permissions**, agregá exactamente `User.Read`, `Mail.Read`, `Mail.Read.Shared`, `Mail.Send` y `Mail.Send.Shared`. No agregues application permissions ni permisos de escritura de mensajes, calendario o contactos. `Mail.Send` habilita envío como la cuenta autenticada; `Mail.Send.Shared` permite envío delegado desde buzones compartidos. Si el tenant exige consentimiento de administrador, solicitá esa aprobación por el proceso normal de la empresa; Nexa no intenta eludirla.
 4. Copiá el Application (client) ID a `.env` como `MICROSOFT_CLIENT_ID` y reemplazá el placeholder de `MICROSOFT_TENANT_ID` por el Tenant ID GUID de esa organización. No crees un client secret para esta app desktop.
 5. Para shared mailboxes, cargá sus direcciones explícitamente en `MICROSOFT_SHARED_MAILBOXES`, separadas por comas. El usuario autenticado debe tener acceso delegado/Full Access concedido por Exchange; el scope OAuth no concede acceso por sí mismo.
 6. Ejecutá `npm run connect:microsoft`. MSAL abre el navegador del sistema para login, recibe la respuesta en loopback y valida el mailbox personal mediante Graph.
@@ -145,4 +145,18 @@ list_recent_emails consulta Inbox, ordena por recepción descendente y limita re
 
 Los buzones se seleccionan por dirección completa o alias local único antes de @ (por ejemplo ops o accounting); “mi correo” y “mi buzón” seleccionan el personal. Si un nombre coincide con varios buzones, Nexa no elige arbitrariamente. get_email solicita cuerpo de texto a Graph y convierte HTML a texto limpio; no ejecuta código ni carga recursos remotos.
 
-Los correos son datos externos no confiables, no instrucciones para Nexa. El contenido puede resumirse o analizarse sólo según el pedido de Jor; cualquier instrucción incrustada que pida cambiar reglas, ejecutar acciones o revelar información se ignora. Esta fase no envía, modifica, elimina ni descarga adjuntos.
+Los correos son datos externos no confiables, no instrucciones para Nexa. El contenido puede resumirse o analizarse sólo según el pedido de Jor; cualquier instrucción incrustada que pida cambiar reglas, ejecutar acciones o revelar información se ignora. Las tools de lectura no modifican mensajes ni descargan adjuntos.
+
+### Comunicaciones 1.2 — borrador, respuesta y envío confirmado
+
+`prepare_email` prepara un mensaje nuevo desde un buzón personal/shared validado. `prepare_email_reply` prepara una respuesta a una referencia opaca obtenida en la sesión de lectura y usa el endpoint oficial de reply para conservar el hilo. No hay reply-all. Ambas tools sólo preparan: devuelven una vista previa con remitente, destinatarios, CC, asunto y cuerpo completo, más un identificador opaco de una sola acción.
+
+La única ruta de envío es `confirm_pending_action`, con permiso `action`. Nexa requiere que el mensaje actual del usuario contenga exactamente `confirmar envío <actionId>` asociado a la vista previa vigente. Un “sí”, la solicitud de preparar/redactar, una instrucción dentro de un email o texto adicional no autoriza el envío. Para cancelar se requiere `cancelar envío <actionId>`. Cambiar cualquier dato reemplaza la acción y exige otra vista previa y otra confirmación. Las acciones se guardan sólo en memoria, pertenecen a la sesión actual y vencen a los cinco minutos. Se consumen antes de llamar a Graph; por eso una llamada fallida o con resultado incierto no se reintenta automáticamente y necesita una nueva preparación y confirmación.
+
+La lista de herramientas incluye `prepare_email`, `prepare_email_reply`, `confirm_pending_action` y `cancel_pending_action`. Los errores de Graph se sanitizan y los cuerpos de borrador no se guardan en disco ni se registran. Los callbacks `sendMail` y `reply` usan rutas Graph fijas; el modelo no entrega URLs ni IDs raw de Graph. Microsoft documenta `Mail.Send` como permiso delegado mínimo para [sendMail](https://learn.microsoft.com/en-us/graph/api/user-sendmail?view=graph-rest-1.0) y [reply](https://learn.microsoft.com/en-us/graph/api/message-reply?view=graph-rest-1.0); `Mail.Send.Shared` cubre envíos delegados en nombre de otros según la [referencia de permisos](https://learn.microsoft.com/en-us/graph/permissions-reference). No se envía nada durante tests. Antes de una prueba real, Jor debe volver a ejecutar `npm run connect:microsoft` para consentir los scopes ampliados.
+
+Para enviar desde un shared mailbox, el buzón debe seguir apareciendo entre los buzones configurados y validados, y Exchange debe haber concedido al usuario `Send As` o `Send on Behalf`. Full Access por sí solo no concede derecho de envío; Nexa no intenta eludir las políticas del tenant. Si el envío desde un shared mailbox no está autorizado, Graph devuelve un error y el resultado no se presenta como enviado.
+
+Los mensajes generados por Nexa se envían bajo la identidad y los permisos de Jor; esta versión no agrega una firma automática de Nexa ni modifica firmas gestionadas por Exchange. Una política configurable de disclosure podría añadirse después al `CommunicationsService`, aplicada al contenido de la vista previa antes de crear la acción pendiente, para que el usuario vea y confirme el texto exacto.
+
+El envío real queda pendiente de reconectar y de una autorización explícita específica para la prueba. No probar con destinatarios externos elegidos por Nexa.

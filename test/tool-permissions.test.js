@@ -58,6 +58,10 @@ test('existing local tools declare their intended permissions', () => {
         list_recent_emails: 'read',
         search_emails: 'read',
         get_email: 'read',
+        prepare_email: 'read',
+        prepare_email_reply: 'read',
+        confirm_pending_action: 'action',
+        cancel_pending_action: 'action',
     });
 
     for (const registration of localToolRegistry.values()) {
@@ -161,6 +165,15 @@ test('a denied external tool does not make an HTTP request', async () => {
     } finally {
         globalThis.fetch = originalFetch;
     }
+});
+
+test('a denied email confirmation is stopped before the communications tool runs', async () => {
+    const result = await executeTool('confirm_pending_action', { actionId: 'action_0123456789abcdef0123456789abcdef' }, {
+        permissionPolicy: { ...defaultPermissionPolicy, action: false },
+    });
+    assert.equal(result.success, false);
+    assert.equal(result.error.code, 'permission_denied');
+    assert.equal(result.permission, 'action');
 });
 
 test('hosted Web Search is available only when external reads are allowed', () => {

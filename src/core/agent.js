@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { askOpenAI } from '../brain/openai.js';
 import { config } from '../config.js';
 import { NEXA_INSTRUCTIONS } from '../prompts/nexa.js';
@@ -52,6 +53,7 @@ export async function createAgent({
     logger = writeAgentDiagnostic,
 } = {}) {
     const memory = await load();
+    const sessionId = randomUUID();
 
     function diagnostic(event, details = {}) {
         try { logger(event, details); } catch { /* diagnostics never change agent behavior */ }
@@ -140,7 +142,7 @@ ${memoryToPrompt(memory)}
                 diagnostic('tool_call', { iteration, tool: toolCall.name, arguments: safeArgumentSummary(args) });
                 let result;
                 try {
-                    result = await execute(toolCall.name, args, { memory, saveMemory: save, permissionPolicy });
+                    result = await execute(toolCall.name, args, { memory, saveMemory: save, permissionPolicy, sessionId, userMessage });
                 } catch (error) {
                     result = { success: false, error: { code: 'tool_execution_failed', message: error.message } };
                 }

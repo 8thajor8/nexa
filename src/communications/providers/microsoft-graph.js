@@ -2,19 +2,23 @@ import { getMicrosoftConfiguration } from '../config.js';
 import { MicrosoftAuthError } from '../../integrations/microsoft/auth.js';
 
 const graphRoot = 'https://graph.microsoft.com/v1.0/';
-const messageFields = 'id,subject,from,toRecipients,ccRecipients,receivedDateTime,bodyPreview,hasAttachments,isRead,importance';
+const messageFields = 'id,subject,from,replyTo,toRecipients,ccRecipients,receivedDateTime,bodyPreview,hasAttachments,isRead,importance';
 const maximumBodyLength = 12000;
+
 export function normalizeMailbox({ id, address, displayName, type }) {
     if (![id, address].every(value => typeof value === 'string' && value.trim()) || !['personal', 'shared'].includes(type)) return null;
     return { id: id.trim(), provider: 'microsoft', address: address.trim().toLocaleLowerCase('en-US'),
         displayName: typeof displayName === 'string' && displayName.trim() ? displayName.trim() : address.trim(), type };
 }
-function graphError(status) {
+function graphError(status, writing = false) {
     if (status === 401) return { code: 'microsoft_authorization_required', message: 'La sesión Microsoft venció o necesita reconectarse.' };
-    if (status === 403) return { code: 'microsoft_access_denied', message: 'Microsoft no permite leer este buzón con la autorización o los accesos delegados actuales.' };
-    if (status === 404) return { code: 'microsoft_mailbox_not_found', message: 'Microsoft Graph no encontró el buzón configurado.' };
+    if (status === 403) return { code: 'microsoft_access_denied', message: writing
+        ? 'Microsoft no autorizó este envío. Para un shared mailbox, verificá Mail.Send.Shared y los permisos Exchange Send As o Send on Behalf.'
+        : 'Microsoft no permite leer este buzón con la autorización o los accesos delegados actuales.' };
+    if (status === 404) return { code: 'microsoft_mailbox_not_found', message: 'Microsoft Graph no encontró el buzón o mensaje.' };
     if (status === 429) return { code: 'microsoft_rate_limited', message: 'Microsoft Graph pidió reducir la frecuencia de solicitudes.' };
-    return { code: 'microsoft_graph_unavailable', message: 'No se pudo consultar Microsoft Graph.' };
+    if (status === 400) return { code: 'microsoft_request_invalid', message: 'Microsoft Graph rechazó los datos de la solicitud.' };
+    return { code: 'microsoft_graph_unavailable', message: 'No se pudo completar la operación con Microsoft Graph.' };
 }
 const entityMap = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
 function decodeEntities(text) {
@@ -42,7 +46,8 @@ export function normalizeEmail(message, mailbox, { includeBody = false } = {}) {
     return {
         providerMessageId: message?.id, mailbox: mailbox.address,
         subject: typeof message?.subject === 'string' ? message.subject : '',
-        from: person(message?.from), to: recipientList(message?.toRecipients), cc: recipientList(message?.ccRecipients),
+        from: person(message?.from), replyTo: recipientList(message?.replyTo),
+        to: recipientList(message?.toRecipients), cc: recipientList(message?.ccRecipients),
         receivedAt: typeof message?.receivedDateTime === 'string' ? message.receivedDateTime : null,
         preview: typeof message?.bodyPreview === 'string' ? message.bodyPreview.slice(0, 1000) : '',
         body: includeBody ? (message?.body?.contentType?.toLocaleLowerCase('en-US') === 'html' ? htmlToSafeText(message.body.content) : String(message?.body?.content ?? '').slice(0, maximumBodyLength)) : '',
@@ -75,7 +80,7 @@ function validSearchArgs(args) {
         && date(args.dateFrom) && date(args.dateTo) && (!args.dateFrom || !args.dateTo || args.dateFrom <= args.dateTo);
 }
 export function createMicrosoftGraphProvider({ auth, fetchImpl = fetch, environment = process.env } = {}) {
-    async function request(resource, { preferText = false } = {}) {
+    async function request(resource, { preferText = false, method = 'GET', jsonBody } = {}) {
         let accessToken;
         try { accessToken = await auth.getAccessToken(); }
         catch (error) {
@@ -83,13 +88,15 @@ export function createMicrosoftGraphProvider({ auth, fetchImpl = fetch, environm
             return { success: false, error: { code: 'microsoft_authentication_failed', message: 'No se pudo obtener una sesión Microsoft válida.' } };
         }
         if (!accessToken) return { success: false, error: { code: 'email_not_connected', message: 'Microsoft todavía no está conectado. Ejecutá npm run connect:microsoft.' } };
+        const headers = { authorization: 'Bearer ' + accessToken, accept: 'application/json' };
+        if (preferText) headers.prefer = 'outlook.body-content-type="text"';
+        const options = { method, headers };
+        if (jsonBody !== undefined) { headers['content-type'] = 'application/json'; options.body = JSON.stringify(jsonBody); }
         let response;
-        try {
-            const headers = { authorization: 'Bearer ' + accessToken, accept: 'application/json' };
-            if (preferText) headers.prefer = 'outlook.body-content-type="text"';
-            response = await fetchImpl(new URL(resource, graphRoot), { method: 'GET', headers });
-        } catch { return { success: false, error: { code: 'microsoft_network_error', message: 'No se pudo conectar con Microsoft Graph.' } }; }
-        if (!response.ok) return { success: false, error: graphError(response.status) };
+        try { response = await fetchImpl(new URL(resource, graphRoot), options); }
+        catch { return { success: false, error: { code: 'microsoft_network_error', message: 'No se pudo conectar con Microsoft Graph.' } }; }
+        if (!response.ok) return { success: false, error: graphError(response.status, method !== 'GET') };
+        if (response.status === 202 || response.status === 204) return { success: true, data: null };
         try { return { success: true, data: await response.json() }; }
         catch { return { success: false, error: { code: 'microsoft_response_invalid', message: 'Microsoft Graph devolvió una respuesta no válida.' } }; }
     }
@@ -141,5 +148,22 @@ export function createMicrosoftGraphProvider({ auth, fetchImpl = fetch, environm
         const response = await request('users/' + owner + '/messages/' + messageId + '?$select=' + messageFields + ',body', { preferText: true });
         return response.success ? { success: true, email: normalizeEmail(response.data, { address: mailboxAddress }, { includeBody: true }) } : response;
     }
-    return { getConnectionStatus, getMailboxes, listRecentEmails, searchEmails, getEmail };
+    async function sendEmail({ mailboxAddress, to, cc, subject, body }) {
+        const recipients = addresses => addresses.map(address => ({ emailAddress: { address } }));
+        const message = {
+            subject, body: { contentType: 'Text', content: body },
+            toRecipients: recipients(to), ccRecipients: recipients(cc),
+        };
+        const response = await request('users/' + encodeURIComponent(mailboxAddress) + '/sendMail', {
+            method: 'POST', jsonBody: { message, saveToSentItems: true },
+        });
+        return response.success ? { success: true, sent: true } : response;
+    }
+    async function sendReply({ mailboxAddress, providerMessageId, body }) {
+        const response = await request('users/' + encodeURIComponent(mailboxAddress) + '/messages/' + encodeURIComponent(providerMessageId) + '/reply', {
+            method: 'POST', jsonBody: { comment: body },
+        });
+        return response.success ? { success: true, sent: true } : response;
+    }
+    return { getConnectionStatus, getMailboxes, listRecentEmails, searchEmails, getEmail, sendEmail, sendReply };
 }

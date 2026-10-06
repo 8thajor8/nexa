@@ -47,6 +47,10 @@ export const toolPermissions = Object.freeze({
     list_recent_emails: 'read',
     search_emails: 'read',
     get_email: 'read',
+    prepare_email: 'read',
+    prepare_email_reply: 'read',
+    confirm_pending_action: 'action',
+    cancel_pending_action: 'action',
 });
 
 export const defaultPermissionPolicy = Object.freeze({

@@ -1,4 +1,4 @@
-export const microsoftGraphScopes = Object.freeze(['User.Read', 'Mail.Read', 'Mail.Read.Shared']);
+export const microsoftGraphScopes = Object.freeze(['User.Read', 'Mail.Read', 'Mail.Read.Shared', 'Mail.Send', 'Mail.Send.Shared']);
 
 export function getMicrosoftConfiguration(environment = process.env) {
     const clientId = typeof environment.MICROSOFT_CLIENT_ID === 'string' ? environment.MICROSOFT_CLIENT_ID.trim() : '';
