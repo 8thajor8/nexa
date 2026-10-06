@@ -6,7 +6,11 @@ try {
     const sourceAudio = await readFile(path.join(voiceCastingDirectory, 'nexa-digital-original.wav'));
     const samples = await generateVoiceCastingSamples({ sourceAudio });
     console.log('Muestras FX de una única toma nova-portena:');
-    for (const sample of samples) console.log(`- ${sample.name} (${sample.profile}): ${sample.path}${sample.processingMs ? ` — FX ${sample.processingMs.toFixed(1)} ms` : ''}`);
+    for (const sample of samples) {
+        const metrics = sample.metrics;
+        console.log(`- ${sample.name} (${sample.profile}): ${sample.path}`);
+        console.log(`  ΔRMS ${metrics.rmsDifference.toFixed(1)} | Δpeak ${metrics.peakDifference} | changed ${metrics.changedPercent.toFixed(2)}% | peak ${metrics.peakFinal} | clipped ${metrics.clippedSamples} | ${metrics.durationSeconds.toFixed(2)} s | DSP ${sample.processingMs.toFixed(1)} ms`);
+    }
     console.log('Casting de desarrollo solamente; la voz predeterminada de Nexa no cambia.');
 } catch (error) {
     const status = Number.isInteger(error?.status) ? ` (HTTP ${error.status})` : '';

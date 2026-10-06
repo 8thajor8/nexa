@@ -12,7 +12,7 @@ import { checkToolPermission } from '../src/tools/permissions.js';
 import { createWindowsAudioPlayer } from '../src/speech/windows-player.js';
 import { digitalCastingOutputs, generateVoiceCastingSamples } from '../src/speech/voice-casting.js';
 import { normalizeWavLengths } from '../src/speech/wav.js';
-import { createVoiceFxProcessor, voiceFxProfiles } from '../src/speech/voice-fx.js';
+import { createVoiceFxProcessor, measureVoiceFxDifference, voiceFxProfiles } from '../src/speech/voice-fx.js';
 
 async function fixture(t, { maxTemporaryAgeMs = 60_000 } = {}) {
     const root = await mkdtemp(path.join(os.tmpdir(), 'nexa-speech-test-'));
@@ -272,6 +272,34 @@ test('VoiceFX profiles alter real sample data with reasonably increasing strengt
     assert.notDeepEqual(outputs[0], outputs[2]);
 });
 
+test('sci-fi FX families are distinct, duration-safe WAVs without clipping', () => {
+    const processor = createVoiceFxProcessor();
+    const source = makePcmWav({ durationMs: 800 });
+    const sourceBefore = Buffer.from(source);
+    const profiles = ['synthetic_companion', 'digital_spatial', 'nexa_hybrid'];
+    const outputs = profiles.map(profile => processor.process(source, profile));
+    assert.deepEqual(source, sourceBefore);
+    for (let index = 0; index < profiles.length; index++) {
+        const result = outputs[index];
+        const metrics = measureVoiceFxDifference(source, result);
+        assert.equal(result.toString('ascii', 0, 4), 'RIFF');
+        assert.equal(result.toString('ascii', 8, 12), 'WAVE');
+        assert.equal(result.readUInt32LE(4) + 8, result.length);
+        assert.equal(metrics.durationSeconds, 0.8);
+        assert(metrics.rmsDifference > 0);
+        assert(metrics.changedPercent > 0);
+        assert.equal(metrics.clippedSamples, 0);
+        assert(metrics.peakFinal < 32767);
+        assert.deepEqual(processor.process(source, profiles[index]), result);
+    }
+    assert.equal(outputs[0].readUInt16LE(22), 1, 'companion layer remains mono');
+    assert.equal(outputs[1].readUInt16LE(22), 2, 'spatial profile renders stereo');
+    assert.equal(outputs[2].readUInt16LE(22), 2, 'hybrid profile renders stereo');
+    assert.notDeepEqual(outputs[0], outputs[1]);
+    assert.notDeepEqual(outputs[0], outputs[2]);
+    assert.notDeepEqual(outputs[1], outputs[2]);
+});
+
 test('VoiceFX rejects invalid WAV input and unknown profiles', () => {
     const processor = createVoiceFxProcessor();
     assert.throws(() => processor.process(Buffer.from('bad audio'), 'digital'), /invalid_wav/u);
@@ -280,12 +308,15 @@ test('VoiceFX rejects invalid WAV input and unknown profiles', () => {
 });
 
 test('VoiceFX DSP values are centralized in immutable named presets', () => {
-    assert.deepEqual(Object.keys(voiceFxProfiles), ['off', 'subtle', 'digital', 'strong']);
+    assert.deepEqual(Object.keys(voiceFxProfiles), ['off', 'subtle', 'digital', 'strong', 'synthetic_companion', 'digital_spatial', 'nexa_hybrid']);
     assert(Object.isFrozen(voiceFxProfiles));
     assert(Object.values(voiceFxProfiles).every(Object.isFrozen));
     assert.equal(voiceFxProfiles.off.delayMix, 0);
     assert(voiceFxProfiles.subtle.delayMix < voiceFxProfiles.digital.delayMix);
     assert(voiceFxProfiles.digital.delayMix < voiceFxProfiles.strong.delayMix);
+    assert.equal(voiceFxProfiles.synthetic_companion.family, 'filtered_companion');
+    assert.equal(voiceFxProfiles.digital_spatial.family, 'early_reflections');
+    assert.equal(voiceFxProfiles.nexa_hybrid.family, 'hybrid');
 });
 
 test('SpeechService integrates VoiceFX with off as the unchanged default', async t => {
@@ -329,25 +360,26 @@ test('Windows playback opens WAV through MCI, waits for completion, closes it, a
     assert.equal(invalidPath.error.code, 'invalid_audio_reference');
 });
 
-test('digital voice casting applies every profile to one unchanged source file without a TTS provider', async t => {
+test('sci-fi FX casting writes four named versions of one unchanged source file without TTS', async t => {
     const f = await fixture(t);
     const outputDirectory = path.join(f.root, 'voice-casting');
     const profiles = [];
-    const source = Buffer.from('single raw nova take');
+    const source = makePcmWav();
     let clock = 0;
+    const actualProcessor = createVoiceFxProcessor();
     const samples = await generateVoiceCastingSamples({
         sourceAudio: source,
         outputDirectory,
         now: () => { clock += 5; return clock; },
-        processor: { process(audio, profile) { profiles.push(profile); assert.deepEqual(audio, source); return Buffer.from(`${audio}:${profile}`); } },
+        processor: { process(audio, profile) { profiles.push(profile); assert.deepEqual(audio, source); return actualProcessor.process(audio, profile); } },
     });
-    assert.deepEqual(samples.map(item => item.name), ['nexa-digital-original', 'nexa-digital-subtle', 'nexa-digital', 'nexa-digital-strong']);
-    assert.deepEqual(samples.map(item => item.profile), ['off', 'subtle', 'digital', 'strong']);
-    assert.deepEqual(profiles, ['subtle', 'digital', 'strong']);
-    assert.deepEqual(source, Buffer.from('single raw nova take'));
+    assert.deepEqual(samples.map(item => item.name), ['nexa-fx-original', 'nexa-fx-edi', 'nexa-fx-jarvis', 'nexa-fx-hybrid']);
+    assert.deepEqual(samples.map(item => item.profile), ['off', 'synthetic_companion', 'digital_spatial', 'nexa_hybrid']);
+    assert.deepEqual(profiles, ['synthetic_companion', 'digital_spatial', 'nexa_hybrid']);
+    assert.deepEqual(source, makePcmWav());
     assert.deepEqual(samples.map(item => item.processingMs), [0, 5, 5, 5]);
-    assert.equal((await readFile(samples[0].path)).toString(), 'single raw nova take');
-    for (const sample of samples.slice(1)) assert.match((await readFile(sample.path)).toString(), /:(subtle|digital|strong)$/u);
+    assert.deepEqual(await readFile(samples[0].path), source);
+    for (const sample of samples) assert.equal((await readFile(sample.path)).toString('ascii', 0, 4), 'RIFF');
 });
 
 test('digital casting rejects a missing source instead of calling TTS or attempting FX', async t => {
