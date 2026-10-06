@@ -10,8 +10,7 @@ import { createOpenAISpeechProvider } from '../src/speech/providers/openai.js';
 import { generateSpeechTool, playAudioTool, speechRegistrations } from '../src/speech/index.js';
 import { checkToolPermission } from '../src/tools/permissions.js';
 import { createWindowsAudioPlayer } from '../src/speech/windows-player.js';
-import { castingVariants } from '../src/speech/voice-casting-profiles.js';
-import { digitalCastingText, digitalCastingOutputs, generateVoiceCastingSamples } from '../src/speech/voice-casting.js';
+import { digitalCastingOutputs, generateVoiceCastingSamples } from '../src/speech/voice-casting.js';
 import { normalizeWavLengths } from '../src/speech/wav.js';
 import { createVoiceFxProcessor, voiceFxProfiles } from '../src/speech/voice-fx.js';
 
@@ -239,6 +238,40 @@ test('VoiceFX presets are deterministic, preserve WAV validity and duration', ()
     assert.deepEqual(source, sourceBefore);
 });
 
+test('VoiceFX profiles alter real sample data with reasonably increasing strength', () => {
+    const processor = createVoiceFxProcessor();
+    const source = makePcmWav({ durationMs: 800 });
+    const outputs = ['subtle', 'digital', 'strong'].map(profile => processor.process(source, profile));
+    const difference = output => {
+        let squareSum = 0;
+        let peak = 0;
+        let changed = 0;
+        const samples = source.readUInt32LE(40) / 2;
+        for (let i = 0; i < samples; i++) {
+            const sourceSample = source.readInt16LE(44 + i * 2);
+            const delta = output.readInt16LE(44 + i * 2) - sourceSample;
+            squareSum += delta * delta;
+            peak = Math.max(peak, Math.abs(delta));
+            if (delta !== 0) changed++;
+        }
+        return { rms: Math.sqrt(squareSum / samples), peak, changed };
+    };
+    const differences = outputs.map(difference);
+    const sourceRms = Math.sqrt(Array.from({ length: source.readUInt32LE(40) / 2 }, (_, index) => {
+        const sample = source.readInt16LE(44 + index * 2);
+        return sample * sample;
+    }).reduce((total, square) => total + square, 0) / (source.readUInt32LE(40) / 2));
+    assert(differences.every(value => value.rms > 0 && value.peak > 0 && value.changed > 0));
+    assert(differences[0].rms < differences[1].rms);
+    assert(differences[1].rms < differences[2].rms);
+    assert(differences[0].rms / sourceRms > 0.01);
+    assert(differences[1].rms / sourceRms > 0.05);
+    assert(differences[2].rms / sourceRms > 0.15);
+    assert.notDeepEqual(outputs[0], outputs[1]);
+    assert.notDeepEqual(outputs[1], outputs[2]);
+    assert.notDeepEqual(outputs[0], outputs[2]);
+});
+
 test('VoiceFX rejects invalid WAV input and unknown profiles', () => {
     const processor = createVoiceFxProcessor();
     assert.throws(() => processor.process(Buffer.from('bad audio'), 'digital'), /invalid_wav/u);
@@ -268,6 +301,15 @@ test('SpeechService integrates VoiceFX with off as the unchanged default', async
     assert.equal(generated.success, true);
     assert.equal(usedProfile, 'off');
     assert.deepEqual(await readFile(f.store.get(generated.audioId).filePath), source);
+
+    const fxService = createSpeechService({
+        store: f.store,
+        provider: { async synthesize() { return source; } },
+        voiceFxProfile: 'strong',
+    });
+    const fxGenerated = await fxService.generate({ text: 'Un poco más digital' });
+    assert.equal(fxGenerated.success, true);
+    assert.notDeepEqual(await readFile(f.store.get(fxGenerated.audioId).filePath), source);
 });
 
 test('Windows playback opens WAV through MCI, waits for completion, closes it, and rejects other platforms', async () => {
@@ -287,26 +329,20 @@ test('Windows playback opens WAV through MCI, waits for completion, closes it, a
     assert.equal(invalidPath.error.code, 'invalid_audio_reference');
 });
 
-test('digital voice casting makes one Nova portena take and applies FX variants to that source', async t => {
+test('digital voice casting applies every profile to one unchanged source file without a TTS provider', async t => {
     const f = await fixture(t);
     const outputDirectory = path.join(f.root, 'voice-casting');
-    const requests = [];
     const profiles = [];
     const source = Buffer.from('single raw nova take');
     let clock = 0;
     const samples = await generateVoiceCastingSamples({
+        sourceAudio: source,
         outputDirectory,
         now: () => { clock += 5; return clock; },
-        provider: { async synthesize(options) { requests.push(options); return source; } },
         processor: { process(audio, profile) { profiles.push(profile); assert.deepEqual(audio, source); return Buffer.from(`${audio}:${profile}`); } },
     });
     assert.deepEqual(samples.map(item => item.name), ['nexa-digital-original', 'nexa-digital-subtle', 'nexa-digital', 'nexa-digital-strong']);
     assert.deepEqual(samples.map(item => item.profile), ['off', 'subtle', 'digital', 'strong']);
-    assert.equal(requests.length, 1);
-    assert.equal(requests[0].voice, 'nova');
-    assert.equal(requests[0].text, digitalCastingText);
-    assert.equal(requests[0].instructions, castingVariants[2].instructions);
-    assert.equal(requests[0].format, 'wav');
     assert.deepEqual(profiles, ['subtle', 'digital', 'strong']);
     assert.deepEqual(source, Buffer.from('single raw nova take'));
     assert.deepEqual(samples.map(item => item.processingMs), [0, 5, 5, 5]);
@@ -314,15 +350,11 @@ test('digital voice casting makes one Nova portena take and applies FX variants 
     for (const sample of samples.slice(1)) assert.match((await readFile(sample.path)).toString(), /:(subtle|digital|strong)$/u);
 });
 
-test('digital casting reports provider errors without attempting any FX processing', async t => {
+test('digital casting rejects a missing source instead of calling TTS or attempting FX', async t => {
     const f = await fixture(t);
-    const requests = [];
     let processed = false;
-    const result = await generateVoiceCastingSamples({ outputDirectory: path.join(f.root, 'cast'), provider: {
-        async synthesize(options) { requests.push(options); throw new Error('mock provider failure'); },
-    }, processor: { process() { processed = true; throw new Error('should not run'); } } }).catch(error => error);
-    assert.match(result.message, /mock provider failure/u);
-    assert.equal(requests.length, 1);
+    const result = await generateVoiceCastingSamples({ outputDirectory: path.join(f.root, 'cast'), processor: { process() { processed = true; throw new Error('should not run'); } } }).catch(error => error);
+    assert.match(result.message, /WAV fuente/u);
     assert.equal(processed, false);
 });
 

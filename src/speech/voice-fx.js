@@ -2,9 +2,9 @@
 // Keep all audible tuning values here so they can be compared and adjusted.
 export const voiceFxProfiles = Object.freeze({
     off: Object.freeze({ presence: 0, lowPassAlpha: 0, delayMix: 0, delayMs: 0, modulationDepthMs: 0, modulationHz: 0 }),
-    subtle: Object.freeze({ presence: 0.025, lowPassAlpha: 0.18, delayMix: 0.012, delayMs: 6, modulationDepthMs: 0.25, modulationHz: 0.18 }),
-    digital: Object.freeze({ presence: 0.045, lowPassAlpha: 0.18, delayMix: 0.025, delayMs: 8, modulationDepthMs: 0.4, modulationHz: 0.2 }),
-    strong: Object.freeze({ presence: 0.065, lowPassAlpha: 0.18, delayMix: 0.04, delayMs: 10, modulationDepthMs: 0.55, modulationHz: 0.22 }),
+    subtle: Object.freeze({ presence: 0.08, lowPassAlpha: 0.18, delayMix: 0.035, delayMs: 6, modulationDepthMs: 0.35, modulationHz: 0.18 }),
+    digital: Object.freeze({ presence: 0.16, lowPassAlpha: 0.18, delayMix: 0.12, delayMs: 9, modulationDepthMs: 0.8, modulationHz: 0.22 }),
+    strong: Object.freeze({ presence: 0.28, lowPassAlpha: 0.18, delayMix: 0.32, delayMs: 13, modulationDepthMs: 1.8, modulationHz: 0.25 }),
 });
 
 function parsePcmWav(audio) {
