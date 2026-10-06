@@ -123,11 +123,11 @@ test('explicit OAuth connection uses the minimal scopes and sanitizes tenant con
 });
 
 test('only the two read-only email tools are registered with read permission', () => {
-    assert.deepEqual(communicationsRegistrations.map(registration => registration.definition.name), ['get_email_connection_status', 'list_email_mailboxes']);
-    for (const name of ['get_email_connection_status', 'list_email_mailboxes']) {
+    assert.deepEqual(communicationsRegistrations.map(registration => registration.definition.name), ['get_email_connection_status', 'list_email_mailboxes', 'list_recent_emails', 'search_emails', 'get_email']);
+    for (const name of ['get_email_connection_status', 'list_email_mailboxes', 'list_recent_emails', 'search_emails', 'get_email']) {
         assert.equal(localToolRegistry.get(name)?.permission, 'read');
         assert.equal(checkToolPermission(localToolRegistry.get(name), defaultPermissionPolicy).allowed, true);
-        assert.deepEqual(localToolRegistry.get(name).definition.parameters.properties, {});
+        if (['get_email_connection_status', 'list_email_mailboxes'].includes(name)) assert.deepEqual(localToolRegistry.get(name).definition.parameters.properties, {});
     }
     assert.equal(localToolRegistry.has('send_email'), false);
 });

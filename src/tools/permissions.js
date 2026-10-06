@@ -44,6 +44,9 @@ export const toolPermissions = Object.freeze({
     spotify_previous: 'action',
     get_email_connection_status: 'read',
     list_email_mailboxes: 'read',
+    list_recent_emails: 'read',
+    search_emails: 'read',
+    get_email: 'read',
 });
 
 export const defaultPermissionPolicy = Object.freeze({

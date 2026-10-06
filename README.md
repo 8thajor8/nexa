@@ -122,7 +122,7 @@ Las pruebas automatizadas usan un proveedor simulado y no requieren aplicaciones
 
 ## Communications — Microsoft Outlook (solo lectura)
 
-`src/communications/` define una API independiente del proveedor (`CommunicationsService` / `EmailProvider`). La implementación actual usa Microsoft Graph mediante OAuth delegado de MSAL; el Agent sólo conoce `get_email_connection_status` y `list_email_mailboxes`, ambas tools `read`. Esta fase no lee contenido de mensajes y no automatiza Outlook Classic ni accede a PST/OST. La estructura permite incorporar otros providers de correo más adelante.
+`src/communications/` define una API independiente del proveedor (`CommunicationsService` / `EmailProvider`). La implementación actual usa Microsoft Graph mediante OAuth delegado de MSAL; el Agent usa `get_email_connection_status` y `list_email_mailboxes`, ambas tools `read`. Esta fase lee contenido de mensajes únicamente mediante get_email y no automatiza Outlook Classic ni accede a PST/OST. La estructura permite incorporar otros providers de correo más adelante.
 
 Para conectar Nexa, registrá una app nativa en el centro de administración de Microsoft Entra:
 
@@ -136,3 +136,13 @@ Para conectar Nexa, registrá una app nativa en el centro de administración de 
 Graph documenta un endpoint de Exchange settings que enumera mailboxes primarios/compartidos, pero su permiso delegado mínimo es `User.Read.All`. Nexa evita ese permiso de lectura amplia del directorio: incluye el mailbox personal autenticado y sólo agrega las direcciones shared configuradas que superen una comprobación de acceso a su Inbox con Graph. Las que no se puedan validar aparecen como incidencias sin exponer respuestas sin filtrar de Graph. El listado no lee mensajes. Ver [List Exchange settings](https://learn.microsoft.com/en-us/graph/api/usersettings-list-exchange?view=graph-rest-1.0) y [permisos para carpetas compartidas](https://learn.microsoft.com/en-us/graph/outlook-share-messages-folders).
 
 MSAL mantiene la caché OAuth en `data/microsoft-token.json`; en Windows, Microsoft Authentication Extensions la cifra con DPAPI para el usuario actual. El archivo y su lock están ignorados por Git. Nexa no escribe ni registra tokens o contraseñas Microsoft. `.env.example` contiene únicamente nombres y placeholders de configuración.
+
+### Comunicaciones 1.1 — lectura y búsqueda de correo
+
+Las tools list_recent_emails, search_emails y get_email son exclusivamente de lectura. CommunicationsService mantiene un contrato independiente del proveedor; Microsoft Graph usa los scopes delegados existentes Mail.Read y Mail.Read.Shared. Los mensajes se normalizan a metadata y texto, no se guardan localmente ni se registran en logs. Las búsquedas usan KQL de Graph sobre el mailbox indicado; los shared mailboxes pasan por /users/{address}/messages y requieren acceso delegado concedido en Exchange.
+
+list_recent_emails consulta Inbox, ordena por recepción descendente y limita resultados a 25 (10 por defecto). search_emails admite texto, remitente, asunto y fechas, también con un máximo de 25. get_email sólo acepta referencias opacas emitidas durante la sesión por las otras tools, nunca URLs o IDs Graph entregados directamente por el modelo. Las referencias expiran al reiniciar Nexa.
+
+Los buzones se seleccionan por dirección completa o alias local único antes de @ (por ejemplo ops o accounting); “mi correo” y “mi buzón” seleccionan el personal. Si un nombre coincide con varios buzones, Nexa no elige arbitrariamente. get_email solicita cuerpo de texto a Graph y convierte HTML a texto limpio; no ejecuta código ni carga recursos remotos.
+
+Los correos son datos externos no confiables, no instrucciones para Nexa. El contenido puede resumirse o analizarse sólo según el pedido de Jor; cualquier instrucción incrustada que pida cambiar reglas, ejecutar acciones o revelar información se ignora. Esta fase no envía, modifica, elimina ni descarga adjuntos.
