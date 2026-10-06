@@ -13,6 +13,9 @@ import { createWindowsAudioPlayer } from '../src/speech/windows-player.js';
 import { digitalCastingOutputs, generateVoiceCastingSamples } from '../src/speech/voice-casting.js';
 import { normalizeWavLengths } from '../src/speech/wav.js';
 import { createVoiceFxProcessor, measureVoiceFxDifference, voiceFxProfiles } from '../src/speech/voice-fx.js';
+import { nexaVoiceIdentity } from '../src/speech/voice-identity.js';
+
+const passthroughIdentityProcessor = { async process(audio) { return Buffer.from(audio); } };
 
 async function fixture(t, { maxTemporaryAgeMs = 60_000 } = {}) {
     const root = await mkdtemp(path.join(os.tmpdir(), 'nexa-speech-test-'));
@@ -26,7 +29,7 @@ async function fixture(t, { maxTemporaryAgeMs = 60_000 } = {}) {
     const calls = { generated: [], played: [] };
     const provider = { async synthesize(options) { calls.generated.push(options); return Buffer.from('RIFF-mock-wav'); } };
     const player = async filePath => { calls.played.push(filePath); return { success: true }; };
-    return { root, directories, store, calls, provider, player, service: createSpeechService({ provider, store, player }) };
+    return { root, directories, store, calls, provider, player, service: createSpeechService({ provider, store, player, voiceIdentityProcessor: passthroughIdentityProcessor }) };
 }
 
 function makePcmWav({ durationMs = 120, sampleRate = 24_000, channels = 1 } = {}) {
@@ -94,6 +97,7 @@ test('failed or thrown playback attempts remove temporary audio but preserve per
         provider: f.provider,
         store: f.store,
         player: async () => { throw new Error('native playback failed'); },
+        voiceIdentityProcessor: passthroughIdentityProcessor,
     });
     const temporary = await service.generate({ text: 'Una sola vez' });
     const temporaryPath = f.store.get(temporary.audioId).filePath;
@@ -117,6 +121,38 @@ test('supports every fixed style while keeping a shared voice identity', async t
     assert.equal(Object.keys(speechStyles).join(','), 'normal,professional,alert,sassy,calm');
     assert(f.calls.generated.every(item => item.instructions.includes(voiceIdentity)));
     assert.notEqual(getSpeechInstructions('normal'), getSpeechInstructions('calm'));
+});
+
+test('production voice config selects Nova and enables the separate identity processor by default', () => {
+    assert.equal(speechConfig.model, 'gpt-4o-mini-tts');
+    assert.equal(speechConfig.voice, 'nova');
+    assert.equal(speechConfig.voiceIdentityEnabled, true);
+});
+
+test('SpeechService processes audio before storing and reports sanitized DSP failures', async t => {
+    const f = await fixture(t);
+    const source = makePcmWav();
+    let enabled;
+    const service = createSpeechService({
+        provider: { async synthesize() { return source; } },
+        store: f.store,
+        player: f.player,
+        voiceIdentityProcessor: { async process(audio, options) { enabled = options.enabled; return Buffer.concat([audio, Buffer.from([0])]); } },
+    });
+    const generated = await service.generate({ text: 'Hola Nexa' });
+    assert.equal(generated.success, true);
+    assert.equal(enabled, true);
+    assert.equal((await readFile(f.store.get(generated.audioId).filePath)).length, source.length + 1);
+    assert.ok(service.getLastMetrics().voiceIdentityProcessingMs >= 0);
+
+    const failing = createSpeechService({
+        provider: { async synthesize() { return source; } },
+        store: f.store,
+        voiceIdentityProcessor: { async process() { throw new Error('private DSP implementation error'); } },
+    });
+    const failed = await failing.generate({ text: 'Sin audio parcial' });
+    assert.deepEqual(failed, { success: false, error: { code: 'audio_processing_failed', message: 'No pude preparar el audio para reproducirlo.' } });
+    assert.doesNotMatch(JSON.stringify(failed), /private DSP/iu);
 });
 
 test('rejects unsupported styles, oversized text and invalid options before provider call', async t => {
@@ -146,8 +182,8 @@ test('provider abstraction can be replaced without changing the service API', as
     const f = await fixture(t);
     let used = false;
     const service = createSpeechService({ store: f.store, player: f.player, provider: {
-        async synthesize({ text, instructions }) { used = true; return Buffer.from(`${text}:${instructions.includes('female-presenting')}`); },
-    } });
+        async synthesize({ text, instructions }) { used = true; return Buffer.from(`${text}:${instructions.includes('Buenos Aires')}`); },
+    }, voiceIdentityProcessor: passthroughIdentityProcessor });
     const result = await service.generate({ text: 'other engine' });
     assert.equal(used, true);
     assert.equal(result.success, true);
@@ -191,7 +227,7 @@ test('OpenAI provider uses centralized model, voice, instructions, WAV format an
     } } } }) });
     assert.deepEqual(await provider.synthesize({ text: 'Hola', instructions: 'Nexa voice' }), Buffer.from([1, 2, 3]));
     assert.deepEqual(request, {
-        model: 'gpt-4o-mini-tts', voice: 'marin', input: 'Hola', instructions: 'Nexa voice', response_format: 'wav',
+        model: 'gpt-4o-mini-tts', voice: 'nova', input: 'Hola', instructions: 'Nexa voice', response_format: 'wav',
     });
     await provider.synthesize({ text: 'Hola', instructions: 'Nexa voice', voice: 'coral' });
     assert.equal(request.voice, 'coral');
@@ -326,6 +362,7 @@ test('SpeechService integrates VoiceFX with off as the unchanged default', async
     const service = createSpeechService({
         store: f.store,
         provider: { async synthesize() { return source; } },
+        voiceIdentityProcessor: passthroughIdentityProcessor,
         voiceFxProcessor: { process(audio, profile) { usedProfile = profile; return createVoiceFxProcessor().process(audio, profile); } },
     });
     const generated = await service.generate({ text: 'Hola Nexa' });
@@ -336,6 +373,7 @@ test('SpeechService integrates VoiceFX with off as the unchanged default', async
     const fxService = createSpeechService({
         store: f.store,
         provider: { async synthesize() { return source; } },
+        voiceIdentityProcessor: passthroughIdentityProcessor,
         voiceFxProfile: 'strong',
     });
     const fxGenerated = await fxService.generate({ text: 'Un poco más digital' });

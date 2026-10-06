@@ -3,6 +3,8 @@ import { createOpenAISpeechProvider } from './providers/openai.js';
 import { createAudioStore } from './audio-store.js';
 import { createWindowsAudioPlayer } from './windows-player.js';
 import { createVoiceFxProcessor } from './voice-fx.js';
+import { createVoiceIdentityProcessor, nexaVoiceIdentity } from './voice-identity.js';
+import { performance } from 'node:perf_hooks';
 
 const maxAudioBytes = 50 * 1024 * 1024;
 
@@ -14,10 +16,13 @@ export function createSpeechService({
     provider = createOpenAISpeechProvider(),
     store = createAudioStore(speechConfig),
     player = createWindowsAudioPlayer(),
-    voiceFxProcessor = createVoiceFxProcessor(),
+    voiceIdentityProcessor = createVoiceIdentityProcessor(),
+    voiceIdentityEnabled = nexaVoiceIdentity.enabled,
+    voiceFxProcessor,
     voiceFxProfile = 'off',
     maxTextLength = speechConfig.maxTextLength,
 } = {}) {
+    let lastMetrics = null;
     async function initialize() {
         try { await store.initialize(); }
         catch { return failure('audio_storage_unavailable', 'No pude preparar el almacenamiento seguro de audio.'); }
@@ -33,13 +38,23 @@ export function createSpeechService({
         if (!initialized.success) return initialized;
 
         let audio;
+        const providerStartedAt = performance.now();
         try { audio = await provider.synthesize({ text, instructions: getSpeechInstructions(style), format: speechConfig.format }); }
         catch { return failure('speech_generation_failed', 'El proveedor de voz no pudo generar el audio.'); }
+        const providerGenerationMs = performance.now() - providerStartedAt;
         if (!(Buffer.isBuffer(audio) || audio instanceof Uint8Array) || audio.byteLength === 0 || audio.byteLength > maxAudioBytes) {
             return failure('invalid_provider_audio', 'El proveedor devolvió un audio no válido.');
         }
 
-        try { audio = voiceFxProcessor.process(Buffer.from(audio), voiceFxProfile); }
+        let processingMs;
+        try {
+            const processingStartedAt = performance.now();
+            audio = await voiceIdentityProcessor.process(Buffer.from(audio), { enabled: voiceIdentityEnabled });
+            processingMs = performance.now() - processingStartedAt;
+            if (voiceFxProcessor || voiceFxProfile !== 'off') {
+                audio = (voiceFxProcessor ?? createVoiceFxProcessor()).process(Buffer.from(audio), voiceFxProfile);
+            }
+        }
         catch { return failure('audio_processing_failed', 'No pude preparar el audio para reproducirlo.'); }
         if (!(Buffer.isBuffer(audio) || audio instanceof Uint8Array) || audio.byteLength === 0 || audio.byteLength > maxAudioBytes) {
             return failure('audio_processing_failed', 'El procesador de audio devolvió un resultado no válido.');
@@ -47,6 +62,7 @@ export function createSpeechService({
 
         try {
             const reference = await store.save(Buffer.from(audio), persist);
+            lastMetrics = { providerGenerationMs, voiceIdentityProcessingMs: processingMs, outputBytes: audio.byteLength };
             return { success: true, ...reference };
         } catch {
             return failure('audio_storage_failed', 'No pude guardar el audio generado.');
@@ -79,7 +95,9 @@ export function createSpeechService({
         catch { return { success: false, removed: 0 }; }
     }
 
-    return { initialize, generate, play, close };
+    function getLastMetrics() { return lastMetrics ? { ...lastMetrics } : null; }
+
+    return { initialize, generate, play, close, getLastMetrics };
 }
 
 const speechService = createSpeechService();
@@ -87,3 +105,4 @@ export const initializeSpeechService = speechService.initialize;
 export const generateSpeech = speechService.generate;
 export const playAudio = speechService.play;
 export const closeSpeechService = speechService.close;
+export const getSpeechMetrics = speechService.getLastMetrics;

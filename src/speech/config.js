@@ -6,8 +6,9 @@ const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '
 export const speechConfig = Object.freeze({
     provider: 'openai',
     model: 'gpt-4o-mini-tts',
-    voice: 'marin',
+    voice: 'nova',
     format: 'wav',
+    voiceIdentityEnabled: process.env.NEXA_VOICE_IDENTITY !== 'off',
     maxTextLength: 3000,
     maxTemporaryAgeMs: 24 * 60 * 60 * 1000,
     temporaryDirectory: path.join(projectRoot, 'data', 'temp', 'audio'),
@@ -15,11 +16,12 @@ export const speechConfig = Object.freeze({
 });
 
 export const voiceIdentity = [
-    'Female-presenting young adult voice.',
-    'Intelligent and confident, natural and conversational.',
-    'Warm but not overly sweet; clear diction; technological but human.',
-    'Use a subtle Argentine / Buenos Aires Spanish accent. Do not exaggerate the accent.',
-    'Avoid corporate assistant or announcer delivery.',
+    'Speak in Spanish with a subtle, natural Buenos Aires / Rioplatense Argentine accent.',
+    'Sound like a young woman in her mid-to-late twenties: casual, confident, clever and spontaneous.',
+    'Warm and energetic, with natural changes in rhythm, intonation and pauses.',
+    'It should feel like a real person talking to someone she knows well.',
+    'Keep the accent noticeable but never exaggerated.',
+    'Avoid virtual-assistant, GPS, corporate-presenter, announcer, narrator, customer-service, overly polished, or robotic delivery.',
 ].join(' ');
 
 export const speechStyles = Object.freeze({
