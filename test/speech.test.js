@@ -10,8 +10,10 @@ import { createOpenAISpeechProvider } from '../src/speech/providers/openai.js';
 import { generateSpeechTool, playAudioTool, speechRegistrations } from '../src/speech/index.js';
 import { checkToolPermission } from '../src/tools/permissions.js';
 import { createWindowsAudioPlayer } from '../src/speech/windows-player.js';
-import { castingVariants, castingText, generateVoiceCastingSamples } from '../src/speech/voice-casting.js';
+import { castingVariants } from '../src/speech/voice-casting-profiles.js';
+import { digitalCastingText, digitalCastingOutputs, generateVoiceCastingSamples } from '../src/speech/voice-casting.js';
 import { normalizeWavLengths } from '../src/speech/wav.js';
+import { createVoiceFxProcessor, voiceFxProfiles } from '../src/speech/voice-fx.js';
 
 async function fixture(t, { maxTemporaryAgeMs = 60_000 } = {}) {
     const root = await mkdtemp(path.join(os.tmpdir(), 'nexa-speech-test-'));
@@ -26,6 +28,29 @@ async function fixture(t, { maxTemporaryAgeMs = 60_000 } = {}) {
     const provider = { async synthesize(options) { calls.generated.push(options); return Buffer.from('RIFF-mock-wav'); } };
     const player = async filePath => { calls.played.push(filePath); return { success: true }; };
     return { root, directories, store, calls, provider, player, service: createSpeechService({ provider, store, player }) };
+}
+
+function makePcmWav({ durationMs = 120, sampleRate = 24_000, channels = 1 } = {}) {
+    const frames = Math.round(sampleRate * durationMs / 1000);
+    const dataSize = frames * channels * 2;
+    const wav = Buffer.alloc(44 + dataSize);
+    wav.write('RIFF', 0, 'ascii');
+    wav.writeUInt32LE(wav.length - 8, 4);
+    wav.write('WAVEfmt ', 8, 'ascii');
+    wav.writeUInt32LE(16, 16);
+    wav.writeUInt16LE(1, 20);
+    wav.writeUInt16LE(channels, 22);
+    wav.writeUInt32LE(sampleRate, 24);
+    wav.writeUInt32LE(sampleRate * channels * 2, 28);
+    wav.writeUInt16LE(channels * 2, 32);
+    wav.writeUInt16LE(16, 34);
+    wav.write('data', 36, 'ascii');
+    wav.writeUInt32LE(dataSize, 40);
+    for (let frame = 0; frame < frames; frame++) {
+        const sample = Math.round(6000 * Math.sin(2 * Math.PI * 440 * frame / sampleRate));
+        for (let channel = 0; channel < channels; channel++) wav.writeInt16LE(sample, 44 + (frame * channels + channel) * 2);
+    }
+    return wav;
 }
 
 test('generates temporary audio with opaque ID, never returns a path, then plays and cleans it', async t => {
@@ -187,6 +212,64 @@ test('normalizes unknown OpenAI WAV length markers for Windows file playback', (
     assert.equal(normalizeWavLengths(Buffer.from('not a wav')).toString(), 'not a wav');
 });
 
+test('VoiceFX off preserves audio bytes and never mutates the source', () => {
+    const processor = createVoiceFxProcessor();
+    const source = makePcmWav();
+    const before = Buffer.from(source);
+    const output = processor.process(source, 'off');
+    assert.deepEqual(output, before);
+    assert.notEqual(output, source);
+    assert.deepEqual(source, before);
+});
+
+test('VoiceFX presets are deterministic, preserve WAV validity and duration', () => {
+    const processor = createVoiceFxProcessor();
+    const source = makePcmWav({ durationMs: 800, channels: 2 });
+    const sourceBefore = Buffer.from(source);
+    for (const profile of ['subtle', 'digital', 'strong']) {
+        const output = processor.process(source, profile);
+        assert.equal(output.toString('ascii', 0, 4), 'RIFF');
+        assert.equal(output.toString('ascii', 8, 12), 'WAVE');
+        assert.equal(output.readUInt32LE(4) + 8, output.length);
+        assert.equal(output.readUInt32LE(40), source.readUInt32LE(40));
+        assert.equal(output.length, source.length);
+        assert.notDeepEqual(output, source);
+        assert.deepEqual(processor.process(source, profile), output);
+    }
+    assert.deepEqual(source, sourceBefore);
+});
+
+test('VoiceFX rejects invalid WAV input and unknown profiles', () => {
+    const processor = createVoiceFxProcessor();
+    assert.throws(() => processor.process(Buffer.from('bad audio'), 'digital'), /invalid_wav/u);
+    assert.throws(() => processor.process(makePcmWav(), 'metallic'), /invalid_voice_fx_profile/u);
+    assert.throws(() => processor.process('bad audio', 'off'), /invalid_audio_buffer/u);
+});
+
+test('VoiceFX DSP values are centralized in immutable named presets', () => {
+    assert.deepEqual(Object.keys(voiceFxProfiles), ['off', 'subtle', 'digital', 'strong']);
+    assert(Object.isFrozen(voiceFxProfiles));
+    assert(Object.values(voiceFxProfiles).every(Object.isFrozen));
+    assert.equal(voiceFxProfiles.off.delayMix, 0);
+    assert(voiceFxProfiles.subtle.delayMix < voiceFxProfiles.digital.delayMix);
+    assert(voiceFxProfiles.digital.delayMix < voiceFxProfiles.strong.delayMix);
+});
+
+test('SpeechService integrates VoiceFX with off as the unchanged default', async t => {
+    const f = await fixture(t);
+    const source = makePcmWav();
+    let usedProfile;
+    const service = createSpeechService({
+        store: f.store,
+        provider: { async synthesize() { return source; } },
+        voiceFxProcessor: { process(audio, profile) { usedProfile = profile; return createVoiceFxProcessor().process(audio, profile); } },
+    });
+    const generated = await service.generate({ text: 'Hola Nexa' });
+    assert.equal(generated.success, true);
+    assert.equal(usedProfile, 'off');
+    assert.deepEqual(await readFile(f.store.get(generated.audioId).filePath), source);
+});
+
 test('Windows playback opens WAV through MCI, waits for completion, closes it, and rejects other platforms', async () => {
     const commands = [];
     const windowsPlayer = createWindowsAudioPlayer({ platform: 'win32', sendCommand: async command => { commands.push(command); return 0; } });
@@ -204,32 +287,43 @@ test('Windows playback opens WAV through MCI, waits for completion, closes it, a
     assert.equal(invalidPath.error.code, 'invalid_audio_reference');
 });
 
-test('Nova personality casting writes four samples with fixed model, voice, text and WAV format', async t => {
+test('digital voice casting makes one Nova portena take and applies FX variants to that source', async t => {
     const f = await fixture(t);
     const outputDirectory = path.join(f.root, 'voice-casting');
     const requests = [];
+    const profiles = [];
+    const source = Buffer.from('single raw nova take');
+    let clock = 0;
     const samples = await generateVoiceCastingSamples({
         outputDirectory,
-        provider: { async synthesize(options) { requests.push(options); return Buffer.from(`wav:${options.voice}`); } },
+        now: () => { clock += 5; return clock; },
+        provider: { async synthesize(options) { requests.push(options); return source; } },
+        processor: { process(audio, profile) { profiles.push(profile); assert.deepEqual(audio, source); return Buffer.from(`${audio}:${profile}`); } },
     });
-    assert.deepEqual(samples.map(item => item.name), ['nova-natural', 'nova-canchera', 'nova-portena', 'nova-nexa']);
-    assert(samples.every(item => item.voice === 'nova'));
-    assert(requests.every(item => item.voice === 'nova' && item.text === castingText && item.format === 'wav'));
-    assert.equal(new Set(requests.map(item => item.instructions)).size, 4);
-    assert.equal(castingVariants.length, 4);
-    assert(requests.every((item, index) => item.instructions === castingVariants[index].instructions));
-    for (const sample of samples) assert.equal((await readFile(sample.path)).toString(), 'wav:nova');
+    assert.deepEqual(samples.map(item => item.name), ['nexa-digital-original', 'nexa-digital-subtle', 'nexa-digital', 'nexa-digital-strong']);
+    assert.deepEqual(samples.map(item => item.profile), ['off', 'subtle', 'digital', 'strong']);
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].voice, 'nova');
+    assert.equal(requests[0].text, digitalCastingText);
+    assert.equal(requests[0].instructions, castingVariants[2].instructions);
+    assert.equal(requests[0].format, 'wav');
+    assert.deepEqual(profiles, ['subtle', 'digital', 'strong']);
+    assert.deepEqual(source, Buffer.from('single raw nova take'));
+    assert.deepEqual(samples.map(item => item.processingMs), [0, 5, 5, 5]);
+    assert.equal((await readFile(samples[0].path)).toString(), 'single raw nova take');
+    for (const sample of samples.slice(1)) assert.match((await readFile(sample.path)).toString(), /:(subtle|digital|strong)$/u);
 });
 
-test('Nova casting uses only fixed variant instructions and reports provider errors', async t => {
+test('digital casting reports provider errors without attempting any FX processing', async t => {
     const f = await fixture(t);
     const requests = [];
+    let processed = false;
     const result = await generateVoiceCastingSamples({ outputDirectory: path.join(f.root, 'cast'), provider: {
-        async synthesize(options) { requests.push(options); if (options.instructions === castingVariants[1].instructions) throw new Error('mock provider failure'); return Buffer.from('sample'); },
-    } }).catch(error => error);
+        async synthesize(options) { requests.push(options); throw new Error('mock provider failure'); },
+    }, processor: { process() { processed = true; throw new Error('should not run'); } } }).catch(error => error);
     assert.match(result.message, /mock provider failure/u);
-    assert.deepEqual(requests.map(item => item.voice), ['nova', 'nova']);
-    assert.deepEqual(requests.map(item => item.instructions), castingVariants.slice(0, 2).map(item => item.instructions));
+    assert.equal(requests.length, 1);
+    assert.equal(processed, false);
 });
 
 test('public schemas constrain style and expose only opaque identifiers', () => {

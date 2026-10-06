@@ -2,6 +2,7 @@ import { speechConfig, getSpeechInstructions, speechStyles } from './config.js';
 import { createOpenAISpeechProvider } from './providers/openai.js';
 import { createAudioStore } from './audio-store.js';
 import { createWindowsAudioPlayer } from './windows-player.js';
+import { createVoiceFxProcessor } from './voice-fx.js';
 
 const maxAudioBytes = 50 * 1024 * 1024;
 
@@ -13,6 +14,8 @@ export function createSpeechService({
     provider = createOpenAISpeechProvider(),
     store = createAudioStore(speechConfig),
     player = createWindowsAudioPlayer(),
+    voiceFxProcessor = createVoiceFxProcessor(),
+    voiceFxProfile = 'off',
     maxTextLength = speechConfig.maxTextLength,
 } = {}) {
     async function initialize() {
@@ -34,6 +37,12 @@ export function createSpeechService({
         catch { return failure('speech_generation_failed', 'El proveedor de voz no pudo generar el audio.'); }
         if (!(Buffer.isBuffer(audio) || audio instanceof Uint8Array) || audio.byteLength === 0 || audio.byteLength > maxAudioBytes) {
             return failure('invalid_provider_audio', 'El proveedor devolvió un audio no válido.');
+        }
+
+        try { audio = voiceFxProcessor.process(Buffer.from(audio), voiceFxProfile); }
+        catch { return failure('audio_processing_failed', 'No pude preparar el audio para reproducirlo.'); }
+        if (!(Buffer.isBuffer(audio) || audio instanceof Uint8Array) || audio.byteLength === 0 || audio.byteLength > maxAudioBytes) {
+            return failure('audio_processing_failed', 'El procesador de audio devolvió un resultado no válido.');
         }
 
         try {
