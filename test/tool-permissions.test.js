@@ -53,6 +53,8 @@ test('existing local tools declare their intended permissions', () => {
         spotify_pause: 'action',
         spotify_next: 'action',
         spotify_previous: 'action',
+        get_email_connection_status: 'read',
+        list_email_mailboxes: 'read',
     });
 
     for (const registration of localToolRegistry.values()) {

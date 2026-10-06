@@ -4,6 +4,8 @@ data/memory.json
 data/apps.json*
 data/spotify-token.json
 data/spotify-token.json.tmp
+data/microsoft-token.json
+data/microsoft-token.json.lockfile
 data/whatsapp-session/
 data/temp/audio/
 data/audio/

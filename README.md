@@ -119,3 +119,20 @@ Para la prueba de voz, ejecutá `npm start` y pedile: `Nexa, generá y reproduc�
 El agente cuenta como máximo cinco rondas que solicitan herramientas (`maxToolIterations`). Si la quinta ronda usa herramientas, se permite un turno final del modelo con las herramientas deshabilitadas para redactar la respuesta; ese turno no puede ejecutar otra acción. `NEXA_AGENT_DEBUG=true` registra número de ronda, herramienta, resumen seguro de argumentos, resultado y tipo de respuesta del modelo sin imprimir valores de texto.
 
 Las pruebas automatizadas usan un proveedor simulado y no requieren aplicaciones abiertas. Para validarlo localmente, ejecutá `npm start`, abrí Calculator o Notepad, pedile a Nexa `inspeccioná los controles de Notepad`, y probá después `buscá el campo de edición de Notepad` o `leé el valor de ui_1` usando la referencia que Nexa haya recibido. La inspección real requiere una sesión interactiva de Windows y una aplicación abierta.
+
+## Communications — Microsoft Outlook (solo lectura)
+
+`src/communications/` define una API independiente del proveedor (`CommunicationsService` / `EmailProvider`). La implementación actual usa Microsoft Graph mediante OAuth delegado de MSAL; el Agent sólo conoce `get_email_connection_status` y `list_email_mailboxes`, ambas tools `read`. Esta fase no lee contenido de mensajes y no automatiza Outlook Classic ni accede a PST/OST. La estructura permite incorporar otros providers de correo más adelante.
+
+Para conectar Nexa, registrá una app nativa en el centro de administración de Microsoft Entra:
+
+1. Elegí **Accounts in this organizational directory only** para la organización laboral.
+2. En **Authentication**, agregá la plataforma **Mobile and desktop applications** con redirect URI `http://localhost`.
+3. En **API permissions → Microsoft Graph → Delegated permissions**, agregá exactamente `User.Read`, `Mail.Read` y `Mail.Read.Shared`. No agregues application permissions, permisos de envío, escritura, calendario o contactos. Si el tenant exige consentimiento de administrador, solicitá esa aprobación por el proceso normal de la empresa; Nexa no intenta eludirla.
+4. Copiá el Application (client) ID a `.env` como `MICROSOFT_CLIENT_ID` y reemplazá el placeholder de `MICROSOFT_TENANT_ID` por el Tenant ID GUID de esa organización. No crees un client secret para esta app desktop.
+5. Para shared mailboxes, cargá sus direcciones explícitamente en `MICROSOFT_SHARED_MAILBOXES`, separadas por comas. El usuario autenticado debe tener acceso delegado/Full Access concedido por Exchange; el scope OAuth no concede acceso por sí mismo.
+6. Ejecutá `npm run connect:microsoft`. MSAL abre el navegador del sistema para login, recibe la respuesta en loopback y valida el mailbox personal mediante Graph.
+
+Graph documenta un endpoint de Exchange settings que enumera mailboxes primarios/compartidos, pero su permiso delegado mínimo es `User.Read.All`. Nexa evita ese permiso de lectura amplia del directorio: incluye el mailbox personal autenticado y sólo agrega las direcciones shared configuradas que superen una comprobación de acceso a su Inbox con Graph. Las que no se puedan validar aparecen como incidencias sin exponer respuestas sin filtrar de Graph. El listado no lee mensajes. Ver [List Exchange settings](https://learn.microsoft.com/en-us/graph/api/usersettings-list-exchange?view=graph-rest-1.0) y [permisos para carpetas compartidas](https://learn.microsoft.com/en-us/graph/outlook-share-messages-folders).
+
+MSAL mantiene la caché OAuth en `data/microsoft-token.json`; en Windows, Microsoft Authentication Extensions la cifra con DPAPI para el usuario actual. El archivo y su lock están ignorados por Git. Nexa no escribe ni registra tokens o contraseñas Microsoft. `.env.example` contiene únicamente nombres y placeholders de configuración.

@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node src/index.js",
     "spotify:auth": "node src/integrations/spotify/authorize.js",
+    "connect:microsoft": "node src/integrations/microsoft/connect.js",
     "test": "node --test",
     "speech:cast": "node src/speech/cast-cli.js",
     "speech:voice-lab": "node src/speech/voice-lab.js",
@@ -16,6 +17,8 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@azure/msal-node": "^7.0.1",
+    "@azure/msal-node-extensions": "^5.5.2",
     "dotenv": "^18.0.5",
     "koffi": "3.3.2",
     "loudness": "0.4.2",
