@@ -15,7 +15,7 @@ export const nexaEmailIdentity = Object.freeze({
         contentType: 'image/jpeg',
         contentBytes: readFileSync(new URL('./assets/lifeguard-costa-rica.jpg', import.meta.url)).toString('base64'),
         alt: 'Lifeguard Costa Rica',
-        width: 330,
-        height: 75,
+        width: 288,
+        height: 65,
     }),
 });

@@ -15,6 +15,13 @@ test('signature renderer creates a text-friendly, email-safe HTML signature and 
     assert.match(result.htmlBody, /href="tel:\+50640019867"/u);
     assert.match(result.htmlBody, /href="tel:\+50685129111"/u);
     assert.match(result.htmlBody, /src="cid:nexa-lifeguard-logo"/u);
+    assert.match(result.htmlBody, /font-family:Aptos,'Arial Narrow',Arial,sans-serif/u);
+    assert.match(result.htmlBody, /font-size:18\.67px;line-height:20px;font-weight:bold;color:#5e5e5e/u);
+    assert.match(result.htmlBody, /font-size:17\.33px;line-height:19px;font-weight:bold;color:#154fa0/u);
+    assert.match(result.htmlBody, /font-size:14px;line-height:16px/u);
+    assert.match(result.htmlBody, /color:#467886;text-decoration:underline/u);
+    assert.match(result.htmlBody, /width="288" height="65" style="display:block;width:288px;height:auto/u);
+    assert.equal(nexaEmailIdentity.logo.width / nexaEmailIdentity.logo.height, 288 / 65);
     assert.equal(result.inlineAttachments.length, 1);
     assert.deepEqual({ type: result.inlineAttachments[0].contentType, inline: result.inlineAttachments[0].isInline, cid: result.inlineAttachments[0].contentId },
         { type: 'image/jpeg', inline: true, cid: 'nexa-lifeguard-logo' });
