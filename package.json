@@ -8,6 +8,7 @@
     "spotify:auth": "node src/integrations/spotify/authorize.js",
     "test": "node --test",
     "speech:cast": "node src/speech/cast-cli.js",
+    "speech:voice-lab": "node src/speech/voice-lab.js",
     "whatsapp:auth": "node src/integrations/whatsapp/auth.js"
   },
   "keywords": [],
@@ -20,5 +21,8 @@
     "loudness": "0.4.2",
     "openai": "^7.27.0",
     "playwright": "^1.63.0"
+  },
+  "devDependencies": {
+    "signalsmith-stretch": "1.3.2"
   }
 }
