@@ -10,6 +10,8 @@ import { createOpenAISpeechProvider } from '../src/speech/providers/openai.js';
 import { generateSpeechTool, playAudioTool, speechRegistrations } from '../src/speech/index.js';
 import { checkToolPermission } from '../src/tools/permissions.js';
 import { createWindowsAudioPlayer } from '../src/speech/windows-player.js';
+import { castingVoices, castingText, castingInstructions, generateVoiceCastingSamples } from '../src/speech/voice-casting.js';
+import { normalizeWavLengths } from '../src/speech/wav.js';
 
 async function fixture(t, { maxTemporaryAgeMs = 60_000 } = {}) {
     const root = await mkdtemp(path.join(os.tmpdir(), 'nexa-speech-test-'));
@@ -146,15 +148,64 @@ test('OpenAI provider uses centralized model, voice, instructions, WAV format an
     assert.deepEqual(request, {
         model: 'gpt-4o-mini-tts', voice: 'marin', input: 'Hola', instructions: 'Nexa voice', response_format: 'wav',
     });
+    await provider.synthesize({ text: 'Hola', instructions: 'Nexa voice', voice: 'coral' });
+    assert.equal(request.voice, 'coral');
 });
 
-test('Windows playback uses the fixed native audio API and rejects other platforms', async () => {
-    let played;
-    const windowsPlayer = createWindowsAudioPlayer({ platform: 'win32', playSound: async audioPath => { played = audioPath; } });
+test('normalizes unknown OpenAI WAV length markers for Windows file playback', () => {
+    const wav = Buffer.alloc(48);
+    wav.write('RIFF', 0, 'ascii');
+    wav.writeUInt32LE(0xffffffff, 4);
+    wav.write('WAVEfmt ', 8, 'ascii');
+    wav.writeUInt32LE(16, 16);
+    wav.write('data', 36, 'ascii');
+    wav.writeUInt32LE(0xffffffff, 40);
+    const normalized = normalizeWavLengths(wav);
+    assert.equal(normalized.readUInt32LE(4), 40);
+    assert.equal(normalized.readUInt32LE(40), 4);
+    assert.equal(normalizeWavLengths(Buffer.from('not a wav')).toString(), 'not a wav');
+});
+
+test('Windows playback opens WAV through MCI, waits for completion, closes it, and rejects other platforms', async () => {
+    const commands = [];
+    const windowsPlayer = createWindowsAudioPlayer({ platform: 'win32', sendCommand: async command => { commands.push(command); return 0; } });
     assert.deepEqual(await windowsPlayer('internal-controlled-audio.wav'), { success: true });
-    assert.equal(played, 'internal-controlled-audio.wav');
+    assert.match(commands[0], /^open "internal-controlled-audio\.wav" type waveaudio alias NexaAudio/u);
+    assert.match(commands[1], /^play NexaAudio[0-9a-f]{12} wait$/u);
+    assert.match(commands[2], /^close NexaAudio[0-9a-f]{12}$/u);
+    assert.equal(commands[1].split(' ')[1], commands[2].split(' ')[1]);
+    const failed = await createWindowsAudioPlayer({ platform: 'win32', sendCommand: async command => command.startsWith('play ') ? 263 : 0 })('internal-controlled-audio.wav');
+    assert.equal(failed.error.code, 'audio_playback_failed');
+    assert.equal(commands.length, 3);
     const unsupported = await createWindowsAudioPlayer({ platform: 'linux' })('ignored.wav');
     assert.equal(unsupported.error.code, 'unsupported_platform');
+    const invalidPath = await createWindowsAudioPlayer({ platform: 'win32', sendCommand: async () => 0 })('bad" path.wav');
+    assert.equal(invalidPath.error.code, 'invalid_audio_reference');
+});
+
+test('voice casting writes one sample per fixed supported voice and shares identical text/instructions', async t => {
+    const f = await fixture(t);
+    const outputDirectory = path.join(f.root, 'voice-casting');
+    const requests = [];
+    const samples = await generateVoiceCastingSamples({
+        outputDirectory,
+        provider: { async synthesize(options) { requests.push(options); return Buffer.from(`wav:${options.voice}`); } },
+    });
+    assert.deepEqual(samples.map(item => item.voice), ['coral', 'nova', 'shimmer', 'sage']);
+    assert.deepEqual(castingVoices, samples.map(item => item.voice));
+    assert(requests.every(item => item.text === castingText && item.instructions === castingInstructions && item.format === 'wav'));
+    for (const sample of samples) assert.equal((await readFile(sample.path)).toString(), `wav:${sample.voice}`);
+});
+
+test('voice casting provider errors do not invoke live OpenAI in test and only fixed voice names are output', async t => {
+    const f = await fixture(t);
+    const requests = [];
+    const result = await generateVoiceCastingSamples({ outputDirectory: path.join(f.root, 'cast'), provider: {
+        async synthesize(options) { requests.push(options); if (options.voice === 'nova') throw new Error('mock provider failure'); return Buffer.from('sample'); },
+    } }).catch(error => error);
+    assert.match(result.message, /mock provider failure/u);
+    assert.deepEqual(requests.map(item => item.voice), ['coral', 'nova']);
+    assert.deepEqual(castingVoices, ['coral', 'nova', 'shimmer', 'sage']);
 });
 
 test('public schemas constrain style and expose only opaque identifiers', () => {
