@@ -31,9 +31,9 @@ export function normalizeMailbox({ id, address, displayName, type }) {
 }
 function graphError(status, writing = false, resourceKind = 'mail') {
     if (status === 401) return { code: 'microsoft_authorization_required', message: 'La sesión Microsoft venció o necesita reconectarse.' };
-    if (status === 403) return { code: 'microsoft_access_denied', message: writing
-        ? 'Microsoft no autorizó este envío. Para un shared mailbox, verificá Mail.Send.Shared y los permisos Exchange Send As o Send on Behalf.'
-        : resourceKind === 'calendar' ? 'Microsoft no permite leer este calendario con la autorización o los accesos delegados actuales.' : 'Microsoft no permite leer este buzón con la autorización o los accesos delegados actuales.' };
+    if (status === 403) return { code: 'microsoft_access_denied', message: resourceKind === 'calendar'
+        ? writing ? 'Microsoft no autorizó esta escritura de calendario. Verificá los permisos delegados Calendars.ReadWrite y el acceso de edición al calendario compartido.' : 'Microsoft no permite leer este calendario con la autorización o los accesos delegados actuales.'
+        : writing ? 'Microsoft no autorizó este envío. Para un shared mailbox, verificá Mail.Send.Shared y los permisos Exchange Send As o Send on Behalf.' : 'Microsoft no permite leer este buzón con la autorización o los accesos delegados actuales.' };
     if (status === 404) return resourceKind === 'calendar'
         ? { code: 'microsoft_calendar_not_found', message: 'Microsoft Graph no encontró el calendario o evento.' }
         : { code: 'microsoft_mailbox_not_found', message: 'Microsoft Graph no encontró el buzón o mensaje.' };
@@ -76,6 +76,7 @@ function normalizeGraphCalendarEvent(event, { includeBody = false } = {}) {
         providerEventId: event.id,
         subject: typeof event.subject === 'string' ? event.subject : '(Sin asunto)',
         startDateTime, endDateTime, isAllDay: event.isAllDay === true,
+        isOrganizer: event.isOrganizer === true,
         location: typeof event.location?.displayName === 'string' ? { displayName: event.location.displayName.slice(0, 300) } : null,
         organizer: person(event.organizer), attendees: recipientList(event.attendees).slice(0, 50),
         preview: typeof event.bodyPreview === 'string' ? event.bodyPreview.slice(0, 500) : '',
@@ -199,7 +200,7 @@ export function createMicrosoftGraphProvider({ auth, fetchImpl = fetch, environm
             return { success: false, error: { code: 'calendar_not_configured', message: 'Ese calendario compartido no está en la lista configurada.' } };
         }
         const owner = calendarAddress ? 'users/' + encodeURIComponent(calendarAddress) : 'me';
-        const params = new URLSearchParams({ startDateTime, endDateTime, '$select': 'id,subject,start,end,isAllDay,location,organizer,attendees,bodyPreview', '$top': String(Math.max(1, Math.min(50, limit))) });
+        const params = new URLSearchParams({ startDateTime, endDateTime, '$select': 'id,subject,start,end,isAllDay,isOrganizer,location,organizer,attendees,bodyPreview', '$top': String(Math.max(1, Math.min(50, limit))) });
         const response = await request(owner + '/calendarView?' + params, { preferTimezone: 'UTC', resourceKind: 'calendar' });
         if (!response.success) return response;
         if (!Array.isArray(response.data?.value)) return { success: false, error: { code: 'calendar_response_invalid', message: 'Microsoft Graph devolvió una lista de eventos no válida.' } };
@@ -214,11 +215,63 @@ export function createMicrosoftGraphProvider({ auth, fetchImpl = fetch, environm
         if (typeof providerEventId !== 'string' || !providerEventId || providerEventId.length > 512) return { success: false, error: { code: 'calendar_reference_invalid', message: 'La referencia del evento no es válida.' } };
         const owner = calendarAddress ? 'users/' + encodeURIComponent(calendarAddress) : 'me';
         const eventId = encodeURIComponent(providerEventId);
-        const fields = 'id,subject,start,end,isAllDay,location,organizer,attendees,bodyPreview,body';
+        const fields = 'id,subject,start,end,isAllDay,isOrganizer,location,organizer,attendees,bodyPreview,body';
         const response = await request(owner + '/events/' + eventId + '?$select=' + fields, { preferText: true, preferTimezone: 'UTC', resourceKind: 'calendar' });
         if (!response.success) return response;
         const event = normalizeGraphCalendarEvent(response.data, { includeBody: true });
         return event ? { success: true, event } : { success: false, error: { code: 'calendar_event_invalid', message: 'Microsoft Graph devolvió un evento no válido.' } };
+    }
+    function calendarOwner(calendarAddress) { return calendarAddress ? 'users/' + encodeURIComponent(calendarAddress) : 'me'; }
+    function calendarWritePath(calendarAddress, providerEventId = null) {
+        const owner = calendarOwner(calendarAddress);
+        return owner + (providerEventId ? '/events/' + encodeURIComponent(providerEventId) : '/calendar/events');
+    }
+    function graphDateTime(instant) {
+        const value = new Date(instant);
+        if (!Number.isFinite(value.getTime())) return null;
+        return { dateTime: value.toISOString().replace(/Z$/u, ''), timeZone: 'UTC' };
+    }
+    async function createCalendarEvent({ calendarAddress = null, event }) {
+        const config = getMicrosoftConfiguration(environment);
+        if (!config.success) return { success: false, error: config.error };
+        if (calendarAddress && !config.sharedCalendars.includes(String(calendarAddress).toLocaleLowerCase('en-US'))) return { success: false, error: { code: 'calendar_not_configured', message: 'Ese calendario compartido no está en la lista configurada.' } };
+        const start = graphDateTime(event?.startDateTime), end = graphDateTime(event?.endDateTime);
+        if (!start || !end || Date.parse(event.endDateTime) <= Date.parse(event.startDateTime)) return { success: false, error: { code: 'calendar_event_invalid', message: 'El horario del evento no es válido.' } };
+        const attendees = Array.isArray(event.attendees) ? event.attendees.map(address => ({ emailAddress: { address }, type: 'required' })) : [];
+        const jsonBody = { subject: event.title, start, end, attendees,
+            body: { contentType: 'text', content: event.description ?? '' },
+            ...(event.location ? { location: { displayName: event.location } } : {}) };
+        const response = await request(calendarWritePath(calendarAddress), { method: 'POST', jsonBody, resourceKind: 'calendar' });
+        if (!response.success) return response;
+        const created = normalizeGraphCalendarEvent(response.data);
+        return created ? { success: true, event: created } : { success: false, error: { code: 'calendar_response_invalid', message: 'Microsoft Graph no devolvió el evento creado.' } };
+    }
+    async function updateCalendarEvent({ calendarAddress = null, providerEventId, patch }) {
+        const config = getMicrosoftConfiguration(environment);
+        if (!config.success) return { success: false, error: config.error };
+        if (calendarAddress && !config.sharedCalendars.includes(String(calendarAddress).toLocaleLowerCase('en-US'))) return { success: false, error: { code: 'calendar_not_configured', message: 'Ese calendario compartido no está en la lista configurada.' } };
+        if (typeof providerEventId !== 'string' || !providerEventId || providerEventId.length > 512) return { success: false, error: { code: 'calendar_reference_invalid', message: 'La referencia del evento no es válida.' } };
+        const jsonBody = {};
+        if (patch?.title !== undefined) jsonBody.subject = patch.title;
+        if (patch?.startDateTime !== undefined) jsonBody.start = graphDateTime(patch.startDateTime);
+        if (patch?.endDateTime !== undefined) jsonBody.end = graphDateTime(patch.endDateTime);
+        if (patch?.location !== undefined) jsonBody.location = { displayName: patch.location };
+        if (!Object.keys(jsonBody).length || (jsonBody.start === null) || (jsonBody.end === null)) return { success: false, error: { code: 'calendar_event_invalid', message: 'No hay cambios válidos para aplicar al evento.' } };
+        const response = await request(calendarWritePath(calendarAddress, providerEventId), { method: 'PATCH', jsonBody, preferTimezone: 'UTC', resourceKind: 'calendar' });
+        if (!response.success) return response;
+        const event = normalizeGraphCalendarEvent(response.data);
+        return event ? { success: true, event } : { success: false, error: { code: 'calendar_response_invalid', message: 'Microsoft Graph no devolvió el evento modificado.' } };
+    }
+    async function cancelCalendarEvent({ calendarAddress = null, providerEventId, sendMeetingCancellation = false }) {
+        const config = getMicrosoftConfiguration(environment);
+        if (!config.success) return { success: false, error: config.error };
+        if (calendarAddress && !config.sharedCalendars.includes(String(calendarAddress).toLocaleLowerCase('en-US'))) return { success: false, error: { code: 'calendar_not_configured', message: 'Ese calendario compartido no está en la lista configurada.' } };
+        if (typeof providerEventId !== 'string' || !providerEventId || providerEventId.length > 512) return { success: false, error: { code: 'calendar_reference_invalid', message: 'La referencia del evento no es válida.' } };
+        const eventPath = calendarWritePath(calendarAddress, providerEventId);
+        const response = sendMeetingCancellation
+            ? await request(eventPath + '/cancel', { method: 'POST', jsonBody: {}, resourceKind: 'calendar' })
+            : await request(eventPath, { method: 'DELETE', resourceKind: 'calendar' });
+        return response.success ? { success: true, cancelled: true, notificationSent: sendMeetingCancellation } : response;
     }
     async function sendEmail({ mailboxAddress, to, cc, subject, bodyHtml, inlineAttachments }) {
         const mimeBody = createRelatedMime({ from: mailboxAddress, to, cc, subject, htmlBody: bodyHtml, inlineAttachments });
@@ -234,5 +287,5 @@ export function createMicrosoftGraphProvider({ auth, fetchImpl = fetch, environm
         });
         return response.success ? { success: true, sent: true } : response;
     }
-    return { getConnectionStatus, getMailboxes, listRecentEmails, searchEmails, getEmail, listCalendarEvents, getCalendarEvent, sendEmail, sendReply };
+    return { getConnectionStatus, getMailboxes, listRecentEmails, searchEmails, getEmail, listCalendarEvents, getCalendarEvent, createCalendarEvent, updateCalendarEvent, cancelCalendarEvent, sendEmail, sendReply };
 }

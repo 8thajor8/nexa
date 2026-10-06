@@ -19,9 +19,9 @@ test('Microsoft config validates client/tenant and normalizes configured shared 
     assert.equal(getMicrosoftConfiguration({ ...environment, MICROSOFT_SHARED_MAILBOXES: 'not-an-address' }).success, false);
 });
 
-test('OAuth requests delegated identity, mail, send-mail and read-only calendar scopes', () => {
-    assert.deepEqual(microsoftGraphScopes, ['User.Read', 'Mail.Read', 'Mail.Read.Shared', 'Mail.Send', 'Mail.Send.Shared', 'Calendars.Read', 'Calendars.Read.Shared']);
-    assert(microsoftGraphScopes.every(scope => !/write|delete|contacts|\.all/iu.test(scope)));
+test('OAuth requests only delegated identity, mail, and calendar read/write scopes required by configured tools', () => {
+    assert.deepEqual(microsoftGraphScopes, ['User.Read', 'Mail.Read', 'Mail.Read.Shared', 'Mail.Send', 'Mail.Send.Shared', 'Calendars.ReadWrite', 'Calendars.ReadWrite.Shared']);
+    assert(microsoftGraphScopes.every(scope => !/\.all|contacts|offline_access/iu.test(scope)));
 });
 
 test('normalizes provider-independent personal/shared mailbox records', () => {
@@ -122,8 +122,8 @@ test('explicit OAuth connection uses the minimal scopes and sanitizes tenant con
     assert(!JSON.stringify(result).includes('secret diagnostic'));
 });
 
-test('email tools register preparation separately from confirmed sending', () => {
-    assert.deepEqual(communicationsRegistrations.map(registration => registration.definition.name), ['get_email_connection_status', 'list_email_mailboxes', 'list_recent_emails', 'search_emails', 'get_email', 'prepare_email', 'prepare_email_reply', 'confirm_pending_action', 'cancel_pending_action', 'resolve_pending_action', 'list_calendar_events', 'get_calendar_event']);
+test('communications tools register calendar writes as preparation actions, not direct write tools', () => {
+    assert.deepEqual(communicationsRegistrations.map(registration => registration.definition.name), ['get_email_connection_status', 'list_email_mailboxes', 'list_recent_emails', 'search_emails', 'get_email', 'prepare_email', 'prepare_email_reply', 'confirm_pending_action', 'cancel_pending_action', 'resolve_pending_action', 'list_calendar_events', 'get_calendar_event', 'prepare_calendar_event', 'prepare_calendar_event_update', 'prepare_calendar_event_cancel']);
     for (const name of ['get_email_connection_status', 'list_email_mailboxes', 'list_recent_emails', 'search_emails', 'get_email', 'prepare_email', 'prepare_email_reply']) {
         assert.equal(localToolRegistry.get(name)?.permission, 'read');
         assert.equal(checkToolPermission(localToolRegistry.get(name), defaultPermissionPolicy).allowed, true);
@@ -138,4 +138,9 @@ test('email tools register preparation separately from confirmed sending', () =>
         assert.equal(localToolRegistry.get(name)?.permission, 'read');
         assert.equal(checkToolPermission(localToolRegistry.get(name), defaultPermissionPolicy).allowed, true);
     }
+    for (const name of ['prepare_calendar_event', 'prepare_calendar_event_update', 'prepare_calendar_event_cancel']) {
+        assert.equal(localToolRegistry.get(name)?.permission, 'action');
+        assert.equal(checkToolPermission(localToolRegistry.get(name), defaultPermissionPolicy).allowed, true);
+    }
+    for (const name of ['create_calendar_event', 'update_calendar_event', 'cancel_calendar_event']) assert.equal(localToolRegistry.has(name), false);
 });

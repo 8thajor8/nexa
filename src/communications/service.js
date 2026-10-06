@@ -24,17 +24,26 @@ function formatPreview({ from, to, cc, subject, body }) {
 }
 function pendingResult(action) {
     const { type, preview, expiresAt } = action;
+    const nextStep = type === 'calendar.create' ? 'Mostrá la vista previa y preguntá si lo crea.'
+        : type === 'calendar.update' ? 'Mostrá el antes y después y preguntá si lo cambia.'
+            : type === 'calendar.cancel' ? 'Mostrá qué evento se cancelará y preguntá si confirma la cancelación.'
+                : 'Revisá la vista previa. Si está bien, respondé naturalmente: ¿Lo envío? También podés pedirme que lo modifique o cancelarlo.';
     return { success: true, pendingAction: { type, preview, expiresAt },
-        nextStep: 'Revisá la vista previa. Si está bien, respondé naturalmente: ¿Lo envío? También podés pedirme que lo modifique o cancelarlo.' };
+        nextStep };
 }
 
 function normalizedText(value) {
     return typeof value === 'string' ? value.trim().toLocaleLowerCase('es').normalize('NFD').replace(/\p{Diacritic}/gu, '') : '';
 }
-function directActionCue(message) {
+function directActionCue(message, actions = []) {
     const text = normalizedText(message);
     if (!text || text.length > 160 || /["“”'‘’`]/u.test(text)) return null;
-    if (/\b(pero|aunque|cambi|modific|corrig|agreg|sac[ae]|reemplaz|asunto|destinatari|cuerpo|texto|antes de|si\s+(?:podes|puedes|podrias|podrías)|en vez de)\b/u.test(text)) return 'modify';
+    const actionType = actions.length === 1 ? actions[0]?.type : null;
+    if (/^(?:crealo|creala|crealos)(?:[.!\s]*)$/u.test(text) && actionType === 'calendar.create') return 'approve';
+    if (/^(?:cambialo|cambiala|actualizalo|actualizala)(?:[.!\s]*)$/u.test(text) && actionType === 'calendar.update') return 'approve';
+    if (/^(?:cancelalo|cancelala)(?:[.!\s]*)$/u.test(text) && actionType === 'calendar.cancel') return 'approve';
+    if (/^(?:hacelo|hacela)(?:[.!\s]*)$/u.test(text)) return 'approve';
+    if (/\b(pero|aunque|cambi[a-z]*|modific[a-z]*|corrig[a-z]*|agreg[a-z]*|sac[ae][a-z]*|reemplaz[a-z]*|pas[a-z]*|mov[a-z]*|asunto|destinatari|cuerpo|texto|antes de|si\s+(?:podes|puedes|podrias|podrías)|en vez de)\b/u.test(text)) return 'modify';
     if (/^(?:ningun[oa]s?|olvidate|dejalo|dejala|cancelalos|cancelalas)(?:[.!\s]*)$/u.test(text)) return 'cancel_all';
     if (/^(?:cancelalo|cancelala|cancelar|no lo mandes|no la envies|no lo envies|no enviar)(?:[.!\s]*)$/u.test(text)) return 'cancel';
     if (/^(?:no(?:\s+gracias)?|mejor no|todavia no|aun no)(?:[.!\s]*)$/u.test(text)) return 'reject';
@@ -45,6 +54,9 @@ function directActionCue(message) {
 function actionDescription(action) {
     const payload = action.payload ?? {};
     if (Array.isArray(payload.to)) return 'correo para ' + payload.to.join(', ');
+    if (action.type === 'calendar.create') return 'evento ' + (payload.title ?? 'de calendario');
+    if (action.type === 'calendar.update') return 'cambio de ' + (payload.current?.subject ?? 'evento');
+    if (action.type === 'calendar.cancel') return 'cancelación de ' + (payload.event?.subject ?? 'evento');
     return action.type;
 }
 export function createCommunicationsService({ emailProvider, calendarProvider = null, pendingActions = createPendingActionManager(), signatureRenderer = emailSignatureRenderer }) {
@@ -131,6 +143,25 @@ export function createCommunicationsService({ emailProvider, calendarProvider = 
             return pendingResult(action);
         });
     }
+    async function prepareCalendarAction(args, context, operation, type) {
+        return safelyCall(async () => {
+            if (!calendarService) return safeError;
+            const sessionId = session(context);
+            if (!sessionId) return { success: false, error: { code: 'pending_action_invalid', message: 'La preparación requiere una sesión activa.' } };
+            if (modificationTargetIsAmbiguous(context)) return { success: false, error: { code: 'pending_action_ambiguous', message: 'Hay varias vistas previas pendientes. Elegí cuál querés modificar antes de preparar otra.' } };
+            const prepared = await operation(args ?? {}, context);
+            if (!prepared?.success) return prepared ?? safeError;
+            const action = pendingActions.create({ type, payload: prepared.payload, preview: prepared.preview, sessionId,
+                replaceIds: replacementIds(context) });
+            return pendingResult(action);
+        });
+    }
+    const prepareCalendarEvent = (args, context) => prepareCalendarAction(args, context,
+        (value, ctx) => calendarService.prepareCalendarEvent(value, ctx), 'calendar.create');
+    const prepareCalendarEventUpdate = (args, context) => prepareCalendarAction(args, context,
+        (value, ctx) => calendarService.prepareCalendarEventUpdate(value, ctx), 'calendar.update');
+    const prepareCalendarEventCancel = (args, context) => prepareCalendarAction(args, context,
+        (value, ctx) => calendarService.prepareCalendarEventCancel(value, ctx), 'calendar.cancel');
     async function confirmPendingAction(args, context) {
         return safelyCall(async () => {
             const sessionId = session(context);
@@ -158,14 +189,14 @@ export function createCommunicationsService({ emailProvider, calendarProvider = 
             if (!sessionId || context?.userMessageSource !== 'direct_user') return { success: false, error: { code: 'direct_user_confirmation_required', message: 'Sólo un mensaje directo del usuario puede confirmar o cancelar una acción pendiente.' } };
             const actions = pendingActions.list({ sessionId });
             if (!actions.length) return { success: false, error: { code: 'pending_action_not_found', message: 'No hay acciones pendientes para esta sesión.' } };
-            const cue = directActionCue(context.userMessage);
+            const selected = pendingActions.getSelected({ sessionId });
+            const cue = directActionCue(context.userMessage, selected ? [selected] : actions);
             const decision = args?.intent;
             if (cue === 'modify' || decision === 'modify') {
                 return { success: true, outcome: 'modify', message: 'No ejecuté la acción. Prepará una nueva vista previa con los cambios solicitados; hará falta confirmarla nuevamente.' };
             }
             if (!cue) return { success: false, error: { code: 'confirmation_intent_unclear', message: 'No pude verificar una aprobación directa del usuario. No ejecuté ninguna acción.' } };
             if (decision !== cue) return { success: false, error: { code: 'confirmation_intent_mismatch', message: 'No pude verificar una confirmación directa e inequívoca. La acción sigue pendiente y no se ejecutó.' } };
-            const selected = pendingActions.getSelected({ sessionId });
             if (decision === 'approve') {
                 let action;
                 if (selected) action = actions.find(item => item.id === selected.id);
@@ -206,8 +237,12 @@ export function createCommunicationsService({ emailProvider, calendarProvider = 
         let result;
         if (claimed.type === 'email.send' && typeof emailProvider.sendEmail === 'function') result = await emailProvider.sendEmail(claimed.payload);
         else if (claimed.type === 'email.reply' && typeof emailProvider.sendReply === 'function') result = await emailProvider.sendReply(claimed.payload);
+        else if (claimed.type === 'calendar.create' && calendarService) result = await calendarService.createCalendarEvent(claimed.payload);
+        else if (claimed.type === 'calendar.update' && calendarService) result = await calendarService.updateCalendarEvent(claimed.payload);
+        else if (claimed.type === 'calendar.cancel' && calendarService) result = await calendarService.cancelCalendarEvent(claimed.payload);
         else return { success: false, error: { code: 'pending_action_type_unavailable', message: 'La acción ya no se puede ejecutar. Preparala nuevamente.' } };
         if (!result?.success) return result?.error ? { success: false, error: result.error } : safeError;
+        if (claimed.type.startsWith('calendar.')) return result;
         return { success: true, sent: true, message: 'Microsoft Graph confirmó la aceptación del envío.' };
     }
     return {
@@ -234,5 +269,6 @@ export function createCommunicationsService({ emailProvider, calendarProvider = 
         prepareEmail, prepareEmailReply, confirmPendingAction, cancelPendingAction, resolvePendingAction,
         listCalendarEvents: (args, context) => calendarService ? calendarService.listCalendarEvents(args, context) : safeError,
         getCalendarEvent: (args, context) => calendarService ? calendarService.getCalendarEvent(args, context) : safeError,
+        prepareCalendarEvent, prepareCalendarEventUpdate, prepareCalendarEventCancel,
     };
 }

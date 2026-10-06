@@ -4,6 +4,7 @@ import { getMicrosoftConfiguration } from './config.js';
 const maxEvents = 50;
 const maxRangeDays = 31;
 const maxDescriptionLength = 3000;
+const defaultEventDurationMinutes = 60;
 const failure = { success: false, error: { code: 'calendar_unavailable', message: 'El calendario no está disponible en este momento.' } };
 
 function localDateParts(date, timeZone) {
@@ -44,6 +45,28 @@ function localDateTime(iso, timeZone) {
     const value = Object.fromEntries(parts.filter(item => item.type !== 'literal').map(item => [item.type, item.value]));
     return value.year + '-' + value.month + '-' + value.day + ' ' + value.hour + ':' + value.minute;
 }
+function validLocalDateTime(value) {
+    if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/u.test(value)) return null;
+    const [date, time] = value.split('T'), parts = parseDate(date);
+    const [hour, minute] = time.split(':').map(Number);
+    return parts && hour < 24 && minute < 60 ? { ...parts, hour, minute } : null;
+}
+function zoneOffsetAt(instant, timeZone) {
+    const parts = localClockParts(instant, timeZone);
+    return Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second) - instant.getTime();
+}
+function utcForLocalDateTime(value, timeZone) {
+    const local = validLocalDateTime(value);
+    if (!local) return null;
+    const target = Date.UTC(local.year, local.month - 1, local.day, local.hour, local.minute);
+    const offsets = new Set();
+    for (const hours of [-36, -24, -12, 0, 12, 24, 36]) offsets.add(zoneOffsetAt(new Date(target + hours * 3600000), timeZone));
+    const candidates = [...offsets].map(offset => new Date(target - offset)).filter(candidate => {
+        const parts = localClockParts(candidate, timeZone);
+        return parts.year === local.year && parts.month === local.month && parts.day === local.day && parts.hour === local.hour && parts.minute === local.minute && parts.second === 0;
+    });
+    return candidates.length === 1 ? candidates[0].toISOString() : null;
+}
 function resolveDateRange(args, timeZone, now) {
     let start;
     let end;
@@ -79,6 +102,7 @@ function safeEvent(event, calendar, timeZone) {
         endLocal: localDateTime(event.endDateTime, timeZone),
         timeZone,
         isAllDay: event.isAllDay === true,
+        isOrganizer: event.isOrganizer === true,
         location: event.location ?? null,
         organizer: event.organizer ?? null,
         attendees: Array.isArray(event.attendees) ? event.attendees.slice(0, 50) : [],
@@ -102,6 +126,126 @@ export function createCalendarService({ provider, environment = process.env, tim
         if (['personal', 'mi calendario', 'mi calendario personal'].includes(value)) return { success: true, address: null, type: 'personal' };
         const matches = sharedCalendars.filter(address => address === value || address.split('@')[0] === value);
         return matches.length === 1 ? { success: true, address: matches[0], type: 'shared' } : { success: false, error: { code: matches.length ? 'calendar_ambiguous' : 'calendar_not_configured', message: 'Indicá mi calendario personal o una dirección/nombre de calendario compartido configurado.' } };
+    }
+    function writableCalendar(reference) { return resolveCalendar(reference); }
+    function validText(value, max, required = false) {
+        if (value === undefined || value === null) return required ? null : '';
+        if (typeof value !== 'string' || value.length > max || /[\0\r]/u.test(value) || (required && !value.trim())) return null;
+        return value.trim();
+    }
+    function validAttendees(value) {
+        if (value === undefined || value === null) return [];
+        if (!Array.isArray(value) || value.length > 20) return null;
+        const normalized = value.map(item => typeof item === 'string' ? item.trim().toLocaleLowerCase('en-US') : '');
+        return normalized.every(item => /^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$/u.test(item) && item.length <= 254) ? [...new Set(normalized)] : null;
+    }
+    function timezoneFor(value) {
+        const zone = typeof value === 'string' && value.trim() ? value.trim() : timeZone;
+        return validTimeZone(zone) ? zone : null;
+    }
+    function localInput(value, zone) {
+        const instant = utcForLocalDateTime(value, zone);
+        return instant ? { instant } : null;
+    }
+    function previewTimes(title, start, end, zone) {
+        const startValue = localDateTime(start, zone), endValue = localDateTime(end, zone);
+        const startDate = new Date(start);
+        const longDate = new Intl.DateTimeFormat('es-ES', { timeZone: zone, weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).format(startDate);
+        const dateLabel = longDate.charAt(0).toLocaleUpperCase('es') + longDate.slice(1);
+        const startClock = startValue?.slice(11) ?? start, endClock = endValue?.slice(11) ?? end;
+        const endDate = endValue?.slice(0, 10) === startValue?.slice(0, 10) ? '' : '\n' + endValue?.slice(0, 10) + ' ';
+        return `${title}\n${dateLabel}\n${startClock}–${endDate}${endClock}`;
+    }
+    function activeSession(context) { return currentSession(context); }
+    function lookupEvent(id, context) {
+        const reference = typeof id === 'string' ? references.get(id) : null;
+        return reference && reference.sessionId === activeSession(context) && activeSession(context) ? reference : null;
+    }
+    async function prepareCalendarEvent(args = {}, context = {}) {
+        try {
+            const sessionId = activeSession(context);
+            const title = validText(args.title, 255, true), location = validText(args.location, 300), descriptionInput = validText(args.description, maxDescriptionLength);
+            const description = descriptionInput?.replace(/\s+/gu, ' ') ?? null;
+            const attendees = validAttendees(args.attendees), zone = timezoneFor(args.timezone), calendar = writableCalendar(args.calendar);
+            if (!sessionId || !title || /[\n\r]/u.test(title) || (location !== null && /[\n\r]/u.test(location)) || location === null || description === null || !attendees || !zone || !calendar.success) return { success: false, error: { code: 'calendar_event_invalid', message: 'Revisá el título, la zona horaria, los invitados y el calendario. No se creó ningún evento.' } };
+            const start = localInput(args.start, zone);
+            if (!start) return { success: false, error: { code: 'calendar_time_ambiguous', message: 'La hora no es válida, no existe por el cambio de horario o es ambigua. Indicá otra hora o zona horaria.' } };
+            let end, duration;
+            if (args.end !== undefined && args.end !== null && args.end !== '') {
+                end = localInput(args.end, zone);
+                if (!end) return { success: false, error: { code: 'calendar_time_ambiguous', message: 'La hora de fin no es válida o es ambigua por el cambio de horario.' } };
+                duration = (Date.parse(end.instant) - Date.parse(start.instant)) / 60000;
+            } else {
+                const minutes = args.durationMinutes === undefined || args.durationMinutes === null ? defaultEventDurationMinutes : args.durationMinutes;
+                if (!Number.isInteger(minutes) || minutes < 5 || minutes > 720) return { success: false, error: { code: 'calendar_duration_invalid', message: 'La duración debe estar entre 5 minutos y 12 horas.' } };
+                duration = minutes;
+                end = { instant: new Date(Date.parse(start.instant) + duration * 60000).toISOString() };
+            }
+            if (duration <= 0 || duration > 720) return { success: false, error: { code: 'calendar_duration_invalid', message: 'El horario de fin debe ser posterior al inicio y no superar 12 horas.' } };
+            const payload = { calendarAddress: calendar.address, title, startDateTime: start.instant, endDateTime: end.instant, timeZone: zone, location, description, attendees };
+            const lines = [previewTimes(title, start.instant, end.instant, zone), 'Zona horaria: ' + zone, ...(location ? ['Ubicación: ' + location] : []), ...(description ? ['Descripción: ' + description] : []), ...(attendees.length ? ['Invitados: ' + attendees.join(', '), 'Microsoft enviará invitaciones a los invitados.'] : []), 'Calendario: ' + (calendar.address ?? 'personal')];
+            return { success: true, payload, preview: lines.join('\n') + '\n\n¿Lo creo?', notification: attendees.length > 0 };
+        } catch { return failure; }
+    }
+    async function prepareCalendarEventUpdate(args = {}, context = {}) {
+        try {
+            const reference = lookupEvent(args.id, context);
+            if (!reference || typeof provider?.getCalendarEvent !== 'function') return { success: false, error: { code: 'calendar_reference_invalid', message: 'No puedo identificar ese evento en esta sesión. Volvé a listar los eventos.' } };
+            const zone = timezoneFor(args.timezone);
+            if (!zone) return { success: false, error: { code: 'calendar_timezone_invalid', message: 'La zona horaria configurada no es válida.' } };
+            const currentResult = await provider.getCalendarEvent(reference);
+            if (!currentResult?.success) return currentResult ?? failure;
+            const current = safeEvent(currentResult.event, reference.calendarAddress ?? 'personal', zone);
+            if (!current) return { success: false, error: { code: 'calendar_event_invalid', message: 'No pude validar el evento actual.' } };
+            const patch = {};
+            const title = validText(args.title, 255), location = validText(args.location, 300);
+            if (args.title !== undefined && args.title !== null) { if (!title || /[\n\r]/u.test(title)) return { success: false, error: { code: 'calendar_event_invalid', message: 'El título propuesto no es válido.' } }; patch.title = title; }
+            if (args.location !== undefined && args.location !== null) { if (location === null || /[\n\r]/u.test(location)) return { success: false, error: { code: 'calendar_event_invalid', message: 'La ubicación propuesta no es válida.' } }; patch.location = location; }
+            if (args.description !== undefined && args.description !== null) return { success: false, error: { code: 'calendar_update_unsupported', message: 'No puedo cambiar la descripción porque podría alterar datos de una reunión en línea. El resto del evento permanece intacto.' } };
+            let startDateTime = current.startDateTime, endDateTime = current.endDateTime;
+            if (args.start !== undefined && args.start !== null) {
+                const start = localInput(args.start, zone);
+                if (!start) return { success: false, error: { code: 'calendar_time_ambiguous', message: 'La nueva hora de inicio no es válida o es ambigua por el cambio de horario.' } };
+                const durationMs = Date.parse(current.endDateTime) - Date.parse(current.startDateTime);
+                startDateTime = start.instant;
+                if (args.end === undefined || args.end === null) endDateTime = new Date(Date.parse(start.instant) + durationMs).toISOString();
+            }
+            if (args.end !== undefined && args.end !== null) {
+                const end = localInput(args.end, zone);
+                if (!end) return { success: false, error: { code: 'calendar_time_ambiguous', message: 'La nueva hora de fin no es válida o es ambigua por el cambio de horario.' } };
+                endDateTime = end.instant;
+            }
+            if ((args.start !== undefined && args.start !== null) || (args.end !== undefined && args.end !== null)) {
+                if (Date.parse(endDateTime) <= Date.parse(startDateTime) || Date.parse(endDateTime) - Date.parse(startDateTime) > 720 * 60000) return { success: false, error: { code: 'calendar_duration_invalid', message: 'El rango nuevo no es válido o supera 12 horas.' } };
+                patch.startDateTime = startDateTime; patch.endDateTime = endDateTime;
+            }
+            if (!Object.keys(patch).length) return { success: false, error: { code: 'calendar_update_empty', message: 'Indicá al menos un cambio concreto para el evento.' } };
+            const resultingTitle = patch.title ?? current.subject;
+            const payload = { calendarAddress: reference.calendarAddress, providerEventId: reference.providerEventId, patch,
+                current: { subject: current.subject, startDateTime: current.startDateTime, endDateTime: current.endDateTime, hasAttendees: current.attendees.length > 0 }, timeZone: zone };
+            const currentLocation = current.location?.displayName;
+            const lines = ['Voy a cambiar:', previewTimes(current.subject, current.startDateTime, current.endDateTime, zone), ...(currentLocation ? ['Ubicación actual: ' + currentLocation] : []), 'Después:', previewTimes(resultingTitle, startDateTime, endDateTime, zone), ...(patch.location !== undefined ? ['Ubicación nueva: ' + patch.location] : []), 'Zona horaria: ' + zone, ...(current.attendees.length ? ['Microsoft puede enviar una actualización a los participantes.'] : [])];
+            return { success: true, payload, preview: lines.join('\n') + '\n\n¿Lo cambio?', notification: current.attendees.length > 0 };
+        } catch { return failure; }
+    }
+    async function prepareCalendarEventCancel(args = {}, context = {}) {
+        try {
+            const reference = lookupEvent(args.id, context);
+            if (!reference || typeof provider?.getCalendarEvent !== 'function') return { success: false, error: { code: 'calendar_reference_invalid', message: 'No puedo identificar ese evento en esta sesión. Volvé a listar los eventos.' } };
+            const zone = timezoneFor(args.timezone);
+            if (!zone) return { success: false, error: { code: 'calendar_timezone_invalid', message: 'La zona horaria configurada no es válida.' } };
+            const currentResult = await provider.getCalendarEvent(reference);
+            if (!currentResult?.success) return currentResult ?? failure;
+            const current = safeEvent(currentResult.event, reference.calendarAddress ?? 'personal', zone);
+            if (!current) return { success: false, error: { code: 'calendar_event_invalid', message: 'No pude validar el evento actual.' } };
+            const hasAttendees = current.attendees.length > 0;
+            if (hasAttendees && !current.isOrganizer) return { success: false, error: { code: 'calendar_cancel_not_organizer', message: 'Este evento tiene participantes y Nexa no es la organizadora. No puedo enviar una cancelación de reunión.' } };
+            const payload = { calendarAddress: reference.calendarAddress, providerEventId: reference.providerEventId, sendMeetingCancellation: hasAttendees,
+                event: { subject: current.subject, startDateTime: current.startDateTime, endDateTime: current.endDateTime }, timeZone: zone };
+            const preview = ['Voy a cancelar:', previewTimes(current.subject, current.startDateTime, current.endDateTime, zone), 'Zona horaria: ' + zone,
+                ...(hasAttendees ? ['Microsoft enviará una cancelación a los participantes.'] : ['No se enviará una notificación a participantes.']), '', '¿La cancelo?'].join('\n');
+            return { success: true, payload, preview, notification: hasAttendees };
+        } catch { return failure; }
     }
     async function listCalendarEvents(args = {}, context = {}) {
         try {
@@ -138,11 +282,34 @@ export function createCalendarService({ provider, environment = process.env, tim
             if (!response?.success) return response ?? failure;
             const event = safeEvent(response.event, reference.calendarAddress ?? 'personal', timeZone);
             if (!event) return { success: false, error: { code: 'calendar_event_invalid', message: 'Microsoft Graph devolvió un evento no válido.' } };
-            const { id: _opaque, ...publicEvent } = event;
+            const { id: _opaque, providerEventId: _providerId, ...publicEvent } = event;
             return { success: true, event: { ...publicEvent, id: args.id } };
         } catch { return failure; }
     }
-    return Object.freeze({ listCalendarEvents, getCalendarEvent, resolveDateRange: args => resolveDateRange(args, timeZone, now) });
+    async function createCalendarEvent(payload) {
+        if (typeof provider?.createCalendarEvent !== 'function') return failure;
+        const response = await provider.createCalendarEvent({ calendarAddress: payload.calendarAddress, event: payload });
+        if (!response?.success) return response ?? failure;
+        const event = safeEvent(response.event, payload.calendarAddress ?? 'personal', payload.timeZone);
+        return { success: true, created: true, message: `Listo. Agendé ${payload.title}, ${event?.startLocal ?? ''}–${event?.endLocal?.slice(11) ?? ''}.`, event: event ? { subject: event.subject, startLocal: event.startLocal, endLocal: event.endLocal, timeZone: event.timeZone } : null };
+    }
+    async function updateCalendarEvent(payload) {
+        if (typeof provider?.updateCalendarEvent !== 'function') return failure;
+        const response = await provider.updateCalendarEvent(payload);
+        if (!response?.success) return response ?? failure;
+        const event = safeEvent(response.event, payload.calendarAddress ?? 'personal', payload.timeZone);
+        const summary = event ? `${event.subject}, ${event.startLocal}–${event.endLocal?.slice(11) ?? ''}` : 'el evento';
+        return { success: true, updated: true, message: `Listo. Actualicé ${summary}.`, event: event ? { subject: event.subject, startLocal: event.startLocal, endLocal: event.endLocal, timeZone: event.timeZone } : null };
+    }
+    async function cancelCalendarEvent(payload) {
+        if (typeof provider?.cancelCalendarEvent !== 'function') return failure;
+        const response = await provider.cancelCalendarEvent(payload);
+        if (!response?.success) return response ?? failure;
+        return { success: true, cancelled: true, notificationSent: payload.sendMeetingCancellation === true, message: `Listo. Cancelé ${payload.event.subject}.` };
+    }
+    return Object.freeze({ listCalendarEvents, getCalendarEvent, prepareCalendarEvent, prepareCalendarEventUpdate, prepareCalendarEventCancel,
+        createCalendarEvent, updateCalendarEvent, cancelCalendarEvent,
+        resolveDateRange: args => resolveDateRange(args, timeZone, now) });
 }
 
-export { resolveDateRange, utcForLocalMidnight, localDateTime };
+export { resolveDateRange, utcForLocalMidnight, utcForLocalDateTime, localDateTime };
