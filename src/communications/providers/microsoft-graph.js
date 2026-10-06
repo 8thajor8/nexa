@@ -29,12 +29,14 @@ export function normalizeMailbox({ id, address, displayName, type }) {
     return { id: id.trim(), provider: 'microsoft', address: address.trim().toLocaleLowerCase('en-US'),
         displayName: typeof displayName === 'string' && displayName.trim() ? displayName.trim() : address.trim(), type };
 }
-function graphError(status, writing = false) {
+function graphError(status, writing = false, resourceKind = 'mail') {
     if (status === 401) return { code: 'microsoft_authorization_required', message: 'La sesión Microsoft venció o necesita reconectarse.' };
     if (status === 403) return { code: 'microsoft_access_denied', message: writing
         ? 'Microsoft no autorizó este envío. Para un shared mailbox, verificá Mail.Send.Shared y los permisos Exchange Send As o Send on Behalf.'
-        : 'Microsoft no permite leer este buzón con la autorización o los accesos delegados actuales.' };
-    if (status === 404) return { code: 'microsoft_mailbox_not_found', message: 'Microsoft Graph no encontró el buzón o mensaje.' };
+        : resourceKind === 'calendar' ? 'Microsoft no permite leer este calendario con la autorización o los accesos delegados actuales.' : 'Microsoft no permite leer este buzón con la autorización o los accesos delegados actuales.' };
+    if (status === 404) return resourceKind === 'calendar'
+        ? { code: 'microsoft_calendar_not_found', message: 'Microsoft Graph no encontró el calendario o evento.' }
+        : { code: 'microsoft_mailbox_not_found', message: 'Microsoft Graph no encontró el buzón o mensaje.' };
     if (status === 429) return { code: 'microsoft_rate_limited', message: 'Microsoft Graph pidió reducir la frecuencia de solicitudes.' };
     if (status === 400) return { code: 'microsoft_request_invalid', message: 'Microsoft Graph rechazó los datos de la solicitud.' };
     return { code: 'microsoft_graph_unavailable', message: 'No se pudo completar la operación con Microsoft Graph.' };
@@ -61,6 +63,25 @@ export function htmlToSafeText(html) {
 }
 function person(value) { return { name: typeof value?.emailAddress?.name === 'string' ? value.emailAddress.name : '', address: typeof value?.emailAddress?.address === 'string' ? value.emailAddress.address : '' }; }
 function recipientList(values) { return Array.isArray(values) ? values.map(person).filter(item => item.address || item.name) : []; }
+function graphEventInstant(value) {
+    const raw = typeof value?.dateTime === 'string' ? value.dateTime : '';
+    const instant = new Date(/[zZ]|[+-]\d{2}:\d{2}$/u.test(raw) ? raw : raw + 'Z');
+    return Number.isFinite(instant.getTime()) ? instant.toISOString() : null;
+}
+function normalizeGraphCalendarEvent(event, { includeBody = false } = {}) {
+    const startDateTime = graphEventInstant(event?.start), endDateTime = graphEventInstant(event?.end);
+    if (typeof event?.id !== 'string' || !startDateTime || !endDateTime) return null;
+    const bodyHtml = event?.body?.contentType?.toLocaleLowerCase('en-US') === 'html';
+    return {
+        providerEventId: event.id,
+        subject: typeof event.subject === 'string' ? event.subject : '(Sin asunto)',
+        startDateTime, endDateTime, isAllDay: event.isAllDay === true,
+        location: typeof event.location?.displayName === 'string' ? { displayName: event.location.displayName.slice(0, 300) } : null,
+        organizer: person(event.organizer), attendees: recipientList(event.attendees).slice(0, 50),
+        preview: typeof event.bodyPreview === 'string' ? event.bodyPreview.slice(0, 500) : '',
+        body: includeBody ? (bodyHtml ? htmlToSafeText(event.body.content) : String(event?.body?.content ?? '').slice(0, 3000)) : '',
+    };
+}
 export function normalizeEmail(message, mailbox, { includeBody = false } = {}) {
     return {
         providerMessageId: message?.id, mailbox: mailbox.address,
@@ -99,7 +120,7 @@ function validSearchArgs(args) {
         && date(args.dateFrom) && date(args.dateTo) && (!args.dateFrom || !args.dateTo || args.dateFrom <= args.dateTo);
 }
 export function createMicrosoftGraphProvider({ auth, fetchImpl = fetch, environment = process.env } = {}) {
-    async function request(resource, { preferText = false, method = 'GET', jsonBody, rawBody, contentType = 'application/json' } = {}) {
+    async function request(resource, { preferText = false, preferTimezone = null, resourceKind = 'mail', method = 'GET', jsonBody, rawBody, contentType = 'application/json' } = {}) {
         let accessToken;
         try { accessToken = await auth.getAccessToken(); }
         catch (error) {
@@ -108,14 +129,17 @@ export function createMicrosoftGraphProvider({ auth, fetchImpl = fetch, environm
         }
         if (!accessToken) return { success: false, error: { code: 'email_not_connected', message: 'Microsoft todavía no está conectado. Ejecutá npm run connect:microsoft.' } };
         const headers = { authorization: 'Bearer ' + accessToken, accept: 'application/json' };
-        if (preferText) headers.prefer = 'outlook.body-content-type="text"';
+        const preferences = [];
+        if (preferText) preferences.push('outlook.body-content-type="text"');
+        if (preferTimezone) preferences.push('outlook.timezone="' + preferTimezone + '"');
+        if (preferences.length) headers.prefer = preferences.join(', ');
         const options = { method, headers };
         if (jsonBody !== undefined) { headers['content-type'] = contentType; options.body = JSON.stringify(jsonBody); }
         else if (rawBody !== undefined) { headers['content-type'] = contentType; options.body = rawBody; }
         let response;
         try { response = await fetchImpl(new URL(resource, graphRoot), options); }
         catch { return { success: false, error: { code: 'microsoft_network_error', message: 'No se pudo conectar con Microsoft Graph.' } }; }
-        if (!response.ok) return { success: false, error: graphError(response.status, method !== 'GET') };
+        if (!response.ok) return { success: false, error: graphError(response.status, method !== 'GET', resourceKind) };
         if (response.status === 202 || response.status === 204) return { success: true, data: null };
         try { return { success: true, data: await response.json() }; }
         catch { return { success: false, error: { code: 'microsoft_response_invalid', message: 'Microsoft Graph devolvió una respuesta no válida.' } }; }
@@ -168,6 +192,34 @@ export function createMicrosoftGraphProvider({ auth, fetchImpl = fetch, environm
         const response = await request('users/' + owner + '/messages/' + messageId + '?$select=' + messageFields + ',body', { preferText: true });
         return response.success ? { success: true, email: normalizeEmail(response.data, { address: mailboxAddress }, { includeBody: true }) } : response;
     }
+    async function listCalendarEvents({ calendarAddress = null, startDateTime, endDateTime, limit = 25 }) {
+        const config = getMicrosoftConfiguration(environment);
+        if (!config.success) return { success: false, error: config.error };
+        if (calendarAddress && !config.sharedCalendars.includes(String(calendarAddress).toLocaleLowerCase('en-US'))) {
+            return { success: false, error: { code: 'calendar_not_configured', message: 'Ese calendario compartido no está en la lista configurada.' } };
+        }
+        const owner = calendarAddress ? 'users/' + encodeURIComponent(calendarAddress) : 'me';
+        const params = new URLSearchParams({ startDateTime, endDateTime, '$select': 'id,subject,start,end,isAllDay,location,organizer,attendees,bodyPreview', '$top': String(Math.max(1, Math.min(50, limit))) });
+        const response = await request(owner + '/calendarView?' + params, { preferTimezone: 'UTC', resourceKind: 'calendar' });
+        if (!response.success) return response;
+        if (!Array.isArray(response.data?.value)) return { success: false, error: { code: 'calendar_response_invalid', message: 'Microsoft Graph devolvió una lista de eventos no válida.' } };
+        return { success: true, events: response.data.value.map(item => normalizeGraphCalendarEvent(item)).filter(Boolean), truncated: Boolean(response.data['@odata.nextLink']) || response.data.value.length >= Number(params.get('$top')) };
+    }
+    async function getCalendarEvent({ calendarAddress = null, providerEventId }) {
+        const config = getMicrosoftConfiguration(environment);
+        if (!config.success) return { success: false, error: config.error };
+        if (calendarAddress && !config.sharedCalendars.includes(String(calendarAddress).toLocaleLowerCase('en-US'))) {
+            return { success: false, error: { code: 'calendar_not_configured', message: 'Ese calendario compartido no está en la lista configurada.' } };
+        }
+        if (typeof providerEventId !== 'string' || !providerEventId || providerEventId.length > 512) return { success: false, error: { code: 'calendar_reference_invalid', message: 'La referencia del evento no es válida.' } };
+        const owner = calendarAddress ? 'users/' + encodeURIComponent(calendarAddress) : 'me';
+        const eventId = encodeURIComponent(providerEventId);
+        const fields = 'id,subject,start,end,isAllDay,location,organizer,attendees,bodyPreview,body';
+        const response = await request(owner + '/events/' + eventId + '?$select=' + fields, { preferText: true, preferTimezone: 'UTC', resourceKind: 'calendar' });
+        if (!response.success) return response;
+        const event = normalizeGraphCalendarEvent(response.data, { includeBody: true });
+        return event ? { success: true, event } : { success: false, error: { code: 'calendar_event_invalid', message: 'Microsoft Graph devolvió un evento no válido.' } };
+    }
     async function sendEmail({ mailboxAddress, to, cc, subject, bodyHtml, inlineAttachments }) {
         const mimeBody = createRelatedMime({ from: mailboxAddress, to, cc, subject, htmlBody: bodyHtml, inlineAttachments });
         const response = await request('users/' + encodeURIComponent(mailboxAddress) + '/sendMail', {
@@ -182,5 +234,5 @@ export function createMicrosoftGraphProvider({ auth, fetchImpl = fetch, environm
         });
         return response.success ? { success: true, sent: true } : response;
     }
-    return { getConnectionStatus, getMailboxes, listRecentEmails, searchEmails, getEmail, sendEmail, sendReply };
+    return { getConnectionStatus, getMailboxes, listRecentEmails, searchEmails, getEmail, listCalendarEvents, getCalendarEvent, sendEmail, sendReply };
 }

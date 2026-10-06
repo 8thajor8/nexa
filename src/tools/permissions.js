@@ -51,6 +51,9 @@ export const toolPermissions = Object.freeze({
     prepare_email_reply: 'read',
     confirm_pending_action: 'action',
     cancel_pending_action: 'action',
+    resolve_pending_action: 'action',
+    list_calendar_events: 'read',
+    get_calendar_event: 'read',
 });
 
 export const defaultPermissionPolicy = Object.freeze({

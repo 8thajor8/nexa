@@ -62,6 +62,9 @@ test('existing local tools declare their intended permissions', () => {
         prepare_email_reply: 'read',
         confirm_pending_action: 'action',
         cancel_pending_action: 'action',
+        resolve_pending_action: 'action',
+        list_calendar_events: 'read',
+        get_calendar_event: 'read',
     });
 
     for (const registration of localToolRegistry.values()) {

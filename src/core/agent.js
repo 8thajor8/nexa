@@ -142,7 +142,7 @@ ${memoryToPrompt(memory)}
                 diagnostic('tool_call', { iteration, tool: toolCall.name, arguments: safeArgumentSummary(args) });
                 let result;
                 try {
-                    result = await execute(toolCall.name, args, { memory, saveMemory: save, permissionPolicy, sessionId, userMessage });
+                    result = await execute(toolCall.name, args, { memory, saveMemory: save, permissionPolicy, sessionId, userMessage, userMessageSource: 'direct_user' });
                 } catch (error) {
                     result = { success: false, error: { code: 'tool_execution_failed', message: error.message } };
                 }
