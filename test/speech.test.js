@@ -123,8 +123,9 @@ test('supports every fixed style while keeping a shared voice identity', async t
     assert(f.calls.generated.every(item => item.instructions.includes(voiceIdentity)));
     assert.notEqual(getSpeechInstructions('normal'), getSpeechInstructions('calm'));
     assert.equal(voiceIdentity.startsWith(novaPortenaInstructions), true);
-    assert.match(getSpeechInstructions('normal'), /warm, lively, relaxed conversational delivery/iu);
-    assert.doesNotMatch(speechStyles.normal, /balanced, friendly tone|corporate|confident, clever/iu);
+    assert.equal(getSpeechInstructions('normal'), `${novaPortenaInstructions} Keep it relaxed and spontaneous, like chatting with someone you know.`);
+    assert.equal(speechStyles.normal, '');
+    assert.doesNotMatch(getSpeechInstructions('normal'), /youthful adult feminine voice|warm, friendly, lively|witty|confident|corporate/iu);
 });
 
 test('production voice config selects Nova and enables the separate identity processor by default', () => {

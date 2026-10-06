@@ -78,13 +78,13 @@ export const nexaVoiceIdentity = Object.freeze({
         Object.freeze({ frequencyHz: 4400, gainDb: 1.0, q: 1.0 }),
     ]),
     spatial: Object.freeze({
-        wet: 0.07,
-        preDelayMs: 22,
-        rt60Ms: 400,
+        wet: 0.12,
+        preDelayMs: 25,
+        rt60Ms: 520,
         earlyReflectionDelaysMs: Object.freeze([19, 27, 43, 53]),
-        earlyReflectionGains: Object.freeze([0.32, 0.24, 0.17, 0.12]),
+        earlyReflectionGains: Object.freeze([0.42, 0.33, 0.25, 0.19]),
         feedbackCombDelaysMs: Object.freeze([59, 73]),
-        feedback: Object.freeze([0.361, 0.2827]),
+        feedback: Object.freeze([0.4567, 0.3792]),
     }),
 });
 

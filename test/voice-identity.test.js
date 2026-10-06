@@ -23,10 +23,10 @@ test('production identity centralizes Nova/Signalsmith, companion, polish, and s
     ], [1.1, 2.6, 0.17, 9, 0.22]);
     assert.deepEqual(nexaVoiceIdentity.spacePolish.map(({ frequencyHz, gainDb, q }) => [frequencyHz, gainDb, q]), [[2600, 1.4, 1.2], [4400, 1, 1]]);
     assert.deepEqual(nexaVoiceIdentity.spatial, {
-        wet: 0.07, preDelayMs: 22, rt60Ms: 400,
+        wet: 0.12, preDelayMs: 25, rt60Ms: 520,
         earlyReflectionDelaysMs: [19, 27, 43, 53],
-        earlyReflectionGains: [0.32, 0.24, 0.17, 0.12],
-        feedbackCombDelaysMs: [59, 73], feedback: [0.361, 0.2827],
+        earlyReflectionGains: [0.42, 0.33, 0.25, 0.19],
+        feedbackCombDelaysMs: [59, 73], feedback: [0.4567, 0.3792],
     });
 });
 

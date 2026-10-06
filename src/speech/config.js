@@ -18,13 +18,11 @@ export const speechConfig = Object.freeze({
 
 export const voiceIdentity = [
     novaPortenaInstructions,
-    'Use a youthful adult feminine voice. Be warm, friendly, lively and spontaneous, like you enjoy chatting with someone you know well.',
-    'Let wit and a playful edge come naturally. Keep confidence relaxed and approachable.',
-    'Never sound cold, overly serious, corporate, announcer-like, or as if presenting a script.',
+    'Keep it relaxed and spontaneous, like chatting with someone you know.',
 ].join(' ');
 
 export const speechStyles = Object.freeze({
-    normal: 'Use a warm, lively, relaxed conversational delivery. Let your personality and enjoyment show; keep the playfulness subtle and natural.',
+    normal: '',
     professional: 'Use a composed, precise and confident tone while staying natural and approachable.',
     alert: 'Sound attentive and clear, with gentle urgency but no alarmist or exaggerated delivery.',
     sassy: 'Add subtle wit and playful confidence; keep it kind and never theatrical or mean.',
@@ -33,6 +31,6 @@ export const speechStyles = Object.freeze({
 
 export function getSpeechInstructions(style = 'normal') {
     const styleInstruction = speechStyles[style];
-    if (!styleInstruction) return null;
-    return `${voiceIdentity} ${styleInstruction}`;
+    if (!Object.hasOwn(speechStyles, style)) return null;
+    return style === 'normal' ? voiceIdentity : `${voiceIdentity} ${styleInstruction}`;
 }
