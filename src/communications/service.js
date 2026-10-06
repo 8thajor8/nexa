@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { createPendingActionManager } from '../core/pending-actions.js';
+import { emailSignatureRenderer } from './signature/renderer.js';
 
 const limitMax = 25;
 const maxRecipients = 20;
@@ -24,7 +25,7 @@ function pendingResult(action) {
     return { success: true, pendingAction: action,
         nextStep: 'Revisá la vista previa. Para autorizar sólo esta acción, respondé exactamente: ' + action.confirmationPhrase + '. Para cancelarla, respondé exactamente: cancelar envío ' + action.id + '.' };
 }
-export function createCommunicationsService({ emailProvider, pendingActions = createPendingActionManager() }) {
+export function createCommunicationsService({ emailProvider, pendingActions = createPendingActionManager(), signatureRenderer = emailSignatureRenderer }) {
     if (!emailProvider || typeof emailProvider.getConnectionStatus !== 'function' || typeof emailProvider.getMailboxes !== 'function') throw new TypeError('email_provider_invalid');
     const messageReferences = new Map();
     async function safelyCall(operation) { try { return await operation(); } catch { return safeError; } }
@@ -62,9 +63,10 @@ export function createCommunicationsService({ emailProvider, pendingActions = cr
         return safelyCall(() => withMailbox(args, context, async mailbox => {
             const to = validAddresses(args?.to, { required: true }), cc = validAddresses(args?.cc ?? []);
             if (!to || !cc || !validSubject(args?.subject) || !validBody(args?.body)) return { success: false, error: { code: 'email_draft_invalid', message: 'Revisá destinatarios, asunto y cuerpo. No envié nada.' } };
-            const subject = args.subject.trim(), body = args.body;
-            const payload = { mailboxAddress: mailbox.address, to, cc, subject, body };
-            const preview = formatPreview({ from: mailbox.address, to, cc, subject, body });
+            const subject = args.subject.trim(), renderedBody = signatureRenderer.render(args.body);
+            const payload = { mailboxAddress: mailbox.address, to, cc, subject,
+                bodyHtml: renderedBody.htmlBody, inlineAttachments: renderedBody.inlineAttachments };
+            const preview = formatPreview({ from: mailbox.address, to, cc, subject, body: renderedBody.previewBody });
             const action = pendingActions.create({ type: 'email.send', payload, preview, sessionId: session(context),
                 replaceTypes: ['email.send', 'email.reply'] });
             return pendingResult(action);
@@ -82,9 +84,10 @@ export function createCommunicationsService({ emailProvider, pendingActions = cr
             if (!to) return { success: false, error: { code: 'email_reply_recipient_invalid', message: 'No pude validar el destinatario de la respuesta. No envié nada.' } };
             const originalSubject = typeof reference.snapshot.subject === 'string' ? reference.snapshot.subject : '';
             const subject = /^re:/iu.test(originalSubject) ? originalSubject : 'Re: ' + originalSubject;
-            const body = args.body;
-            const payload = { mailboxAddress: mailbox.address, providerMessageId: reference.providerMessageId, body };
-            const preview = formatPreview({ from: mailbox.address, to, cc: [], subject, body });
+            const renderedBody = signatureRenderer.render(args.body);
+            const payload = { mailboxAddress: mailbox.address, providerMessageId: reference.providerMessageId, to, cc: [], subject,
+                bodyHtml: renderedBody.htmlBody, inlineAttachments: renderedBody.inlineAttachments };
+            const preview = formatPreview({ from: mailbox.address, to, cc: [], subject, body: renderedBody.previewBody });
             const action = pendingActions.create({ type: 'email.reply', payload, preview, sessionId,
                 replaceTypes: ['email.send', 'email.reply'] });
             return pendingResult(action);

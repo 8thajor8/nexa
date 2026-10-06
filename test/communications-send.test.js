@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createCommunicationsService } from '../src/communications/service.js';
 import { createPendingActionManager } from '../src/core/pending-actions.js';
+import { nexaEmailIdentity } from '../src/communications/signature/identity.js';
 
 const mailboxes = [
     { id: 'me', address: 'jorge@example.com', displayName: 'Jor', type: 'personal' },
@@ -28,6 +29,7 @@ test('prepare email returns complete preview and opaque expiring action without 
     assert.equal(result.success, true);
     assert.match(result.pendingAction.id, /^action_[a-f0-9]{32}$/u);
     assert.match(result.pendingAction.preview, /De: ops@example\.com[\s\S]*Para: person@example\.com[\s\S]*CC: copy@example\.com[\s\S]*Asunto: Hello[\s\S]*A complete body\./u);
+    assert.match(result.pendingAction.preview, /— Firma Nexa —[\s\S]*Digital Intelligence \| Assistant to Jorge Marcos[\s\S]*Logo Lifeguard Costa Rica/u);
     assert.equal(result.pendingAction.confirmationPhrase, 'confirmar envío ' + result.pendingAction.id);
     assert.match(result.pendingAction.expiresAt, /^\d{4}-/u);
     assert.deepEqual(calls, []);
@@ -47,6 +49,12 @@ test('confirmation must be a fresh exact user message and sends once from config
     assert.equal(calls.length, 1);
     assert.equal(calls[0][1].mailboxAddress, 'ops@example.com');
     assert.deepEqual(calls[0][1].to, ['person@example.com']);
+    assert.match(calls[0][1].bodyHtml, /A complete body\./u);
+    assert.match(calls[0][1].bodyHtml, /Digital Intelligence \| Assistant to Jorge Marcos/u);
+    assert.match(calls[0][1].bodyHtml, /src="cid:nexa-lifeguard-logo"/u);
+    assert.equal(calls[0][1].inlineAttachments[0].isInline, true);
+    assert.equal(calls[0][1].inlineAttachments[0].contentId, 'nexa-lifeguard-logo');
+    assert.equal(calls[0][1].inlineAttachments[0].contentBytes, nexaEmailIdentity.logo.contentBytes);
     assert.equal((await service.confirmPendingAction({ actionId: id }, context('session-1', prepared.pendingAction.confirmationPhrase))).success, false);
     assert.equal(calls.length, 1);
 });
@@ -95,7 +103,12 @@ test('reply uses a session-scoped opaque message reference and native provider r
     assert.equal((await service.prepareEmailReply({ emailId, body: 'Reply' }, context('other-session'))).error.code, 'email_reference_invalid');
     const result = await service.confirmPendingAction({ actionId: prepared.pendingAction.id }, context('session-1', prepared.pendingAction.confirmationPhrase));
     assert.equal(result.sent, true);
-    assert.deepEqual(calls, [['reply', { mailboxAddress: 'ops@example.com', providerMessageId: 'graph-internal', body: 'Thanks, recibido.' }]]);
+    assert.equal(calls[0][0], 'reply');
+    assert.equal(calls[0][1].mailboxAddress, 'ops@example.com');
+    assert.equal(calls[0][1].providerMessageId, 'graph-internal');
+    assert.match(calls[0][1].bodyHtml, /Thanks, recibido\./u);
+    assert.match(calls[0][1].bodyHtml, /<!-- nexa-email-signature-v1 -->[\s\S]*<td[^>]*>Nexa<\/td>/u);
+    assert.equal(calls[0][1].inlineAttachments[0].isInline, true);
 });
 
 test('provider send failure is sanitized and cannot be retried with consumed action', async () => {

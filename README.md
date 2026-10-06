@@ -160,3 +160,13 @@ Para enviar desde un shared mailbox, el buzón debe seguir apareciendo entre los
 Los mensajes generados por Nexa se envían bajo la identidad y los permisos de Jor; esta versión no agrega una firma automática de Nexa ni modifica firmas gestionadas por Exchange. Una política configurable de disclosure podría añadirse después al `CommunicationsService`, aplicada al contenido de la vista previa antes de crear la acción pendiente, para que el usuario vea y confirme el texto exacto.
 
 El envío real queda pendiente de reconectar y de una autorización explícita específica para la prueba. No probar con destinatarios externos elegidos por Nexa.
+
+### Comunicaciones 1.3 — identidad y firma de correo de Nexa
+
+La identidad se centraliza en `src/communications/signature/identity.js`; `EmailSignatureRenderer` está en `renderer.js`. Tanto `prepare_email` como `prepare_email_reply` convierten el texto del usuario en HTML escapado, conservan párrafos y saltos, y agregan la firma oficial. Los datos de contacto y el logo provienen de la referencia `firma nexa.docx`. El contenido es HTML liviano con estilos inline; el cuerpo suministrado se trata siempre como texto, así que tags o instrucciones recibidos en un email no pueden inyectarse en la firma.
+
+La vista previa muestra el cuerpo y, debajo, `— Firma Nexa —` con el texto y una indicación del logo integrado. La acción pendiente guarda el HTML ya renderizado y los bytes del logo exacto, de modo que se confirma la misma versión que se transmite. Preparar otra vez reemplaza la acción anterior y exige aprobación nueva; el renderer reconoce su propio resultado para no duplicar la firma.
+
+El logo se extrae del DOCX y se integra con `Content-ID` como una única imagen JPEG inline. Microsoft Graph documenta el formato MIME para [sendMail](https://learn.microsoft.com/en-us/graph/api/user-sendmail?view=graph-rest-1.0), [reply](https://learn.microsoft.com/en-us/graph/api/message-reply?view=graph-rest-1.0) y las propiedades [contentId/isInline](https://learn.microsoft.com/en-us/graph/api/resources/fileattachment?view=graph-rest-1.0). Nexa serializa un MIME `multipart/related` localmente y lo envía por los endpoints oficiales; no usa rutas locales ni depende de que el destinatario pueda descargar una imagen externa. El endpoint `reply` conserva el hilo y admite MIME con adjuntos inline, por lo que no hace falta crear/modificar drafts ni pedir `Mail.ReadWrite`. La imagen CID es exclusivamente infraestructura interna de la firma; no se implementa una tool general de adjuntos.
+
+El correo generado continúa saliendo como Jor (o desde el mailbox compartido elegido) con la firma de Nexa. No se modifica Outlook ni se agregan avisos extra de “generado por IA”; la firma ya identifica a Nexa como asistente.

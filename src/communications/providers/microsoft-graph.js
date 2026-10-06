@@ -1,9 +1,28 @@
+import { randomBytes } from 'node:crypto';
 import { getMicrosoftConfiguration } from '../config.js';
 import { MicrosoftAuthError } from '../../integrations/microsoft/auth.js';
 
 const graphRoot = 'https://graph.microsoft.com/v1.0/';
 const messageFields = 'id,subject,from,replyTo,toRecipients,ccRecipients,receivedDateTime,bodyPreview,hasAttachments,isRead,importance';
 const maximumBodyLength = 12000;
+
+function base64Lines(value) { return Buffer.from(value).toString('base64').replace(/.{1,76}/gu, '$&\r\n').trimEnd(); }
+function encodedHeader(value) {
+    return /^[\x20-\x7e]*$/u.test(value) ? value : '=?UTF-8?B?' + Buffer.from(value, 'utf8').toString('base64') + '?=';
+}
+function createRelatedMime({ from, to, cc = [], subject, htmlBody, inlineAttachments = [] }) {
+    const boundary = 'nexa_' + randomBytes(18).toString('hex');
+    const headers = ['From: ' + from, 'To: ' + to.join(', '), ...(cc.length ? ['Cc: ' + cc.join(', ')] : []),
+        'Subject: ' + encodedHeader(subject), 'MIME-Version: 1.0', 'Content-Type: multipart/related; boundary="' + boundary + '"', '', ''];
+    const parts = ['--' + boundary, 'Content-Type: text/html; charset="UTF-8"', 'Content-Transfer-Encoding: base64', '', base64Lines(htmlBody)];
+    for (const attachment of inlineAttachments) {
+        parts.push('--' + boundary, 'Content-Type: ' + attachment.contentType + '; name="' + attachment.name + '"',
+            'Content-Transfer-Encoding: base64', 'Content-ID: <' + attachment.contentId + '>',
+            'Content-Disposition: inline; filename="' + attachment.name + '"', '', base64Lines(Buffer.from(attachment.contentBytes, 'base64')));
+    }
+    parts.push('--' + boundary + '--', '');
+    return headers.join('\r\n') + parts.join('\r\n');
+}
 
 export function normalizeMailbox({ id, address, displayName, type }) {
     if (![id, address].every(value => typeof value === 'string' && value.trim()) || !['personal', 'shared'].includes(type)) return null;
@@ -80,7 +99,7 @@ function validSearchArgs(args) {
         && date(args.dateFrom) && date(args.dateTo) && (!args.dateFrom || !args.dateTo || args.dateFrom <= args.dateTo);
 }
 export function createMicrosoftGraphProvider({ auth, fetchImpl = fetch, environment = process.env } = {}) {
-    async function request(resource, { preferText = false, method = 'GET', jsonBody } = {}) {
+    async function request(resource, { preferText = false, method = 'GET', jsonBody, rawBody, contentType = 'application/json' } = {}) {
         let accessToken;
         try { accessToken = await auth.getAccessToken(); }
         catch (error) {
@@ -91,7 +110,8 @@ export function createMicrosoftGraphProvider({ auth, fetchImpl = fetch, environm
         const headers = { authorization: 'Bearer ' + accessToken, accept: 'application/json' };
         if (preferText) headers.prefer = 'outlook.body-content-type="text"';
         const options = { method, headers };
-        if (jsonBody !== undefined) { headers['content-type'] = 'application/json'; options.body = JSON.stringify(jsonBody); }
+        if (jsonBody !== undefined) { headers['content-type'] = contentType; options.body = JSON.stringify(jsonBody); }
+        else if (rawBody !== undefined) { headers['content-type'] = contentType; options.body = rawBody; }
         let response;
         try { response = await fetchImpl(new URL(resource, graphRoot), options); }
         catch { return { success: false, error: { code: 'microsoft_network_error', message: 'No se pudo conectar con Microsoft Graph.' } }; }
@@ -148,20 +168,17 @@ export function createMicrosoftGraphProvider({ auth, fetchImpl = fetch, environm
         const response = await request('users/' + owner + '/messages/' + messageId + '?$select=' + messageFields + ',body', { preferText: true });
         return response.success ? { success: true, email: normalizeEmail(response.data, { address: mailboxAddress }, { includeBody: true }) } : response;
     }
-    async function sendEmail({ mailboxAddress, to, cc, subject, body }) {
-        const recipients = addresses => addresses.map(address => ({ emailAddress: { address } }));
-        const message = {
-            subject, body: { contentType: 'Text', content: body },
-            toRecipients: recipients(to), ccRecipients: recipients(cc),
-        };
+    async function sendEmail({ mailboxAddress, to, cc, subject, bodyHtml, inlineAttachments }) {
+        const mimeBody = createRelatedMime({ from: mailboxAddress, to, cc, subject, htmlBody: bodyHtml, inlineAttachments });
         const response = await request('users/' + encodeURIComponent(mailboxAddress) + '/sendMail', {
-            method: 'POST', jsonBody: { message, saveToSentItems: true },
+            method: 'POST', rawBody: Buffer.from(mimeBody, 'utf8').toString('base64'), contentType: 'text/plain',
         });
         return response.success ? { success: true, sent: true } : response;
     }
-    async function sendReply({ mailboxAddress, providerMessageId, body }) {
+    async function sendReply({ mailboxAddress, providerMessageId, to, cc, subject, bodyHtml, inlineAttachments }) {
+        const mimeBody = createRelatedMime({ from: mailboxAddress, to, cc, subject, htmlBody: bodyHtml, inlineAttachments });
         const response = await request('users/' + encodeURIComponent(mailboxAddress) + '/messages/' + encodeURIComponent(providerMessageId) + '/reply', {
-            method: 'POST', jsonBody: { comment: body },
+            method: 'POST', rawBody: Buffer.from(mimeBody, 'utf8').toString('base64'), contentType: 'text/plain',
         });
         return response.success ? { success: true, sent: true } : response;
     }

@@ -102,20 +102,31 @@ test('Graph provider sends new mail and native replies using fixed endpoints and
     const calls = [], environment = { MICROSOFT_CLIENT_ID: 'client', MICROSOFT_TENANT_ID: 'organizations' };
     const provider = createMicrosoftGraphProvider({ environment, auth: { async getAccessToken() { return 'secret-token'; } },
         fetchImpl: async (url, options) => { calls.push({ url, options }); return { ok: true, status: 202 }; } });
-    assert.deepEqual(await provider.sendEmail({ mailboxAddress: 'ops@example.com', to: ['person@example.com'], cc: [], subject: 'Subject', body: 'Body' }), { success: true, sent: true });
-    assert.deepEqual(await provider.sendReply({ mailboxAddress: 'ops@example.com', providerMessageId: 'graph/id', body: 'Reply' }), { success: true, sent: true });
+    const inlineAttachments = [{ name: 'logo.jpg', contentId: 'test-logo', contentType: 'image/jpeg', contentBytes: Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString('base64'), isInline: true }];
+    const bodyHtml = '<p>Body</p><img src="cid:test-logo">';
+    assert.deepEqual(await provider.sendEmail({ mailboxAddress: 'ops@example.com', to: ['person@example.com'], cc: [], subject: 'Subject', bodyHtml, inlineAttachments }), { success: true, sent: true });
+    assert.deepEqual(await provider.sendReply({ mailboxAddress: 'ops@example.com', providerMessageId: 'graph/id', to: ['sender@example.com'], cc: [], subject: 'Re: Subject', bodyHtml, inlineAttachments }), { success: true, sent: true });
     assert.equal(new URL(calls[0].url).pathname, '/v1.0/users/ops%40example.com/sendMail');
     assert.equal(calls[0].options.method, 'POST');
     assert.equal(calls[0].options.headers.authorization, 'Bearer secret-token');
-    assert.deepEqual(JSON.parse(calls[0].options.body), { message: { subject: 'Subject', body: { contentType: 'Text', content: 'Body' },
-        toRecipients: [{ emailAddress: { address: 'person@example.com' } }], ccRecipients: [] }, saveToSentItems: true });
+    assert.equal(calls[0].options.headers['content-type'], 'text/plain');
+    const firstMime = Buffer.from(calls[0].options.body, 'base64').toString('utf8');
+    assert.match(firstMime, /From: ops@example\.com\r\nTo: person@example\.com\r\nSubject: Subject/u);
+    assert.match(firstMime, /Content-Type: text\/html; charset="UTF-8"/u);
+    assert.match(firstMime, /Content-ID: <test-logo>/u);
+    assert.match(firstMime, /Content-Disposition: inline/u);
+    assert(firstMime.includes(Buffer.from(bodyHtml, 'utf8').toString('base64')));
+    assert.equal(Buffer.from(firstMime.match(/Content-ID: <test-logo>[\s\S]*?\r\n\r\n([A-Za-z0-9+/=\r\n]+)\r\n--/u)[1].replace(/\s/gu, ''), 'base64').toString('hex'), 'ffd8ffd9');
     assert.equal(new URL(calls[1].url).pathname, '/v1.0/users/ops%40example.com/messages/graph%2Fid/reply');
-    assert.deepEqual(JSON.parse(calls[1].options.body), { comment: 'Reply' });
-    assert.equal(calls[1].options.headers['content-type'], 'application/json');
+    assert.equal(calls[1].options.headers['content-type'], 'text/plain');
+    const replyMime = Buffer.from(calls[1].options.body, 'base64').toString('utf8');
+    assert.match(replyMime, /To: sender@example\.com/u);
+    assert.match(replyMime, /Subject: Re: Subject/u);
+    assert(replyMime.includes(Buffer.from(bodyHtml, 'utf8').toString('base64')));
 
     const denied = createMicrosoftGraphProvider({ environment, auth: { async getAccessToken() { return 'never-leak'; } },
         fetchImpl: async () => ({ ok: false, status: 403, async json() { return { error: 'never-leak private content' }; } }) });
-    const failure = await denied.sendEmail({ mailboxAddress: 'ops@example.com', to: ['x@example.com'], cc: [], subject: 's', body: 'sensitive body' });
+    const failure = await denied.sendEmail({ mailboxAddress: 'ops@example.com', to: ['x@example.com'], cc: [], subject: 's', bodyHtml: '<p>sensitive body</p>', inlineAttachments: [] });
     assert.equal(failure.error.code, 'microsoft_access_denied');
     assert.match(failure.error.message, /Mail\.Send\.Shared/u);
     assert.doesNotMatch(JSON.stringify(failure), /never-leak|private content/u);
