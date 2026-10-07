@@ -10,3 +10,9 @@ data/whatsapp-session/
 data/temp/audio/
 data/audio/
 data/voice-casting/
+
+data/memory-v2.json
+data/memory-v2.json.lock
+data/.memory-v2.json.*.tmp
+data/memory-v2-migration-*.bak
+data/memory-v2-migration-*.tmp
