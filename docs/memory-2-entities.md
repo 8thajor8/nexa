@@ -1,8 +1,8 @@
 # Memory 2 B.1: Entities, People and Self
 
-Memory 2 is the product name; its persisted format is now schema 3. Schema 1,
-schema 2 and unknown versions are rejected explicitly, including when they lack
-the new fields. There is no automatic schema upgrade or entity inference. The
+Memory 2 is the product name; its persisted format is now schema 4. Schema 1,
+schema 2, schema 3 and unknown versions are rejected explicitly, including when
+they lack the new fields. There is no automatic schema upgrade or entity inference. The
 personal file remains `data/memory-v2.json`, ignored by Git. Default configuration
 still selects Memory 1. This implementation does not provision a personal store.
 
@@ -111,7 +111,7 @@ WhatsApp, Speech or Permissions are included. `speech/voice-identity.js` process
 Nexa's output audio; it does not identify/authenticate speakers.
 
 The existing Memory 1 migration utility remains an explicit offline operation.
-Its synthetic validation skeleton uses schema 3, without creating entities from
+Its synthetic validation skeleton uses the current schema, without creating entities from
 legacy person text. The only empty destination permitted has revision zero, only
-the structural self and no knowledge/receipts. This is not schema-2-to-3 migration
+the structural self and no knowledge/receipts. This is not a schema-upgrade migration
 and does not run during initialization or normal runtime.

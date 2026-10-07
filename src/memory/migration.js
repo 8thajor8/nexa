@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { assertDenseArray, assertExactObject, validateMemoryStore, validateTimestamp } from './schema.js';
+import { SCHEMA_VERSION, assertDenseArray, assertExactObject, validateMemoryStore, validateTimestamp } from './schema.js';
 import { MemoryRepositoryError } from './repository.js';
 import { screenMemorySecret } from './secret-screening.js';
 
@@ -111,7 +111,7 @@ export function planMemory1Migration({ legacy, now = () => new Date().toISOStrin
     const receipt = { source_sha256, conversion_version: 1, applied_at: recordedAt,
         source_entry_count: entries.length, created_assertion_count: assertions.length };
     try {
-        const skeleton = { schema_version: 3, self_person_id: 'person_00000000-0000-4000-8000-000000000000', entities: [{ id: 'person_00000000-0000-4000-8000-000000000000', type: 'person', created_at: '2000-01-01T00:00:00.000Z' }], store_id: 'store_00000000-0000-4000-8000-000000000000', revision: 0,
+        const skeleton = { schema_version: SCHEMA_VERSION, self_person_id: 'person_00000000-0000-4000-8000-000000000000', entities: [{ id: 'person_00000000-0000-4000-8000-000000000000', type: 'person', created_at: '2000-01-01T00:00:00.000Z' }], store_id: 'store_00000000-0000-4000-8000-000000000000', revision: 0,
             created_at: recordedAt, updated_at: recordedAt, assertions, sources, evidence, migrations: [receipt] };
         validateMemoryStore(skeleton);
     } catch (cause) { throw new MemoryMigrationError('memory_migration_failed', { cause }); }

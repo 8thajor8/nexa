@@ -1,6 +1,7 @@
 import { readDirectUserTurn, releaseDirectUserTurn } from './direct-user-input.js';
 import { createMemoryService } from '../memory/service.js';
-import { authorizeMemoryRemember, authorizeMemoryForget, authorizePersonCreation } from '../memory/authorization.js';
+import { authorizeMemoryRemember, authorizeMemoryForget, authorizePersonCreation, authorizeRelationCreation,
+    authorizeRelationCorrection, authorizeRelationForget } from '../memory/authorization.js';
 import { createMemoryContextProvider, MEMORY_CONTEXT_POLICY } from '../memory/context-provider.js';
 import { openMemoryBackend } from '../memory/backend.js';
 import { randomUUID } from 'node:crypto';
@@ -75,7 +76,8 @@ export async function createAgent({
     const contextProvider = selectedBackend.contextProvider ?? null;
     let queue = Promise.resolve();
     let currentMessage = '', currentSource = 'untrusted', contextDigest = null;
-    const memoryToolNames = new Set(['remember', 'forget', 'recall', 'memory_context_snapshot', 'create_person']);
+    const memoryToolNames = new Set(['remember', 'forget', 'recall', 'memory_context_snapshot', 'create_person',
+        'create_relation', 'correct_relation', 'forget_relation', 'relations_for_entity']);
     function enqueue(operation) {
         const next = queue.then(operation);
         queue = next.catch(() => {});
@@ -227,11 +229,19 @@ ${memoryToPrompt(memory)}
                 if (!message.trim()) return { done: false, response: '' };
                 if (memory2 && command) {
                     const input = { capability, recipient: memory2 };
-                    const result = command.operation === 'create_person'
-                        ? await memory2.createPerson(command.request, authorizePersonCreation({ ...input, request: command.request }))
-                        : command.operation === 'remember'
-                        ? await memory2.remember({ proposal: command.request }, authorizeMemoryRemember({ ...input, proposal: command.request }))
-                        : await memory2.forget(command.request, authorizeMemoryForget({ ...input, target: command.request }));
+                    let result;
+                    if (command.operation === 'create_person') result = await memory2.createPerson(command.request,
+                        authorizePersonCreation({ ...input, request: command.request }));
+                    else if (command.operation === 'remember') result = await memory2.remember({ proposal: command.request },
+                        authorizeMemoryRemember({ ...input, proposal: command.request }));
+                    else if (command.operation === 'create_relation') result = await memory2.createRelation(command.request,
+                        authorizeRelationCreation({ ...input, request: command.request }));
+                    else if (command.operation === 'correct_relation') result = await memory2.correctRelation(command.request,
+                        authorizeRelationCorrection({ ...input, request: command.request }));
+                    else if (command.operation === 'forget_relation') result = await memory2.forgetRelation(command.request,
+                        authorizeRelationForget({ ...input, request: command.request }));
+                    else result = await memory2.forget(command.request,
+                        authorizeMemoryForget({ ...input, target: command.request }));
                     if (result.success && result.invalidateContext === true) {
                         contextProvider.invalidate();
                         conversation.length = 0;

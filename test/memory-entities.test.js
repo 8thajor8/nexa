@@ -65,7 +65,7 @@ function assertionChanges(proposal, { kind = 'user_statement', origin_trust = 'u
 test('schema 3 initialization has exactly one anonymous self and reopen preserves it', async t => {
     const { service, repository, storePath } = await setup(t);
     const current = await repository.readSnapshot();
-    assert.equal(current.snapshot.schema_version, 3);
+    assert.equal(current.snapshot.schema_version, 4);
     assert.equal(current.snapshot.entities.length, 1);
     assert.equal(current.snapshot.self_person_id, current.snapshot.entities[0].id);
     assert.equal(current.snapshot.assertions.length, 0);
@@ -81,7 +81,7 @@ test('schema 3 initialization has exactly one anonymous self and reopen preserve
 test('old formats are rejected explicitly without reinterpretation or writes', async t => {
     const { repository, storePath } = await setup(t);
     const current = await repository.readSnapshot(); await repository.close();
-    for (const version of [1, 2, 4, '3']) {
+    for (const version of [1, 2, 3, 5, '4']) {
         const store = structuredClone(current.snapshot); store.schema_version = version;
         delete store.entities; delete store.self_person_id;
         const bytes = JSON.stringify(store); await fs.writeFile(storePath, bytes);

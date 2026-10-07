@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import { assertExactObject } from './schema.js';
 import { consumeDirectUserTurn, isDirectUserTurnCurrent } from '../core/direct-user-input.js';
-import { validateRememberProposal, validateForgetTarget, validatePersonCreation } from './commands.js';
+import { validateRememberProposal, validateForgetTarget, validatePersonCreation,
+    validateRelationRequest, validateRelationForget } from './commands.js';
 export { validateRememberProposal } from './commands.js';
 
 const grants = new WeakMap();
@@ -23,10 +24,14 @@ function authorize(input, operation, field) {
     try {
         assertExactObject(input, ['capability', 'recipient', field], 'authorization');
         const command = consumeDirectUserTurn(input.capability, input.recipient);
-        if (operation === 'remember') validateRememberProposal(input[field]);
-        else if (operation === 'create_person') validatePersonCreation(input[field]);
-        else validateForgetTarget(input[field]);
-        if (!command || command.operation !== operation || fingerprint(command.request) !== fingerprint(input[field])) throw fail();
+        let scope = input[field];
+        if (operation === 'remember') validateRememberProposal(scope);
+        else if (operation === 'create_person') validatePersonCreation(scope);
+        else if (operation === 'create_relation') scope = validateRelationRequest(scope);
+        else if (operation === 'correct_relation') scope = validateRelationRequest(scope, { correction: true });
+        else if (operation === 'forget_relation') validateRelationForget(scope);
+        else validateForgetTarget(scope);
+        if (!command || command.operation !== operation || fingerprint(command.request) !== fingerprint(scope)) throw fail();
         const grant = Object.freeze(Object.create(null));
         grants.set(grant, { operation, fingerprint: fingerprint(command.request),
             capability: input.capability, recipient: input.recipient });
@@ -35,6 +40,9 @@ function authorize(input, operation, field) {
 }
 export function authorizeMemoryRemember(input) { return authorize(input, 'remember', 'proposal'); }
 export function authorizePersonCreation(input) { return authorize(input, 'create_person', 'request'); }
+export function authorizeRelationCreation(input) { return authorize(input, 'create_relation', 'request'); }
+export function authorizeRelationCorrection(input) { return authorize(input, 'correct_relation', 'request'); }
+export function authorizeRelationForget(input) { return authorize(input, 'forget_relation', 'request'); }
 export function authorizeMemoryForget(input) { return authorize(input, 'forget', 'target'); }
 
 export function consumeMemoryAuthorization(grant, operation, scope, recipient) {

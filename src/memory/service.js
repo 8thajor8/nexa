@@ -3,7 +3,8 @@ import { resolveEntities } from './entity-resolver.js';
 import { randomUUID } from 'node:crypto';
 import { COMPATIBILITY_CATEGORIES, assertExactObject, validateId, validateMemoryRecord, validateTimestamp } from './schema.js';
 import { consumeMemoryAuthorization, validateRememberProposal } from './authorization.js';
-import { validateForgetTarget, validatePersonCreation } from './commands.js';
+import { validateForgetTarget, validatePersonCreation, validateRelationRequest, validateRelationForget } from './commands.js';
+import { getRelationPredicate } from './relation-predicates.js';
 import { screenMemorySecret } from './secret-screening.js';
 import { MemoryRepositoryError } from './repository.js';
 
@@ -53,6 +54,36 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
         return value;
     }
     async function snapshot() { return repository.readSnapshot(); }
+
+    function relationRecord(assertion) { return Boolean(getRelationPredicate(assertion.predicate)) && assertion.object?.type === 'entity_reference'; }
+    function relationKey(assertion) { return [assertion.predicate, assertion.subject.id, assertion.object.id].join(':'); }
+    function relationProjection(assertion, entityId) {
+        return { assertion: structuredClone(assertion), entityId, predicate: assertion.predicate,
+            otherEntityId: assertion.subject.id === entityId ? assertion.object.id : assertion.subject.id,
+            valid_from: structuredClone(assertion.valid_from), valid_to: structuredClone(assertion.valid_to), trust: { authority: 'data_only' } };
+    }
+
+    async function removeAssertions(current, selected) {
+        const deletedIds = new Set(selected.map(record => record.id));
+        const removedEvidence = current.snapshot.evidence.filter(record => deletedIds.has(record.assertion_id));
+        const remainingEvidence = current.snapshot.evidence.filter(record => !deletedIds.has(record.assertion_id));
+        const stillUsedSources = new Set(remainingEvidence.map(record => record.source_id));
+        const removedSourceIds = new Set(removedEvidence.map(record => record.source_id));
+        const orphanSources = current.snapshot.sources.filter(record => removedSourceIds.has(record.id) && !stillUsedSources.has(record.id));
+        const changes = [
+            ...removedEvidence.map(record => ({ type: 'delete', collection: 'evidence', id: record.id })),
+            ...orphanSources.map(record => ({ type: 'delete', collection: 'sources', id: record.id })),
+            ...selected.map(record => ({ type: 'delete', collection: 'assertions', id: record.id })),
+        ];
+        const unlinked = current.snapshot.assertions.filter(record => !deletedIds.has(record.id) && record.supersedes.some(id => deletedIds.has(id)));
+        for (const record of unlinked) changes.push({ type: 'put', collection: 'assertions', record: {
+            ...record, supersedes: record.supersedes.filter(id => !deletedIds.has(id)),
+        } });
+        const committed = await repository.commit({ expectedRevision: current.revision, expectedDigest: current.digest, changes });
+        return { success: true, outcome: 'deleted', removedCount: selected.length,
+            revision: committed.revision, changedIds: [...deletedIds, ...unlinked.map(record => record.id)],
+            invalidateContext: true, trust: { authority: 'data_only' } };
+    }
 
     async function remember(input, authorization) {
         try {
@@ -117,26 +148,7 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
                 && record.compatibility.key === target.compatibility.key);
             if (!selected.length) return failure('memory_not_found');
             if (target.type === 'slot' && new Set(selected.map(record => canonical([canonicalSubject(record.subject, current.snapshot), record.predicate]))).size > 1) return failure('memory_ambiguous');
-            const deletedIds = new Set(selected.map(record => record.id));
-            const removedEvidence = current.snapshot.evidence.filter(record => deletedIds.has(record.assertion_id));
-            const remainingEvidence = current.snapshot.evidence.filter(record => !deletedIds.has(record.assertion_id));
-            const stillUsedSources = new Set(remainingEvidence.map(record => record.source_id));
-            const orphanSources = current.snapshot.sources.filter(record => !stillUsedSources.has(record.id));
-            const changes = [
-                ...removedEvidence.map(record => ({ type: 'delete', collection: 'evidence', id: record.id })),
-                ...orphanSources.map(record => ({ type: 'delete', collection: 'sources', id: record.id })),
-                ...selected.map(record => ({ type: 'delete', collection: 'assertions', id: record.id })),
-            ];
-            const unlinked = current.snapshot.assertions.filter(record => !deletedIds.has(record.id) && record.supersedes.some(id => deletedIds.has(id)));
-            for (const record of unlinked) changes.push({ type: 'put', collection: 'assertions', record: {
-                ...record, supersedes: record.supersedes.filter(id => !deletedIds.has(id)),
-            } });
-            const committed = await repository.commit({ expectedRevision: current.revision, expectedDigest: current.digest, changes });
-            return {
-                success: true, outcome: 'deleted', removedCount: selected.length,
-                revision: committed.revision, changedIds: [...deletedIds, ...unlinked.map(record => record.id)],
-                invalidateContext: true, trust: { authority: 'data_only' },
-            };
+            return await removeAssertions(current, selected);
         } catch (error) { return safeFailure(error); }
     }
 
@@ -236,6 +248,105 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
         catch (error) { return safeFailure(error); }
     }
 
-    const service = Object.freeze({ createPerson, getPerson, getSelf, resolvePerson, remember, forget, getById, find, open: () => repository.open(), close: () => repository.close() });
+    async function createRelation(input, authorization) {
+        try {
+            const request = validateRelationRequest(input);
+            consumeMemoryAuthorization(authorization, 'create_relation', request, service);
+            const current = await snapshot();
+            const entities = new Map(current.snapshot.entities.map(item => [item.id, item]));
+            if (entities.get(request.subject.id)?.type !== request.subject.entity_type
+                || entities.get(request.object.id)?.type !== request.object.entity_type) return failure('memory_invalid_input');
+            const matches = current.snapshot.assertions.filter(record => record.status === 'active' && relationRecord(record)
+                && relationKey(record) === relationKey({ ...request, object: { ...request.object, type: 'entity_reference' } })
+                && same(record.valid_from, request.valid_from) && same(record.valid_to, request.valid_to));
+            if (matches.length > 1) return failure('memory_ambiguous');
+            if (matches.length === 1) return { success: true, outcome: 'equivalent', id: matches[0].id,
+                revision: current.revision, changedIds: [], trust: { authority: 'data_only' } };
+            const recordedAt = timestamp();
+            const assertion = { id: idFactory('mem'), kind: 'fact', subject: structuredClone(request.subject),
+                predicate: request.predicate, object: structuredClone(request.object), status: 'active',
+                valid_from: structuredClone(request.valid_from), valid_to: structuredClone(request.valid_to),
+                recorded_at: recordedAt, supersedes: [], compatibility: null };
+            const source = { id: idFactory('src'), kind: 'user_statement', origin_trust: 'user_asserted', authority: 'data_only',
+                locator: null, occurred_at: { value: recordedAt, precision: 'instant' }, recorded_at: recordedAt };
+            const evidence = { id: idFactory('ev'), assertion_id: assertion.id, source_id: source.id, derivation: 'explicit',
+                extraction_confidence: null, learned_at: recordedAt, last_confirmed_at: null, legacy_ref: null };
+            const additions = [assertion, source, evidence];
+            const knownIds = new Set(current.snapshot.entities.concat(current.snapshot.assertions, current.snapshot.sources, current.snapshot.evidence).map(item => item.id));
+            if (additions.some(item => knownIds.has(item.id)) || new Set(additions.map(item => item.id)).size !== additions.length) return failure('memory_invalid_input');
+            const committed = await repository.commit({ expectedRevision: current.revision, expectedDigest: current.digest,
+                changes: [['assertions', assertion], ['sources', source], ['evidence', evidence]]
+                    .map(([collection, record]) => ({ type: 'put', collection, record })) });
+            return { success: true, outcome: 'created', id: assertion.id, revision: committed.revision,
+                changedIds: additions.map(item => item.id), trust: { authority: 'data_only' } };
+        } catch (error) { return safeFailure(error); }
+    }
+
+    async function correctRelation(input, authorization) {
+        try {
+            const request = validateRelationRequest(input, { correction: true });
+            consumeMemoryAuthorization(authorization, 'correct_relation', request, service);
+            const current = await snapshot();
+            const target = current.snapshot.assertions.find(item => item.id === request.supersedes && item.status === 'active' && relationRecord(item));
+            if (!target || target.predicate !== request.predicate) return failure('memory_not_found');
+            const endpoints = new Set([request.subject.id, request.object.id]);
+            if (!endpoints.has(target.subject.id) && !endpoints.has(target.object.id)) return failure('memory_invalid_input');
+            const entities = new Map(current.snapshot.entities.map(item => [item.id, item]));
+            if (entities.get(request.subject.id)?.type !== request.subject.entity_type
+                || entities.get(request.object.id)?.type !== request.object.entity_type) return failure('memory_invalid_input');
+            const existing = current.snapshot.assertions.find(item => item.status === 'active' && item.id !== target.id && relationRecord(item)
+                && relationKey(item) === relationKey({ ...request, object: { ...request.object, type: 'entity_reference' } })
+                && same(item.valid_from, request.valid_from) && same(item.valid_to, request.valid_to));
+            if (existing) return failure('memory_ambiguous');
+            const recordedAt = timestamp();
+            const assertion = { id: idFactory('mem'), kind: 'fact', subject: structuredClone(request.subject),
+                predicate: request.predicate, object: structuredClone(request.object), status: 'active',
+                valid_from: structuredClone(request.valid_from), valid_to: structuredClone(request.valid_to), recorded_at: recordedAt,
+                supersedes: [target.id], compatibility: null };
+            const source = { id: idFactory('src'), kind: 'user_statement', origin_trust: 'user_asserted', authority: 'data_only',
+                locator: null, occurred_at: { value: recordedAt, precision: 'instant' }, recorded_at: recordedAt };
+            const evidence = { id: idFactory('ev'), assertion_id: assertion.id, source_id: source.id, derivation: 'explicit',
+                extraction_confidence: null, learned_at: recordedAt, last_confirmed_at: null, legacy_ref: null };
+            const ids = new Set(current.snapshot.entities.concat(current.snapshot.assertions, current.snapshot.sources, current.snapshot.evidence).map(item => item.id));
+            const newIds = [assertion.id, source.id, evidence.id];
+            if (newIds.some(id => ids.has(id)) || new Set(newIds).size !== newIds.length) return failure('memory_invalid_input');
+            const previous = { ...target, status: 'superseded' };
+            const committed = await repository.commit({ expectedRevision: current.revision, expectedDigest: current.digest,
+                changes: [['assertions', previous], ['assertions', assertion], ['sources', source], ['evidence', evidence]]
+                    .map(([collection, record]) => ({ type: 'put', collection, record })) });
+            return { success: true, outcome: 'superseded', id: assertion.id, previousId: target.id,
+                revision: committed.revision, changedIds: [assertion.id, source.id, evidence.id, target.id], trust: { authority: 'data_only' } };
+        } catch (error) { return safeFailure(error); }
+    }
+
+    async function forgetRelation(input, authorization) {
+        try {
+            validateRelationForget(input); input = structuredClone(input);
+            consumeMemoryAuthorization(authorization, 'forget_relation', input, service);
+            const current = await snapshot();
+            const selected = current.snapshot.assertions.filter(item => item.id === input.assertionId && relationRecord(item));
+            if (!selected.length) return failure('memory_not_found');
+            return await removeAssertions(current, selected);
+        } catch (error) { return safeFailure(error); }
+    }
+
+    async function relationsForEntity(input) {
+        try {
+            assertExactObject(input, ['entityId', 'predicate']);
+            const entityId = input.entityId, predicate = input.predicate;
+            validateId(entityId, 'person');
+            if (predicate !== null && !getRelationPredicate(predicate)) throw new Error();
+            const current = await snapshot();
+            if (!current.snapshot.entities.some(item => item.id === entityId)) return failure('memory_not_found');
+            const relationships = current.snapshot.assertions.filter(item => item.status === 'active' && relationRecord(item)
+                && (predicate === null || item.predicate === predicate) && (item.subject.id === entityId || item.object.id === entityId))
+                .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+                .map(item => relationProjection(item, entityId));
+            return { success: true, relationships, revision: current.revision, digest: current.digest, trust: { authority: 'data_only' } };
+        } catch (error) { return safeFailure(error); }
+    }
+
+    const service = Object.freeze({ createPerson, getPerson, getSelf, resolvePerson, createRelation, correctRelation,
+        forgetRelation, relationsForEntity, remember, forget, getById, find, open: () => repository.open(), close: () => repository.close() });
     return service;
 }

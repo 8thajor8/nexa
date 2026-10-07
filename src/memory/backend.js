@@ -1,7 +1,7 @@
 import * as fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { validateMemoryStore } from './schema.js';
+import { SCHEMA_VERSION, validateMemoryStore } from './schema.js';
 import { createJsonMemoryRepository } from './json-repository.js';
 import { createMemoryService } from './service.js';
 import { createMemoryContextProvider } from './context-provider.js';
@@ -30,7 +30,7 @@ export async function initializeEmptyMemoryStore({ storePath, now = () => new Da
     }
     const timestamp = now();
     const selfId = 'person_' + randomUUID();
-    const store = { schema_version: 3, self_person_id: selfId,
+    const store = { schema_version: SCHEMA_VERSION, self_person_id: selfId,
         entities: [{ id: selfId, type: 'person', created_at: timestamp }], store_id: 'store_' + randomUUID(), revision: 0,
         created_at: timestamp, updated_at: timestamp, assertions: [], sources: [], evidence: [], migrations: [] };
     try { validateMemoryStore(store); }

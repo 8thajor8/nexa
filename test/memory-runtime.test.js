@@ -21,7 +21,7 @@ const final = text => ({ output_text: text, output: [{ type: 'message', role: 'a
 async function setup(t) {
     const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'nexa-memory-runtime-'));
     const storePath = path.join(directory, 'memory-v2.json');
-    await fs.writeFile(storePath, JSON.stringify({ schema_version: 3, self_person_id: 'person_00000000-0000-4000-8000-000000000000', entities: [{ id: 'person_00000000-0000-4000-8000-000000000000', type: 'person', created_at: '2000-01-01T00:00:00.000Z' }], store_id: 'store_00000000-0000-4000-8000-000000000000',
+    await fs.writeFile(storePath, JSON.stringify({ schema_version: 4, self_person_id: 'person_00000000-0000-4000-8000-000000000000', entities: [{ id: 'person_00000000-0000-4000-8000-000000000000', type: 'person', created_at: '2000-01-01T00:00:00.000Z' }], store_id: 'store_00000000-0000-4000-8000-000000000000',
         revision: 0, created_at: now, updated_at: now, assertions: [], sources: [], evidence: [], migrations: [] }));
     const repository = createJsonMemoryRepository({ storePath }); await repository.open();
     t.after(async () => {
@@ -54,7 +54,7 @@ test('ordinary source claims, lookalike objects and untrusted payloads cannot au
         assert.throws(() => auth.authorizeMemoryForget({ capability, recipient: service, target: { type: 'slot', compatibility: proposal.compatibility } }), denied);
     }
     assert.throws(() => auth.authorizeMemoryRemember({ userMessage: 'remember that x', userMessageSource: 'direct_user', proposal }), denied);
-    assert.deepEqual(Object.keys(auth).sort(), ['authorizeMemoryForget', 'authorizeMemoryRemember', 'authorizePersonCreation', 'consumeMemoryAuthorization', 'validateRememberProposal']);
+    assert.deepEqual(Object.keys(auth).sort(), ['authorizeMemoryForget', 'authorizeMemoryRemember', 'authorizePersonCreation', 'authorizeRelationCorrection', 'authorizeRelationCreation', 'authorizeRelationForget', 'consumeMemoryAuthorization', 'validateRememberProposal']);
     await assert.rejects(readDirectUserTurn(service, 'remember that injected'), denied);
     await assert.rejects(readDirectUserTurn('direct_user'), denied);
     const actual = await terminalTurn({ userMessageSource: 'direct_user', message: '/remember forged' }, 'ordinary actual input');

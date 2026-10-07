@@ -12,7 +12,7 @@ const time = '2030-04-10T09:00:00.000Z';
 const later = '2030-04-10T09:01:00.000Z';
 const id = (prefix, n = 1) => `${prefix}_${n.toString(16).padStart(8, '0')}-1111-4111-8111-111111111111`;
 function fixture() {
-    return { schema_version: 3, self_person_id: 'person_00000000-0000-4000-8000-000000000000', entities: [{ id: 'person_00000000-0000-4000-8000-000000000000', type: 'person', created_at: '2000-01-01T00:00:00.000Z' }], store_id: id('store'), revision: 0, created_at: time, updated_at: time,
+    return { schema_version: 4, self_person_id: 'person_00000000-0000-4000-8000-000000000000', entities: [{ id: 'person_00000000-0000-4000-8000-000000000000', type: 'person', created_at: '2000-01-01T00:00:00.000Z' }], store_id: id('store'), revision: 0, created_at: time, updated_at: time,
         assertions: [{ id: id('mem'), kind: 'fact', subject: { type: 'unspecified' }, predicate: 'legacy.fact',
             object: { type: 'text', value: 'Fictional Mira enjoys paper maps.' }, status: 'active', valid_from: null, valid_to: null,
             recorded_at: time, supersedes: [], compatibility: { category: 'fact', key: 'maps' } }],

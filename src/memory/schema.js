@@ -1,6 +1,7 @@
 import { canonicalSubject, normalizeEntityName, isEntityName } from './entities.js';
+import { getRelationPredicate } from './relation-predicates.js';
 // Memory is inert data. This module performs no I/O and never interprets values.
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 export const COLLECTIONS = Object.freeze(['entities', 'assertions', 'sources', 'evidence', 'migrations']);
 export const COMPATIBILITY_CATEGORIES = Object.freeze(['fact', 'preference', 'person', 'project', 'routine', 'user']);
 export const SOURCE_TRUST = Object.freeze({
@@ -85,6 +86,9 @@ function temporalRange(value) {
     else high.setUTCDate(high.getUTCDate() + 1);
     return [low.getTime(), high.getTime() - 1];
 }
+export function validateTemporalInterval(start, end, path = 'temporal') {
+    if (start !== null && end !== null) requireValue(temporalRange(start)[0] < temporalRange(end)[1], path);
+}
 function assertion(value, path) {
     assertExactObject(value, ['id', 'kind', 'subject', 'predicate', 'object', 'status', 'valid_from', 'valid_to', 'recorded_at', 'supersedes', 'compatibility'], path);
     validateId(value.id, 'assertions', path + '.id');
@@ -100,9 +104,22 @@ function assertion(value, path) {
     }
     text(value.predicate, 1, 128, path + '.predicate');
     requireValue(PREDICATE_PATTERN.test(value.predicate), path + '.predicate');
-    assertExactObject(value.object, ['type', 'value'], path + '.object');
-    requireValue(value.object.type === 'text', path + '.object.type');
-    text(value.object.value, 1, 4000, path + '.object.value');
+    const relationPredicate = getRelationPredicate(value.predicate);
+    if (relationPredicate) {
+        requireValue(value.kind === 'fact' && value.compatibility === null, path);
+        assertExactObject(value.object, ['type', 'entity_type', 'id'], path + '.object');
+        requireValue(value.object.type === 'entity_reference', path + '.object.type');
+        requireValue(relationPredicate.subjectTypes.includes(value.subject.entity_type)
+            && relationPredicate.objectTypes.includes(value.object.entity_type), path + '.predicate');
+        validateId(value.object.id, value.object.entity_type, path + '.object.id');
+        requireValue(value.subject.type === 'entity', path + '.subject');
+        if (!relationPredicate.allowSelf) requireValue(value.subject.id !== value.object.id, path + '.object.id');
+        if (relationPredicate.symmetric) requireValue(value.subject.id < value.object.id, path + '.subject.id');
+    } else {
+        assertExactObject(value.object, ['type', 'value'], path + '.object');
+        requireValue(value.object.type === 'text', path + '.object.type');
+        text(value.object.value, 1, 4000, path + '.object.value');
+    }
     if (isEntityName(value.predicate)) {
         requireValue(value.subject.type !== 'unspecified' && value.kind === 'fact'
             && value.compatibility === null && value.valid_from === null && value.valid_to === null, path);
@@ -111,9 +128,7 @@ function assertion(value, path) {
     requireValue(['active', 'superseded'].includes(value.status), path + '.status');
     validateTemporal(value.valid_from, path + '.valid_from');
     validateTemporal(value.valid_to, path + '.valid_to');
-    if (value.valid_from !== null && value.valid_to !== null) {
-        requireValue(temporalRange(value.valid_from)[0] < temporalRange(value.valid_to)[1], path + '.valid_to');
-    }
+    validateTemporalInterval(value.valid_from, value.valid_to, path + '.valid_to');
     validateTimestamp(value.recorded_at, path + '.recorded_at');
     assertDenseArray(value.supersedes, path + '.supersedes');
     value.supersedes.forEach((id, i) => validateId(id, 'assertions', path + '.supersedes[' + i + ']'));
@@ -200,9 +215,19 @@ export function validateMemoryStore(store) {
     const entities = new Map(store.entities.map(record => [record.id, record]));
     requireValue(entities.get(store.self_person_id)?.type === 'person', 'store.self_person_id');
     const nameSlots = new Set();
+    const activeRelations = new Set();
     store.assertions.forEach((record, i) => {
         const subject = canonicalSubject(record.subject, store);
         if (subject.type === 'entity') requireValue(entities.get(subject.id)?.type === subject.entity_type, 'store.assertions[' + i + '].subject');
+        const relation = getRelationPredicate(record.predicate);
+        if (relation) {
+            requireValue(entities.get(record.object.id)?.type === record.object.entity_type, 'store.assertions[' + i + '].object');
+            if (record.status === 'active') {
+                const key = JSON.stringify([record.predicate, record.subject.id, record.object.id, record.valid_from, record.valid_to]);
+                requireValue(!activeRelations.has(key), 'store.assertions[' + i + ']');
+                activeRelations.add(key);
+            }
+        }
         if (record.status === 'active' && isEntityName(record.predicate)) {
             const key = subject.id + ':' + record.predicate + (record.predicate === 'entity.alias' ? ':' + normalizeEntityName(record.object.value) : '');
             requireValue(!nameSlots.has(key), 'store.assertions[' + i + ']');
@@ -221,6 +246,15 @@ export function validateMemoryStore(store) {
         requireValue(supported.has(record.id), 'store.assertions[' + i + ']');
         for (const target of record.supersedes) {
             requireValue(assertions.has(target) && target !== record.id, 'store.assertions[' + i + '].supersedes');
+            const previous = assertions.get(target);
+            const currentRelation = getRelationPredicate(record.predicate);
+            const previousRelation = getRelationPredicate(previous.predicate);
+            if (currentRelation || previousRelation) {
+                requireValue(currentRelation && previousRelation && record.predicate === previous.predicate
+                    && previous.status === 'superseded', 'store.assertions[' + i + '].supersedes');
+                const endpoints = new Set([record.subject.id, record.object.id]);
+                requireValue(endpoints.has(previous.subject.id) || endpoints.has(previous.object.id), 'store.assertions[' + i + '].supersedes');
+            }
             incoming.set(target, incoming.get(target) + 1);
         }
     });
