@@ -2,6 +2,7 @@ import { readDirectUserTurn, releaseDirectUserTurn } from './direct-user-input.j
 import { createMemoryService } from '../memory/service.js';
 import { authorizeMemoryRemember, authorizeMemoryForget } from '../memory/authorization.js';
 import { createMemoryContextProvider, MEMORY_CONTEXT_POLICY } from '../memory/context-provider.js';
+import { openMemoryBackend } from '../memory/backend.js';
 import { randomUUID } from 'node:crypto';
 import { askOpenAI } from '../brain/openai.js';
 import { config } from '../config.js';
@@ -48,6 +49,8 @@ function writeAgentDiagnostic(event, details) {
 
 export async function createAgent({
     permissionPolicy,
+    memoryBackend = config.memoryBackend,
+    memory2StorePath = config.memory2StorePath,
     memory2Repository = null, // Explicit host composition only; the personal CLI never sets this.
     ask = askOpenAI,
     load = loadMemory,
@@ -57,9 +60,19 @@ export async function createAgent({
     maxToolIterations = config.maxToolIterations,
     logger = writeAgentDiagnostic,
 } = {}) {
-    const memory = memory2Repository ? { user: {}, preferences: {}, facts: [] } : await load();
-    const memory2 = memory2Repository ? createMemoryService({ repository: memory2Repository }) : null;
-    const contextProvider = memory2Repository ? createMemoryContextProvider({ repository: memory2Repository }) : null;
+    let selectedBackend;
+    if (memory2Repository) {
+        if (memoryBackend !== 'memory2') throw new Error('Injected Memory 2 repository requires memoryBackend=memory2.');
+        selectedBackend = { backend: 'memory2', repository: memory2Repository,
+            memory: { user: {}, preferences: {}, facts: [] },
+            service: createMemoryService({ repository: memory2Repository }),
+            contextProvider: createMemoryContextProvider({ repository: memory2Repository }), close: async () => {} };
+    } else {
+        selectedBackend = await openMemoryBackend({ backend: memoryBackend, storePath: memory2StorePath, loadLegacy: load });
+    }
+    const memory = selectedBackend.memory;
+    const memory2 = selectedBackend.service ?? null;
+    const contextProvider = selectedBackend.contextProvider ?? null;
     let queue = Promise.resolve();
     let currentMessage = '', currentSource = 'untrusted', contextDigest = null;
     const memoryToolNames = new Set(['remember', 'forget', 'recall', 'memory_context_snapshot']);
@@ -229,6 +242,7 @@ ${memoryToPrompt(memory)}
             } finally { releaseDirectUserTurn(turn.capability); }
         });
     }
-    const agent = { run: message => enqueue(() => run(message)), readAndRun, memory };
+    const agent = { run: message => enqueue(() => run(message)), readAndRun, memory,
+        memoryBackend: selectedBackend.backend, close: () => selectedBackend.close() };
     return agent;
 }

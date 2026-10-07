@@ -5,19 +5,19 @@ import { createAgent } from './core/agent.js';
 import { closeWhatsAppBrowser } from './integrations/whatsapp/bridge/session.js';
 import { closeSpeechService, initializeSpeechService } from './speech/service.js';
 
-await initializeSpeechService();
-
-const nexa = await createAgent();
-
-console.log('');
-console.log('╔══════════════════════════════════╗');
-console.log('║          NEXA ONLINE             ║');
-console.log('╚══════════════════════════════════╝');
-console.log('');
-console.log('Escribí "salir" para terminar.');
-console.log('');
-
+let nexa;
 try {
+    await initializeSpeechService();
+    nexa = await createAgent();
+    console.log(`Nexa memory backend: ${nexa.memoryBackend}`);
+    console.log('');
+    console.log('╔══════════════════════════════════╗');
+    console.log('║          NEXA ONLINE             ║');
+    console.log('╚══════════════════════════════════╝');
+    console.log('');
+    console.log('Escribí "salir" para terminar.');
+    console.log('');
+
     while (true) {
         try {
             const turn = await nexa.readAndRun();
@@ -32,8 +32,14 @@ try {
             console.log('');
         }
     }
+} catch (error) {
+    console.error('Nexa startup/runtime failure:', error.message);
+    process.exitCode = 1;
 } finally {
     closeDirectUserInput();
-    await closeWhatsAppBrowser();
-    await closeSpeechService();
+    for (const [name, close] of [['Memory', () => nexa?.close()],
+        ['WhatsApp', closeWhatsAppBrowser], ['speech', closeSpeechService]]) {
+        try { await close(); }
+        catch (error) { console.error(`Nexa ${name} shutdown failure:`, error.message); process.exitCode = 1; }
+    }
 }

@@ -34,7 +34,7 @@ async function setup(t) {
 }
 async function agentFor(repository, extra = {}) {
     const requests = [];
-    const agent = await createAgent({ memory2Repository: repository,
+    const agent = await createAgent({ memoryBackend: 'memory2', memory2Repository: repository,
         load: async () => { throw new Error('must not load personal v1'); },
         save: async () => { throw new Error('must not save personal v1'); },
         ask: async request => { requests.push(structuredClone(request)); return final('Fictional answer.'); },

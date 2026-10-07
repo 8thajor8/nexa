@@ -1,9 +1,16 @@
-# Memory 2 A.2 + A.3 boundary
+# Memory 2 A.2–A.4 runtime boundary
 
-Memory 1 remains the default personal runtime. `src/index.js` calls `createAgent()`
-without a Memory 2 repository. No environment switch, default v2 path, store
-initialization, or personal migration is introduced. Tests explicitly inject an
-already-open repository backed by a temporary synthetic store.
+Memory 1 remains the default personal runtime. `NEXA_MEMORY_BACKEND` selects the
+backend: unset or `memory1` selects the existing Memory 1 implementation;
+`memory2` explicitly selects Memory 2; every other value fails startup. The
+Memory 2 path is fixed to `data/memory-v2.json`. The file is initialized as an
+empty schema-v2 store only when Memory 2 is explicitly selected and the file is
+missing. This does not migrate or read Memory 1. Tests use temporary synthetic
+stores and never provision the personal Memory 2 path.
+
+Startup logs the selected backend. The selected repository is closed during
+shutdown. Errors opening a selected Memory 2 store stop startup and do not fall
+back to Memory 1; an existing corrupt or incompatible store is not rewritten.
 
 ## Authority and lifetime
 
@@ -68,6 +75,6 @@ erased. No session invalidation occurs for a failed deletion.
 
 The terminal test driver spawns an isolated Node process and writes synthetic
 lines through its real OS stdin pipe. No production issuer or injectable reader
-is exposed for testing. Filesystem tests use Windows temporary directories and
-safe cleanup checks. Live OpenAI calls and the user's personal stores are not
-needed for these tests.
+is exposed for testing. Backend lifecycle tests use Windows temporary
+directories and safe cleanup checks. Live OpenAI calls and the user's personal
+stores are not needed for these tests.
