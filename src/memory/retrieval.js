@@ -1,6 +1,7 @@
 import { canonicalSubject, eligibleNameAssertions, normalizeEntityName, projectPerson } from './entities.js';
 import { getRelationPredicate } from './relation-predicates.js';
 import { assertDenseArray, assertExactObject, validateId } from './schema.js';
+import { classifyValidity, validateNow, validateValidTime } from './temporal.js';
 
 export const MEMORY_RETRIEVAL_LIMITS = Object.freeze({
     maxSeedEntities: 5,
@@ -153,6 +154,35 @@ function normalizeQuery(query) {
         relationPredicates: uniqueSorted(relationPredicates), statuses: uniqueSorted(statuses), limits };
 }
 
+function queryWithStatuses(query, statuses) {
+    assertAllowedObject(query, QUERY_KEYS, 'query');
+    const safe = Object.create(null);
+    for (const key of Reflect.ownKeys(query)) safe[key] = Object.getOwnPropertyDescriptor(query, key).value;
+    safe.statuses = statuses;
+    return safe;
+}
+
+function atTime(current, rawQuery, validTime, statuses, useActiveStatusForUnboundedCurrent = false) {
+    const time = validateValidTime(validTime);
+    const candidates = retrieveCandidates(current, queryWithStatuses(rawQuery, statuses));
+    const status = record => useActiveStatusForUnboundedCurrent && record.status === 'active'
+        && record.valid_from === null && record.valid_to === null ? 'valid'
+        : classifyValidity(record.valid_from, record.valid_to, time);
+    const classify = item => ({ ...item, temporalStatus: status(item.record) });
+    const classifyRelation = item => ({ ...item, temporalStatus: status(item.assertion) });
+    const classifiedAssertions = candidates.assertions.map(classify);
+    const classifiedRelations = candidates.relations.map(classifyRelation);
+    return {
+        ...candidates,
+        assertions: classifiedAssertions.filter(item => item.temporalStatus === 'valid'),
+        indeterminateAssertions: classifiedAssertions.filter(item => item.temporalStatus === 'indeterminate'),
+        relations: classifiedRelations.filter(item => item.temporalStatus === 'valid'),
+        indeterminateRelations: classifiedRelations.filter(item => item.temporalStatus === 'indeterminate'),
+        metadata: { ...candidates.metadata, validTime: structuredClone(time),
+            temporalModel: 'valid_time_only', bitemporal: false },
+    };
+}
+
 function assertionEvidence(assertionId, evidenceByAssertion, sourcesById) {
     return (evidenceByAssertion.get(assertionId) ?? []).map(evidence => ({
         evidence: structuredClone(evidence),
@@ -276,11 +306,23 @@ export function retrieveCandidates(current, rawQuery) {
 
 /** Repository-neutral adapter. It requires only the repository snapshot reader;
  * the supplied backend may be JSON today and indexed storage later. */
-export function createMemoryRetriever({ readSnapshot } = {}) {
-    assertExactObject({ readSnapshot }, ['readSnapshot'], 'retriever');
-    if (typeof readSnapshot !== 'function') throw new TypeError('memory_retriever_invalid');
+export function createMemoryRetriever({ readSnapshot, now = () => new Date().toISOString() } = {}) {
+    assertExactObject({ readSnapshot, now }, ['readSnapshot', 'now'], 'retriever');
+    if (typeof readSnapshot !== 'function' || typeof now !== 'function') throw new TypeError('memory_retriever_invalid');
     return Object.freeze({
         async resolveEntityMentions(text, options) { return resolveEntityMentions(text, await readSnapshot(), options); },
         async retrieveCandidates(query) { return retrieveCandidates(await readSnapshot(), query); },
+        async currentKnowledge(query) {
+            const validTime = validateNow(now());
+            return atTime(await readSnapshot(), query, validTime, ['active'], true);
+        },
+        async knowledgeValidAt(query, validTime) {
+            return atTime(await readSnapshot(), query, validTime, ['active', 'superseded']);
+        },
+        async history(query) {
+            const candidates = retrieveCandidates(await readSnapshot(), queryWithStatuses(query, ['active', 'superseded']));
+            return { ...candidates, metadata: { ...candidates.metadata, temporalModel: 'valid_time_only',
+                bitemporal: false, historyMeaning: 'known_validity_and_supersession' } };
+        },
     });
 }
