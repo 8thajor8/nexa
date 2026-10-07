@@ -111,7 +111,7 @@ export function planMemory1Migration({ legacy, now = () => new Date().toISOStrin
     const receipt = { source_sha256, conversion_version: 1, applied_at: recordedAt,
         source_entry_count: entries.length, created_assertion_count: assertions.length };
     try {
-        const skeleton = { schema_version: 2, store_id: 'store_00000000-0000-4000-8000-000000000000', revision: 0,
+        const skeleton = { schema_version: 3, self_person_id: 'person_00000000-0000-4000-8000-000000000000', entities: [{ id: 'person_00000000-0000-4000-8000-000000000000', type: 'person', created_at: '2000-01-01T00:00:00.000Z' }], store_id: 'store_00000000-0000-4000-8000-000000000000', revision: 0,
             created_at: recordedAt, updated_at: recordedAt, assertions, sources, evidence, migrations: [receipt] };
         validateMemoryStore(skeleton);
     } catch (cause) { throw new MemoryMigrationError('memory_migration_failed', { cause }); }
@@ -131,7 +131,7 @@ export async function applyMemory1Migration({ legacy, repository, now = () => ne
         const existingReceipt = current.snapshot.migrations.find(item => item.source_sha256 === plan.source_sha256);
         if (existingReceipt) return { success: true, outcome: 'already_applied', revision: current.revision,
             receipt: structuredClone(existingReceipt), trust: { authority: 'data_only' } };
-        const empty = current.revision === 0 && ['assertions', 'sources', 'evidence', 'migrations'].every(name => current.snapshot[name].length === 0);
+        const empty = current.snapshot.entities.length === 1 && current.snapshot.entities[0].id === current.snapshot.self_person_id && current.revision === 0 && ['assertions', 'sources', 'evidence', 'migrations'].every(name => current.snapshot[name].length === 0);
         if (!empty) throw new MemoryMigrationError('memory_migration_destination_not_empty');
         const changes = [
             ...plan.sources.map(record => ({ type: 'put', collection: 'sources', record })),

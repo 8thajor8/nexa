@@ -1,7 +1,9 @@
+import { canonicalSubject, normalizeEntityName, projectPerson, isEntityName, eligibleNameAssertions } from './entities.js';
+import { resolveEntities } from './entity-resolver.js';
 import { randomUUID } from 'node:crypto';
 import { COMPATIBILITY_CATEGORIES, assertExactObject, validateId, validateMemoryRecord, validateTimestamp } from './schema.js';
 import { consumeMemoryAuthorization, validateRememberProposal } from './authorization.js';
-import { validateForgetTarget } from './commands.js';
+import { validateForgetTarget, validatePersonCreation } from './commands.js';
 import { screenMemorySecret } from './secret-screening.js';
 import { MemoryRepositoryError } from './repository.js';
 
@@ -26,11 +28,14 @@ function canonical(value) {
     return JSON.stringify(value);
 }
 function same(a, b) { return canonical(a) === canonical(b); }
-function sameSlot(a, b) {
-    return same(a.subject, b.subject) && a.predicate === b.predicate && same(a.compatibility, b.compatibility);
+function sameSlot(a, b, store) {
+    return same(canonicalSubject(a.subject, store), canonicalSubject(b.subject, store))
+        && a.predicate === b.predicate && same(a.compatibility, b.compatibility)
+        && (a.predicate !== 'entity.alias' || normalizeEntityName(a.object.value) === normalizeEntityName(b.object.value));
 }
-function equivalent(a, b) {
-    return a.kind === b.kind && sameSlot(a, b) && same(a.object, b.object)
+function equivalent(a, b, store) {
+    return a.kind === b.kind && sameSlot(a, b, store)
+        && (a.predicate === 'entity.alias' ? normalizeEntityName(a.object.value) === normalizeEntityName(b.object.value) : same(a.object, b.object))
         && same(a.valid_from, b.valid_from) && same(a.valid_to, b.valid_to);
 }
 function newId(prefix) { return prefix + '_' + randomUUID(); }
@@ -58,9 +63,10 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
             const screened = secretScreen(proposal.object.value);
             if (!screened?.safe) return failure('memory_secret_suspected');
             const current = await snapshot();
-            const candidates = current.snapshot.assertions.filter(record => record.status === 'active' && sameSlot(record, proposal));
+            const candidates = current.snapshot.assertions.filter(record => record.status === 'active' && sameSlot(record, proposal, current.snapshot));
             if (candidates.length > 1) return failure('memory_ambiguous');
-            if (candidates.length === 1 && equivalent(candidates[0], proposal)) {
+            if (candidates.length === 1 && equivalent(candidates[0], proposal, current.snapshot)
+                && (!isEntityName(proposal.predicate) || eligibleNameAssertions(current.snapshot).some(record => record.id === candidates[0].id))) {
                 return { success: true, outcome: 'equivalent', id: candidates[0].id, revision: current.revision, changedIds: [], trust: { authority: 'data_only' } };
             }
             const learnedAt = timestamp();
@@ -110,7 +116,7 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
                 && record.compatibility.category === target.compatibility.category
                 && record.compatibility.key === target.compatibility.key);
             if (!selected.length) return failure('memory_not_found');
-            if (target.type === 'slot' && new Set(selected.map(record => canonical([record.subject, record.predicate]))).size > 1) return failure('memory_ambiguous');
+            if (target.type === 'slot' && new Set(selected.map(record => canonical([canonicalSubject(record.subject, current.snapshot), record.predicate]))).size > 1) return failure('memory_ambiguous');
             const deletedIds = new Set(selected.map(record => record.id));
             const removedEvidence = current.snapshot.evidence.filter(record => deletedIds.has(record.assertion_id));
             const remainingEvidence = current.snapshot.evidence.filter(record => !deletedIds.has(record.assertion_id));
@@ -165,7 +171,7 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
             const records = current.snapshot.assertions.filter(record => (includeSuperseded || record.status === 'active')
                 && (category === null || record.compatibility?.category === category)
                 && (key === null || record.compatibility?.key === key)
-                && (subject === null || same(record.subject, subject))
+                && (subject === null || same(canonicalSubject(record.subject, current.snapshot), canonicalSubject(subject, current.snapshot)))
                 && (predicate === null || record.predicate === predicate))
                 .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
             const result = records.map(record => ({
@@ -178,6 +184,58 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
         } catch (error) { return safeFailure(error); }
     }
 
-    const service = Object.freeze({ remember, forget, getById, find, open: () => repository.open(), close: () => repository.close() });
+    async function createPerson(request, authorization) {
+        try {
+            validatePersonCreation(request);
+            request = structuredClone(request);
+            consumeMemoryAuthorization(authorization, 'create_person', request, service);
+            if (!secretScreen(request.preferredName)?.safe) return failure('memory_secret_suspected');
+            const current = await snapshot();
+            const resolution = resolveEntities(current, { text: request.preferredName });
+            if (!request.allowDuplicate && resolution.match === 'exact' && resolution.total > 0) return failure('memory_ambiguous');
+            const recordedAt = timestamp();
+            const entityId = idFactory('person'), assertionId = idFactory('mem'), sourceId = idFactory('src'), evidenceId = idFactory('ev');
+            // Never turn an ID collision into an update of an existing person or record.
+            const ids = current.snapshot.entities.concat(current.snapshot.assertions, current.snapshot.sources, current.snapshot.evidence).map(item => item.id);
+            if ([entityId, assertionId, sourceId, evidenceId].some(id => ids.includes(id))) return failure('memory_invalid_input');
+            const entity = { id: entityId, type: 'person', created_at: recordedAt };
+            const assertion = { id: assertionId, kind: 'fact', subject: { type: 'entity', entity_type: 'person', id: entityId },
+                predicate: 'entity.preferred_name', object: { type: 'text', value: request.preferredName },
+                status: 'active', valid_from: null, valid_to: null, recorded_at: recordedAt, supersedes: [], compatibility: null };
+            const source = { id: sourceId, kind: 'user_statement', origin_trust: 'user_asserted', authority: 'data_only', locator: null,
+                occurred_at: { value: recordedAt, precision: 'instant' }, recorded_at: recordedAt };
+            const evidence = { id: evidenceId, assertion_id: assertionId, source_id: sourceId, derivation: 'explicit',
+                extraction_confidence: null, learned_at: recordedAt, last_confirmed_at: null, legacy_ref: null };
+            const changes = [['entities', entity], ['assertions', assertion], ['sources', source], ['evidence', evidence]]
+                .map(([collection, record]) => ({ type: 'put', collection, record }));
+            const committed = await repository.commit({ expectedRevision: current.revision, expectedDigest: current.digest, changes });
+            return { success: true, outcome: 'created', person: projectPerson(committed.snapshot, entityId),
+                revision: committed.revision, changedIds: [entityId, assertionId, sourceId, evidenceId], trust: { authority: 'data_only' } };
+        } catch (error) { return safeFailure(error); }
+    }
+    async function getPerson(input) {
+        try {
+            assertExactObject(input, ['id']); const id = input.id; validateId(id, 'person');
+            const current = await snapshot();
+            const person = projectPerson(current.snapshot, id);
+            return person ? { success: true, person, revision: current.revision, digest: current.digest, trust: { authority: 'data_only' } } : failure('memory_not_found');
+        } catch (error) { return safeFailure(error); }
+    }
+    async function getSelf() {
+        try {
+            const current = await snapshot();
+            return { success: true, person: projectPerson(current.snapshot, current.snapshot.self_person_id),
+                revision: current.revision, digest: current.digest, trust: { authority: 'data_only' } };
+        } catch (error) { return safeFailure(error); }
+    }
+    async function resolvePerson(input) {
+        try {
+            assertExactObject(input, ['text']); const text = input.text; normalizeEntityName(text);
+            return { success: true, ...resolveEntities(await snapshot(), { text }) };
+        }
+        catch (error) { return safeFailure(error); }
+    }
+
+    const service = Object.freeze({ createPerson, getPerson, getSelf, resolvePerson, remember, forget, getById, find, open: () => repository.open(), close: () => repository.close() });
     return service;
 }

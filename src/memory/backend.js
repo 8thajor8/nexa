@@ -29,7 +29,9 @@ export async function initializeEmptyMemoryStore({ storePath, now = () => new Da
         if (error?.code !== 'ENOENT') throw publicStartupError('memory_store_unreadable');
     }
     const timestamp = now();
-    const store = { schema_version: 2, store_id: 'store_' + randomUUID(), revision: 0,
+    const selfId = 'person_' + randomUUID();
+    const store = { schema_version: 3, self_person_id: selfId,
+        entities: [{ id: selfId, type: 'person', created_at: timestamp }], store_id: 'store_' + randomUUID(), revision: 0,
         created_at: timestamp, updated_at: timestamp, assertions: [], sources: [], evidence: [], migrations: [] };
     try { validateMemoryStore(store); }
     catch { throw publicStartupError('memory_store_initialization_failed'); }

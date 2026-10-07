@@ -10,7 +10,7 @@ import { createMemoryService } from '../src/memory/service.js';
 import { authorizeMemoryRemember, authorizeMemoryForget, validateRememberProposal } from '../src/memory/authorization.js';
 
 const now = '2032-06-12T10:30:00.000Z';
-const fixture = () => ({ schema_version: 2, store_id: 'store_00000000-0000-4000-8000-000000000000', revision: 0,
+const fixture = () => ({ schema_version: 3, self_person_id: 'person_00000000-0000-4000-8000-000000000000', entities: [{ id: 'person_00000000-0000-4000-8000-000000000000', type: 'person', created_at: '2000-01-01T00:00:00.000Z' }], store_id: 'store_00000000-0000-4000-8000-000000000000', revision: 0,
     created_at: now, updated_at: now, assertions: [], sources: [], evidence: [], migrations: [] });
 function proposal(value, options = {}) {
     return { kind: 'preference', subject: options.subject ?? { type: 'owner' }, predicate: options.predicate ?? 'person.favourite_colour',

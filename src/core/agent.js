@@ -1,6 +1,6 @@
 import { readDirectUserTurn, releaseDirectUserTurn } from './direct-user-input.js';
 import { createMemoryService } from '../memory/service.js';
-import { authorizeMemoryRemember, authorizeMemoryForget } from '../memory/authorization.js';
+import { authorizeMemoryRemember, authorizeMemoryForget, authorizePersonCreation } from '../memory/authorization.js';
 import { createMemoryContextProvider, MEMORY_CONTEXT_POLICY } from '../memory/context-provider.js';
 import { openMemoryBackend } from '../memory/backend.js';
 import { randomUUID } from 'node:crypto';
@@ -75,7 +75,7 @@ export async function createAgent({
     const contextProvider = selectedBackend.contextProvider ?? null;
     let queue = Promise.resolve();
     let currentMessage = '', currentSource = 'untrusted', contextDigest = null;
-    const memoryToolNames = new Set(['remember', 'forget', 'recall', 'memory_context_snapshot']);
+    const memoryToolNames = new Set(['remember', 'forget', 'recall', 'memory_context_snapshot', 'create_person']);
     function enqueue(operation) {
         const next = queue.then(operation);
         queue = next.catch(() => {});
@@ -227,7 +227,9 @@ ${memoryToPrompt(memory)}
                 if (!message.trim()) return { done: false, response: '' };
                 if (memory2 && command) {
                     const input = { capability, recipient: memory2 };
-                    const result = command.operation === 'remember'
+                    const result = command.operation === 'create_person'
+                        ? await memory2.createPerson(command.request, authorizePersonCreation({ ...input, request: command.request }))
+                        : command.operation === 'remember'
                         ? await memory2.remember({ proposal: command.request }, authorizeMemoryRemember({ ...input, proposal: command.request }))
                         : await memory2.forget(command.request, authorizeMemoryForget({ ...input, target: command.request }));
                     if (result.success && result.invalidateContext === true) {

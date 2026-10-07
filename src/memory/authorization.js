@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { assertExactObject } from './schema.js';
 import { consumeDirectUserTurn, isDirectUserTurnCurrent } from '../core/direct-user-input.js';
-import { validateRememberProposal, validateForgetTarget } from './commands.js';
+import { validateRememberProposal, validateForgetTarget, validatePersonCreation } from './commands.js';
 export { validateRememberProposal } from './commands.js';
 
 const grants = new WeakMap();
@@ -24,6 +24,7 @@ function authorize(input, operation, field) {
         assertExactObject(input, ['capability', 'recipient', field], 'authorization');
         const command = consumeDirectUserTurn(input.capability, input.recipient);
         if (operation === 'remember') validateRememberProposal(input[field]);
+        else if (operation === 'create_person') validatePersonCreation(input[field]);
         else validateForgetTarget(input[field]);
         if (!command || command.operation !== operation || fingerprint(command.request) !== fingerprint(input[field])) throw fail();
         const grant = Object.freeze(Object.create(null));
@@ -33,6 +34,7 @@ function authorize(input, operation, field) {
     } catch { throw fail(); }
 }
 export function authorizeMemoryRemember(input) { return authorize(input, 'remember', 'proposal'); }
+export function authorizePersonCreation(input) { return authorize(input, 'create_person', 'request'); }
 export function authorizeMemoryForget(input) { return authorize(input, 'forget', 'target'); }
 
 export function consumeMemoryAuthorization(grant, operation, scope, recipient) {

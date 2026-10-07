@@ -6,7 +6,7 @@ const time = '2030-04-10T09:00:00.000Z';
 const id = (prefix, n = 1) => `${prefix}_${n.toString(16).padStart(8, '0')}-1111-4111-8111-111111111111`;
 function fixture() {
     return {
-        schema_version: 2, store_id: id('store'), revision: 0, created_at: time, updated_at: time,
+        schema_version: 3, self_person_id: 'person_00000000-0000-4000-8000-000000000000', entities: [{ id: 'person_00000000-0000-4000-8000-000000000000', type: 'person', created_at: '2000-01-01T00:00:00.000Z' }], store_id: id('store'), revision: 0, created_at: time, updated_at: time,
         assertions: [{ id: id('mem'), kind: 'preference', subject: { type: 'owner' }, predicate: 'legacy.preference',
             object: { type: 'text', value: 'Fictional reader prefers instrumental music.' }, status: 'active',
             valid_from: null, valid_to: null, recorded_at: time, supersedes: [], compatibility: { category: 'preference', key: 'reading_music' } }],
@@ -34,7 +34,7 @@ test('valid store, empty store, nullable provenance and fictional person referen
     assert.equal(validateMemoryStore(store), store);
     const empty = { ...fixture(), assertions: [], sources: [], evidence: [], migrations: [] };
     validateMemoryStore(empty);
-    store.assertions[0].subject = { type: 'entity', entity_type: 'person', id: id('person') };
+    store.assertions[0].subject = { type: 'entity', entity_type: 'person', id: store.self_person_id };
     store.evidence[0].learned_at = null;
     store.evidence[0].legacy_ref = { category: 'preferences', key: 'reading_music', index: 0 };
     validateMemoryStore(store);
@@ -42,7 +42,7 @@ test('valid store, empty store, nullable provenance and fictional person referen
     validateMemoryStore(store);
 });
 test('unsupported schema versions are explicit and never coerced', () => {
-    for (const version of [1, 3, '2', null]) invalid(s => { s.schema_version = version; }, 'memory_schema_unsupported');
+    for (const version of [1, 2, 4, '3', null]) invalid(s => { s.schema_version = version; }, 'memory_schema_unsupported');
 });
 test('malformed roots, collections and record types are rejected', () => {
     for (const root of [null, [], 'secret', 2]) assert.throws(() => validateMemoryStore(root), MemorySchemaError);

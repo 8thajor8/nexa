@@ -67,6 +67,7 @@ export function prepareCommitRequest(request) {
                 assertExactObject(change, ['type', 'collection', 'record']);
                 validateMemoryRecord(collection, change.record);
             } else if (type === 'delete') {
+                if (collection === 'entities') throw new Error(); // Entity deletion is outside B.1.
                 assertExactObject(change, ['type', 'collection', collection === 'migrations' ? 'source_sha256' : 'id']);
                 if (collection === 'migrations') {
                     if (typeof change.source_sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(change.source_sha256)) throw new Error();
@@ -90,9 +91,13 @@ export function applyChanges(store, changes, updatedAt) {
             const index = records.findIndex(record => record[key] === id);
             if (change.type === 'put') {
                 if (index === -1) records.push(structuredClone(change.record));
-                else records[index] = structuredClone(change.record);
+                else {
+                    if (change.collection === 'entities' && (records[index].type !== change.record.type
+                        || records[index].created_at !== change.record.created_at)) throw new Error();
+                    records[index] = structuredClone(change.record);
+                }
             } else {
-                if (index === -1) throw new Error();
+                if (change.collection === 'entities' || index === -1) throw new Error();
                 records.splice(index, 1);
             }
         }

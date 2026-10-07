@@ -1,3 +1,4 @@
+import { normalizeEntityName } from './entities.js';
 import { createHash } from 'node:crypto';
 import { assertExactObject, validateMemoryRecord, validateId } from './schema.js';
 
@@ -20,12 +21,24 @@ export function validateRememberProposal(proposal) {
     return proposal;
 }
 
+export function validatePersonCreation(request) {
+    assertExactObject(request, ['preferredName', 'allowDuplicate'], 'person');
+    normalizeEntityName(request.preferredName);
+    if (typeof request.allowDuplicate !== 'boolean') throw new Error('memory_person_invalid');
+    return request;
+}
+
 // Pure parsing supplies NO provenance. Only the terminal reader can attest input.
 // Natural commands retain the literal fact; semantic extraction is deferred.
 // The explicit structured form binds every field, including slot and subject.
 export function parseMemoryCommand(message) {
     if (typeof message !== 'string' || message.length > 16000) return null;
     try {
+        if (message.startsWith('/person create ')) {
+            const request = JSON.parse(message.slice('/person create '.length));
+            validatePersonCreation(request);
+            return { operation: 'create_person', request };
+        }
         if (message.startsWith('/remember ')) {
             const proposal = JSON.parse(message.slice('/remember '.length));
             validateRememberProposal(proposal);

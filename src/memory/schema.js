@@ -1,6 +1,7 @@
+import { canonicalSubject, normalizeEntityName, isEntityName } from './entities.js';
 // Memory is inert data. This module performs no I/O and never interprets values.
-export const SCHEMA_VERSION = 2;
-export const COLLECTIONS = Object.freeze(['assertions', 'sources', 'evidence', 'migrations']);
+export const SCHEMA_VERSION = 3;
+export const COLLECTIONS = Object.freeze(['entities', 'assertions', 'sources', 'evidence', 'migrations']);
 export const COMPATIBILITY_CATEGORIES = Object.freeze(['fact', 'preference', 'person', 'project', 'routine', 'user']);
 export const SOURCE_TRUST = Object.freeze({
     user_statement: 'user_asserted', legacy_memory_1: 'unknown',
@@ -10,7 +11,7 @@ export const SOURCE_TRUST = Object.freeze({
 // Lowercase namespace segments: letter followed by letters, digits or underscores.
 export const PREDICATE_PATTERN = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$/u;
 const uuid = '[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
-const prefixes = { assertions: 'mem', sources: 'src', evidence: 'ev', store: 'store', person: 'person' };
+const prefixes = { assertions: 'mem', sources: 'src', evidence: 'ev', store: 'store', person: 'person', entities: 'person' };
 
 export class MemorySchemaError extends Error {
     constructor(path, code = 'memory_schema_invalid') {
@@ -102,6 +103,11 @@ function assertion(value, path) {
     assertExactObject(value.object, ['type', 'value'], path + '.object');
     requireValue(value.object.type === 'text', path + '.object.type');
     text(value.object.value, 1, 4000, path + '.object.value');
+    if (isEntityName(value.predicate)) {
+        requireValue(value.subject.type !== 'unspecified' && value.kind === 'fact'
+            && value.compatibility === null && value.valid_from === null && value.valid_to === null, path);
+        try { normalizeEntityName(value.object.value); } catch { throw new MemorySchemaError(path + '.object.value'); }
+    }
     requireValue(['active', 'superseded'].includes(value.status), path + '.status');
     validateTemporal(value.valid_from, path + '.valid_from');
     validateTemporal(value.valid_to, path + '.valid_to');
@@ -117,6 +123,12 @@ function assertion(value, path) {
         requireValue(COMPATIBILITY_CATEGORIES.includes(value.compatibility.category), path + '.compatibility.category');
         text(value.compatibility.key, 1, 128, path + '.compatibility.key');
     }
+}
+function entity(value, path) {
+    assertExactObject(value, ['id', 'type', 'created_at'], path);
+    validateId(value.id, 'entities', path + '.id');
+    requireValue(value.type === 'person', path + '.type');
+    validateTimestamp(value.created_at, path + '.created_at');
 }
 function source(value, path) {
     assertExactObject(value, ['id', 'kind', 'origin_trust', 'authority', 'locator', 'occurred_at', 'recorded_at'], path);
@@ -154,14 +166,19 @@ function migration(value, path) {
     integer(value.source_entry_count, path + '.source_entry_count');
     integer(value.created_assertion_count, path + '.created_assertion_count');
 }
-const validators = { assertions: assertion, sources: source, evidence, migrations: migration };
+const validators = { entities: entity, assertions: assertion, sources: source, evidence, migrations: migration };
 export function validateMemoryRecord(collection, value, path = 'record') {
     requireValue(typeof collection === 'string' && Object.hasOwn(validators, collection), path);
     validators[collection](value, path);
     return value;
 }
 export function validateMemoryStore(store) {
-    assertExactObject(store, ['schema_version', 'store_id', 'revision', 'created_at', 'updated_at', ...COLLECTIONS], 'store');
+    // Recognize incompatible versions before requiring fields introduced in v3.
+    const version = Object.getOwnPropertyDescriptor(store ?? {}, 'schema_version');
+    if (version && Object.hasOwn(version, 'value') && version.value !== SCHEMA_VERSION) {
+        throw new MemorySchemaError('store.schema_version', 'memory_schema_unsupported');
+    }
+    assertExactObject(store, ['schema_version', 'store_id', 'self_person_id', 'revision', 'created_at', 'updated_at', ...COLLECTIONS], 'store');
     if (store.schema_version !== SCHEMA_VERSION) throw new MemorySchemaError('store.schema_version', 'memory_schema_unsupported');
     validateId(store.store_id, 'store', 'store.store_id');
     integer(store.revision, 'store.revision');
@@ -179,6 +196,19 @@ export function validateMemoryStore(store) {
             ids.add(key);
         });
     }
+    validateId(store.self_person_id, 'person', 'store.self_person_id');
+    const entities = new Map(store.entities.map(record => [record.id, record]));
+    requireValue(entities.get(store.self_person_id)?.type === 'person', 'store.self_person_id');
+    const nameSlots = new Set();
+    store.assertions.forEach((record, i) => {
+        const subject = canonicalSubject(record.subject, store);
+        if (subject.type === 'entity') requireValue(entities.get(subject.id)?.type === subject.entity_type, 'store.assertions[' + i + '].subject');
+        if (record.status === 'active' && isEntityName(record.predicate)) {
+            const key = subject.id + ':' + record.predicate + (record.predicate === 'entity.alias' ? ':' + normalizeEntityName(record.object.value) : '');
+            requireValue(!nameSlots.has(key), 'store.assertions[' + i + ']');
+            nameSlots.add(key);
+        }
+    });
     const assertions = new Map(store.assertions.map(record => [record.id, record]));
     const sources = new Set(store.sources.map(record => record.id));
     const supported = new Set();

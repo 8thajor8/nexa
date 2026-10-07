@@ -8,7 +8,7 @@ import { planMemory1Migration, applyMemory1Migration } from '../src/memory/migra
 import { validateMemoryStore } from '../src/memory/schema.js';
 
 const now = '2032-06-12T10:30:00.000Z';
-function emptyStore() { return { schema_version: 2, store_id: 'store_00000000-0000-4000-8000-000000000000', revision: 0,
+function emptyStore() { return { schema_version: 3, self_person_id: 'person_00000000-0000-4000-8000-000000000000', entities: [{ id: 'person_00000000-0000-4000-8000-000000000000', type: 'person', created_at: '2000-01-01T00:00:00.000Z' }], store_id: 'store_00000000-0000-4000-8000-000000000000', revision: 0,
     created_at: now, updated_at: now, assertions: [], sources: [], evidence: [], migrations: [] }; }
 function legacy() { return { user: { nickname: 'Fictional Ada' }, preferences: { tea: 'Fictional Ada prefers mint tea.' },
     facts: [{ key: 'project', value: 'Fictional Ada studies paper maps.' }, { key: 'project', value: 'Fictional Ada collects atlases.' }],

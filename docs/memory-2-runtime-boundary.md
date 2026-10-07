@@ -1,10 +1,10 @@
-# Memory 2 A.2–A.4 runtime boundary
+# Memory 2 A.2–B.1 runtime boundary
 
 Memory 1 remains the default personal runtime. `NEXA_MEMORY_BACKEND` selects the
 backend: unset or `memory1` selects the existing Memory 1 implementation;
 `memory2` explicitly selects Memory 2; every other value fails startup. The
 Memory 2 path is fixed to `data/memory-v2.json`. The file is initialized as an
-empty schema-v2 store only when Memory 2 is explicitly selected and the file is
+schema-3 store with one anonymous structural self and no personal knowledge only when Memory 2 is explicitly selected and the file is
 missing. This does not migrate or read Memory 1. Tests use temporary synthetic
 stores and never provision the personal Memory 2 path.
 
@@ -78,3 +78,7 @@ lines through its real OS stdin pipe. No production issuer or injectable reader
 is exposed for testing. Backend lifecycle tests use Windows temporary
 directories and safe cleanup checks. Live OpenAI calls and the user's personal
 stores are not needed for these tests.
+
+B.1 entity commands and canonical self/name semantics are described in
+[memory-2-entities.md](memory-2-entities.md). They reuse this trusted boundary;
+resolving a Person never grants authority to persist or communicate.
