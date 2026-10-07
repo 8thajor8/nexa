@@ -1,3 +1,7 @@
+import { readDirectUserTurn, releaseDirectUserTurn } from './direct-user-input.js';
+import { createMemoryService } from '../memory/service.js';
+import { authorizeMemoryRemember, authorizeMemoryForget } from '../memory/authorization.js';
+import { createMemoryContextProvider, MEMORY_CONTEXT_POLICY } from '../memory/context-provider.js';
 import { randomUUID } from 'node:crypto';
 import { askOpenAI } from '../brain/openai.js';
 import { config } from '../config.js';
@@ -44,6 +48,7 @@ function writeAgentDiagnostic(event, details) {
 
 export async function createAgent({
     permissionPolicy,
+    memory2Repository = null, // Explicit host composition only; the personal CLI never sets this.
     ask = askOpenAI,
     load = loadMemory,
     save = saveMemory,
@@ -52,7 +57,17 @@ export async function createAgent({
     maxToolIterations = config.maxToolIterations,
     logger = writeAgentDiagnostic,
 } = {}) {
-    const memory = await load();
+    const memory = memory2Repository ? { user: {}, preferences: {}, facts: [] } : await load();
+    const memory2 = memory2Repository ? createMemoryService({ repository: memory2Repository }) : null;
+    const contextProvider = memory2Repository ? createMemoryContextProvider({ repository: memory2Repository }) : null;
+    let queue = Promise.resolve();
+    let currentMessage = '', currentSource = 'untrusted', contextDigest = null;
+    const memoryToolNames = new Set(['remember', 'forget', 'recall', 'memory_context_snapshot']);
+    function enqueue(operation) {
+        const next = queue.then(operation);
+        queue = next.catch(() => {});
+        return next;
+    }
     const sessionId = randomUUID();
 
     function diagnostic(event, details = {}) {
@@ -60,6 +75,7 @@ export async function createAgent({
     }
 
     function getInstructions() {
+        if (memory2) return NEXA_INSTRUCTIONS + MEMORY_CONTEXT_POLICY;
         return `
 ${NEXA_INSTRUCTIONS}
 
@@ -71,10 +87,17 @@ ${memoryToPrompt(memory)}
     const conversation = [];
 
     async function getModelResponse(tools, iteration, finalOnly = false) {
+        const memoryContext = contextProvider ? await contextProvider.read() : null;
+        if (memoryContext && contextDigest !== null && contextDigest !== memoryContext.digest) {
+            // Discard all derived history, including possible assistant echoes of deleted facts.
+            conversation.length = 0;
+            conversation.push({ role: 'user', content: currentMessage });
+        }
+        if (memoryContext) contextDigest = memoryContext.digest;
         const response = await ask({
             instructions: getInstructions(),
-            input: conversation,
-            tools,
+            input: memoryContext ? [...memoryContext.items, ...structuredClone(conversation)] : conversation,
+            tools: memory2 ? tools.filter(tool => !memoryToolNames.has(tool.name)) : tools,
         });
         conversation.push(...(response.output ?? []));
         const toolCalls = (response.output ?? []).filter(item => item.type === 'function_call');
@@ -98,7 +121,9 @@ ${memoryToPrompt(memory)}
             || [...spotifyMessages, 'El ciclo de herramientas terminó, pero no pude generar una respuesta final.'].filter(Boolean).join('\n\n');
     }
 
-    async function run(userMessage) {
+    async function run(userMessage, source = 'untrusted') {
+        if (typeof userMessage !== 'string') throw new TypeError('user_message_must_be_text');
+        currentMessage = userMessage; currentSource = source;
         const spotifyMessages = [];
         const successfulCalls = new Map();
         const repeatLimit = requestedRepeatCount(userMessage);
@@ -142,7 +167,13 @@ ${memoryToPrompt(memory)}
                 diagnostic('tool_call', { iteration, tool: toolCall.name, arguments: safeArgumentSummary(args) });
                 let result;
                 try {
-                    result = await execute(toolCall.name, args, { memory, saveMemory: save, permissionPolicy, sessionId, userMessage, userMessageSource: 'direct_user' });
+                    if (memory2 && memoryToolNames.has(toolCall.name)) {
+                        result = { success: false, error: { code: 'memory_write_not_authorized', message: 'Memory commands require direct terminal input.' } };
+                    } else {
+                        result = await execute(toolCall.name, args, { memory, saveMemory: memory2 ? undefined : save,
+                            permissionPolicy, sessionId, userMessage,
+                            userMessageSource: currentSource });
+                    }
                 } catch (error) {
                     result = { success: false, error: { code: 'tool_execution_failed', message: error.message } };
                 }
@@ -172,8 +203,32 @@ ${memoryToPrompt(memory)}
         return finalAnswer(spotifyMessages, maxToolIterations, 'max_tool_iterations');
     }
 
-    return {
-        run,
-        memory,
-    };
+    // No method accepting a caller string can assert trusted Memory 2 provenance.
+    async function readAndRun() {
+        return enqueue(async () => {
+            const turn = await readDirectUserTurn(memory2 ?? agent);
+            if (!turn) return { done: true };
+            try {
+                const { message, command, capability } = turn;
+                if (message.trim().toLowerCase() === 'salir') return { done: true };
+                if (!message.trim()) return { done: false, response: '' };
+                if (memory2 && command) {
+                    const input = { capability, recipient: memory2 };
+                    const result = command.operation === 'remember'
+                        ? await memory2.remember({ proposal: command.request }, authorizeMemoryRemember({ ...input, proposal: command.request }))
+                        : await memory2.forget(command.request, authorizeMemoryForget({ ...input, target: command.request }));
+                    if (result.success && result.invalidateContext === true) {
+                        contextProvider.invalidate();
+                        conversation.length = 0;
+                        contextDigest = null;
+                    }
+                    // No memory payload or proof is passed to the model or to tools.
+                    return { done: false, response: result.success ? 'Memoria actualizada.' : result.error.message, memoryResult: result };
+                }
+                return { done: false, response: await run(message, 'direct_user') };
+            } finally { releaseDirectUserTurn(turn.capability); }
+        });
+    }
+    const agent = { run: message => enqueue(() => run(message)), readAndRun, memory };
+    return agent;
 }

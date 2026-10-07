@@ -1,17 +1,11 @@
 import 'dotenv/config';
-import readline from 'node:readline/promises';
-import { stdin as input, stdout as output } from 'node:process';
+import { closeDirectUserInput } from './core/direct-user-input.js';
 
 import { createAgent } from './core/agent.js';
 import { closeWhatsAppBrowser } from './integrations/whatsapp/bridge/session.js';
 import { closeSpeechService, initializeSpeechService } from './speech/service.js';
 
 await initializeSpeechService();
-
-const rl = readline.createInterface({
-    input,
-    output,
-});
 
 const nexa = await createAgent();
 
@@ -25,18 +19,11 @@ console.log('');
 
 try {
     while (true) {
-        const message = await rl.question('Vos > ');
-
-        if (message.trim().toLowerCase() === 'salir') {
-            break;
-        }
-
-        if (!message.trim()) {
-            continue;
-        }
-
         try {
-            const response = await nexa.run(message);
+            const turn = await nexa.readAndRun();
+            if (turn.done) break;
+            const response = turn.response;
+            if (!response) continue;
 
             console.log(`Nexa > ${response}`);
             console.log('');
@@ -46,7 +33,7 @@ try {
         }
     }
 } finally {
-    rl.close();
+    closeDirectUserInput();
     await closeWhatsAppBrowser();
     await closeSpeechService();
 }
