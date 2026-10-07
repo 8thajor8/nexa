@@ -1,5 +1,6 @@
 import { canonicalSubject, normalizeEntityName, projectPerson, isEntityName, eligibleNameAssertions } from './entities.js';
 import { resolveEntities } from './entity-resolver.js';
+import { createMemoryRetriever } from './retrieval.js';
 import { randomUUID } from 'node:crypto';
 import { COMPATIBILITY_CATEGORIES, assertExactObject, validateId, validateMemoryRecord, validateTimestamp } from './schema.js';
 import { consumeMemoryAuthorization, validateRememberProposal } from './authorization.js';
@@ -47,6 +48,7 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
         throw new TypeError('memory_repository_contract_invalid');
     }
     if (typeof now !== 'function' || typeof idFactory !== 'function' || typeof secretScreen !== 'function') throw new TypeError('memory_service_dependency_invalid');
+    const retriever = createMemoryRetriever({ readSnapshot: () => repository.readSnapshot() });
 
     function timestamp() {
         const value = now();
@@ -248,6 +250,18 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
         catch (error) { return safeFailure(error); }
     }
 
+    async function resolveEntityMentions(input) {
+        try {
+            assertExactObject(input, ['text']);
+            return { success: true, ...await retriever.resolveEntityMentions(input.text) };
+        } catch (error) { return safeFailure(error); }
+    }
+
+    async function retrieveCandidates(query) {
+        try { return { success: true, ...await retriever.retrieveCandidates(query) }; }
+        catch (error) { return safeFailure(error); }
+    }
+
     async function createRelation(input, authorization) {
         try {
             const request = validateRelationRequest(input);
@@ -346,7 +360,7 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
         } catch (error) { return safeFailure(error); }
     }
 
-    const service = Object.freeze({ createPerson, getPerson, getSelf, resolvePerson, createRelation, correctRelation,
+    const service = Object.freeze({ createPerson, getPerson, getSelf, resolvePerson, resolveEntityMentions, retrieveCandidates, createRelation, correctRelation,
         forgetRelation, relationsForEntity, remember, forget, getById, find, open: () => repository.open(), close: () => repository.close() });
     return service;
 }
