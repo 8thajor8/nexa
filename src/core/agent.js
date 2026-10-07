@@ -76,6 +76,7 @@ export async function createAgent({
     const contextProvider = selectedBackend.contextProvider ?? null;
     let queue = Promise.resolve();
     let currentMessage = '', currentSource = 'untrusted', contextDigest = null;
+    let recentUserTurns = [], currentRecentUserMessages = [];
     const memoryToolNames = new Set(['remember', 'forget', 'recall', 'memory_context_snapshot', 'create_person',
         'create_relation', 'correct_relation', 'forget_relation', 'relations_for_entity']);
     function enqueue(operation) {
@@ -102,11 +103,14 @@ ${memoryToPrompt(memory)}
     const conversation = [];
 
     async function getModelResponse(tools, iteration, finalOnly = false) {
-        const memoryContext = contextProvider ? await contextProvider.read() : null;
+        const memoryContext = contextProvider ? await contextProvider.read({ message: currentMessage,
+            recentUserMessages: currentRecentUserMessages }) : null;
         if (memoryContext && contextDigest !== null && contextDigest !== memoryContext.digest) {
             // Discard all derived history, including possible assistant echoes of deleted facts.
             conversation.length = 0;
             conversation.push({ role: 'user', content: currentMessage });
+            recentUserTurns = [];
+            currentRecentUserMessages = [];
         }
         if (memoryContext) contextDigest = memoryContext.digest;
         const response = await ask({
@@ -139,6 +143,8 @@ ${memoryToPrompt(memory)}
     async function run(userMessage, source = 'untrusted') {
         if (typeof userMessage !== 'string') throw new TypeError('user_message_must_be_text');
         currentMessage = userMessage; currentSource = source;
+        currentRecentUserMessages = recentUserTurns.slice(-4);
+        recentUserTurns = [...recentUserTurns, userMessage.slice(0, 1000)].slice(-8);
         const spotifyMessages = [];
         const successfulCalls = new Map();
         const repeatLimit = requestedRepeatCount(userMessage);
@@ -246,6 +252,8 @@ ${memoryToPrompt(memory)}
                         contextProvider.invalidate();
                         conversation.length = 0;
                         contextDigest = null;
+                        recentUserTurns = [];
+                        currentRecentUserMessages = [];
                     }
                     // No memory payload or proof is passed to the model or to tools.
                     return { done: false, response: result.success ? 'Memoria actualizada.' : result.error.message, memoryResult: result };

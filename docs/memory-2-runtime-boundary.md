@@ -56,13 +56,26 @@ Memory 1 agent keeps its existing tools and behavior.
 
 ## Context and forgetting
 
-The provider reads a fresh snapshot before each model request, selects active
-assertions in stable ID order, and emits a function-call/output pair labelled
-`data_only`. Stored text is never appended to system/developer instructions.
-Only the fixed policy describing this separation is added to instructions.
-Defaults are 20 records and 12,000 UTF-16 code units of serialized payload;
-configuration is capped at 100 records and 32,000 code units. Whole records that
-do not fit are omitted, with a truncation indicator. No embeddings are used.
+For Memory 2, each model request reads one fresh snapshot and orients retrieval
+only from exact resolved names/aliases, explicit singular first-person
+references to Self, or a unique entity resolved in the last four user turns
+when the current turn contains a narrow continuation cue. Ambiguous/partial
+names, model output, tool output and stored text never create that orientation.
+The provider uses C.1 bounded candidates and C.2 current or explicit ISO
+year/month/day validity, ranks direct-entity assertions before direct relations
+and neighbor assertions, then temporal certainty and evidence confidence.
+Recency breaks ties only within the same entity/predicate. Since current
+predicates are generic, it does not invent topic-matching language rules.
+
+The assembled function-call/output payload is `data_only`, capped at 20
+assertions, 10 relations and 12,000 UTF-16 code units. It retains canonical
+entity projections, selected assertions/relations, validity/status/supersession,
+up to three compact evidence rows per record with confidence and source trust,
+plus snapshot revision/digest. Source locators and irrelevant records are omitted. Whole records that do not
+fit are skipped; no JSON is truncated. When there is no oriented memory, the
+provider sends no memory context items. Stored text is never appended to
+system/developer instructions. Memory 1 continues to use its existing prompt
+memory path and does not use this provider.
 
 Memory context items are ephemeral and never retained in conversation history.
 A successful forget invalidates the provider generation and clears the retained

@@ -33,7 +33,7 @@ test('Memory 2 initializes only a missing temporary store, then opens and closes
         assert.equal(first.backend, 'memory2');
         assert.equal((await first.repository.readSnapshot()).snapshot.revision, 0);
         const context = await first.contextProvider.read();
-        assert.deepEqual(JSON.parse(context.items[1].output).records, []);
+        assert.deepEqual(context.items, []);
         await first.close();
         const original = await fs.readFile(storePath);
         const second = await initializeEmptyMemoryStore({ storePath, now: () => { throw new Error('must not rewrite'); } });
