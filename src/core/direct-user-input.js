@@ -7,6 +7,7 @@ const turns = new WeakMap();
 const runtimeSessions = new WeakMap();
 const activeSessions = new Set();
 const contextCapabilities = new WeakMap();
+const confirmationCapabilities = new WeakMap();
 let reader, lines, current, currentContext, reading = false;
 
 function denied() {
@@ -27,7 +28,9 @@ function expireContext(capability) {
 function closeSession(session) {
     if (!session) return;
     for (const capability of session.capabilities) contextCapabilities.delete(capability);
+    for (const capability of session.confirmations) confirmationCapabilities.delete(capability);
     session.capabilities.clear();
+    session.confirmations.clear();
     session.activeTurnId = null;
     session.closed = true;
     activeSessions.delete(session);
@@ -61,11 +64,14 @@ export async function readDirectUserTurn(recipient) {
         let session = runtimeSessions.get(recipient);
         if (!session || session.closed) {
             session = { sessionId: randomUUID(), principalId: `local-cli-session:${randomUUID()}`,
-                principalKind: 'local_runtime_session', activeTurnId: null, capabilities: new Set(), closed: false };
+                principalKind: 'local_runtime_session', activeTurnId: null, capabilities: new Set(),
+                confirmations: new Set(), closed: false };
             runtimeSessions.set(recipient, session);
             activeSessions.add(session);
         }
         const turnId = randomUUID();
+        for (const proof of session.confirmations) confirmationCapabilities.delete(proof);
+        session.confirmations.clear();
         const sourceTextSha256 = createHash('sha256').update(next.value, 'utf8').digest('hex');
         session.activeTurnId = turnId;
         const command = parseMemoryCommand(next.value);
@@ -82,6 +88,92 @@ export async function readDirectUserTurn(recipient) {
         currentContext = runtimeContextCapability;
         return Object.freeze({ message: next.value, command, capability, runtimeContextCapability });
     } finally { reading = false; }
+}
+
+function exactConfirmationInput(input) {
+    const keys = ['recipient', 'requestId', 'operationFingerprint', 'preview', 'phrase'];
+    if (!input || typeof input !== 'object' || Array.isArray(input)
+        || (Object.getPrototypeOf(input) !== Object.prototype && Object.getPrototypeOf(input) !== null)) return false;
+    const own = Reflect.ownKeys(input);
+    return own.length === keys.length && own.every(key => typeof key === 'string' && keys.includes(key)
+        && Object.hasOwn(Object.getOwnPropertyDescriptor(input, key) ?? {}, 'value'))
+        && input.recipient && typeof input.recipient === 'object'
+        && typeof input.requestId === 'string' && /^[0-9a-f-]{36}$/u.test(input.requestId)
+        && typeof input.operationFingerprint === 'string' && /^[a-f0-9]{64}$/u.test(input.operationFingerprint)
+        && typeof input.preview === 'string' && input.preview.length <= 4000
+        && typeof input.phrase === 'string'
+        && (/^CONFIRM ADD [A-F0-9]{8,80}$/u.test(input.phrase)
+            || /^CONFIRM REPLACE mem_[0-9a-f-]{36} [A-F0-9]{8,80}$/u.test(input.phrase));
+}
+
+function confirmationDisplayText(value) {
+    return value.replace(/[\u0000-\u001f\u007f-\u009f\u001b]/gu, ' ').slice(0, 4000);
+}
+
+/**
+ * Displays a code-owned preview and consumes the next real stdin line as a
+ * confirmation event. The line is never returned as a conversational turn.
+ * This proves only local input origin, not human identity or OS ownership.
+ */
+export async function readDirectUserConfirmation(input) {
+    if (arguments.length !== 1 || !exactConfirmationInput(input) || reading) throw denied();
+    const session = runtimeSessions.get(input.recipient);
+    if (!session || session.closed) throw denied();
+    reading = true;
+    if (current) turns.delete(current);
+    if (currentContext) expireContext(currentContext);
+    current = undefined;
+    currentContext = undefined;
+    try {
+        if (!reader) {
+            reader = createInterface({ input: stdin, output: stdout, crlfDelay: Infinity,
+                terminal: Boolean(stdin.isTTY && stdout.isTTY) });
+            lines = reader[Symbol.asyncIterator]();
+        }
+        stdout.write('\n' + confirmationDisplayText(input.preview) + '\n');
+        stdout.write(`Para confirmar, escribí exactamente: ${input.phrase}\n> `);
+        const next = await lines.next();
+        if (next.done) {
+            for (const active of activeSessions) closeSession(active);
+            runtimeSessions.delete(input.recipient);
+            return null;
+        }
+        const confirmationTurnId = randomUUID();
+        session.activeTurnId = confirmationTurnId;
+        if (next.value !== input.phrase) return Object.freeze({ confirmed: false });
+        const capability = Object.freeze(Object.create(null));
+        confirmationCapabilities.set(capability, { recipient: input.recipient, session, sessionId: session.sessionId,
+            confirmationTurnId, requestId: input.requestId, operationFingerprint: input.operationFingerprint,
+            phrase: input.phrase, consumed: false });
+        session.confirmations.add(capability);
+        return Object.freeze({ confirmed: true, capability });
+    } finally { reading = false; }
+}
+
+/** Consume local confirmation proof once, including when a binding mismatches. */
+export function consumeDirectUserConfirmation(capability, binding) {
+    const state = capability && typeof capability === 'object' ? confirmationCapabilities.get(capability) : null;
+    if (!state || state.consumed) throw denied();
+    state.consumed = true;
+    state.session.confirmations.delete(capability);
+    confirmationCapabilities.delete(capability);
+    const keys = ['recipient', 'requestId', 'operationFingerprint', 'phrase'];
+    const validBinding = binding && typeof binding === 'object' && !Array.isArray(binding)
+        && Object.getPrototypeOf(binding) === Object.prototype && Reflect.ownKeys(binding).length === keys.length
+        && Reflect.ownKeys(binding).every(key => typeof key === 'string' && keys.includes(key)
+            && Object.hasOwn(Object.getOwnPropertyDescriptor(binding, key) ?? {}, 'value'))
+        && binding.recipient === state.recipient && binding.requestId === state.requestId
+        && binding.operationFingerprint === state.operationFingerprint && binding.phrase === state.phrase;
+    if (!validBinding || state.session.closed || runtimeSessions.get(state.recipient) !== state.session
+        || state.session.activeTurnId !== state.confirmationTurnId || currentContext !== undefined) throw denied();
+    return Object.freeze({ sessionId: state.sessionId, confirmationTurnId: state.confirmationTurnId,
+        requestId: state.requestId, operationFingerprint: state.operationFingerprint });
+}
+
+/** Non-authorizing lifecycle check used to invalidate internal capabilities. */
+export function isTrustedLocalTurnActive(recipient, sessionId, turnId) {
+    const session = recipient && typeof recipient === 'object' ? runtimeSessions.get(recipient) : null;
+    return Boolean(session && !session.closed && session.sessionId === sessionId && session.activeTurnId === turnId);
 }
 
 export function consumeDirectUserTurn(capability, recipient) {
