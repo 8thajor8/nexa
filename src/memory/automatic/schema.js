@@ -6,7 +6,7 @@ export const AUTOMATIC_MEMORY_MAX_INPUT_CHARS = 16000;
 export const AUTOMATIC_MEMORY_MAX_CANDIDATES = 12;
 
 const enums = Object.freeze({
-    candidateType: ['fact', 'preference', 'decision', 'tool', 'purchase', 'hobby', 'professional', 'language', 'relationship', 'situation', 'other'],
+    candidateType: ['fact', 'preference', 'decision', 'tool', 'purchase', 'hobby', 'professional', 'language', 'learning_activity', 'long_term_goal', 'relationship', 'situation', 'other'],
     durability: ['durable', 'temporary', 'ephemeral', 'unknown'],
     assertionMode: ['asserted', 'hypothetical', 'negated', 'question', 'conditional', 'quoted_or_imported', 'inferred', 'unknown'],
     updateIntent: ['new_fact', 'possible_correction', 'possible_supersession', 'addition', 'relation', 'unknown'],
@@ -21,7 +21,8 @@ const enums = Object.freeze({
 const PREDICATE_BY_TYPE = Object.freeze({
     preference: 'user.preference', decision: 'project.decision', tool: 'user.uses_tool',
     purchase: 'user.owns_item', hobby: 'user.hobby', professional: 'user.professional_context',
-    language: 'user.speaks_language', situation: 'user.situation', relationship: 'user.relationship',
+    language: 'user.speaks_language', learning_activity: 'user.learning_activity', long_term_goal: 'user.long_term_goal',
+    situation: 'user.situation', relationship: 'user.relationship',
 });
 const PREDICATE_HINTS = Object.freeze({
     preference: /^(?:user\.preference|prefer(?:s|red)?(?:_[a-z0-9]+)*|prefier(?:o|e|en|imos)(?:_[a-z0-9]+)*|preferred(?:_[a-z0-9]+)*|unidad_preferida(?:_[a-z0-9]+)*)$/u,
@@ -32,6 +33,8 @@ const PREDICATE_HINTS = Object.freeze({
     professional: /^(?:user\.professional_context|professional(?:_context)?(?:_[a-z0-9]+)*|works?(?:_[a-z0-9]+)*|trabaja(?:_[a-z0-9]+)*|profesion(?:_[a-z0-9]+)*)$/u,
     situation: /^(?:user\.situation|situation(?:_[a-z0-9]+)*|lives?(?:_[a-z0-9]+)*|resides?(?:_[a-z0-9]+)*|vive(?:_[a-z0-9]+)*|reside(?:_[a-z0-9]+)*)$/u,
     language: /^(?:user\.speaks_language|language|speaks?|habla|hablo|idioma)$/u,
+    learning_activity: /^(?:user\.learning_activity|learning(?:_activity)?|learn(?:s|ing|ed)?(?:_[a-z0-9]+)*|aprendizaje|aprend(?:e|iendo|i[oó])(?:_[a-z0-9]+)*)$/u,
+    long_term_goal: /^(?:user\.long_term_goal|long_?term_?goal|goal|goals|meta(?:s)?|objetivo(?:s)?(?:_a_largo_plazo)?)$/u,
     relationship: /^(?:user\.relationship|partner_of|sibling_of|brother_of|sister_of|friend_of|colleague_of|relationship|relaci[oó]n|herman[oa]|amig[oa]|compañer[oa]|pareja)$/u,
 });
 const PREDICATE_LABELS = Object.freeze([
@@ -43,6 +46,8 @@ const PREDICATE_LABELS = Object.freeze([
     'user.hobby', 'hobby', 'enjoy', 'enjoys', 'practice', 'practices', 'pasatiempo', 'aficion',
     'user.professional_context', 'professional', 'professional_context', 'work', 'works', 'trabaja', 'profesion',
     'user.speaks_language', 'language', 'speaks', 'speak', 'habla', 'hablo', 'idioma',
+    'user.learning_activity', 'learning', 'learning_activity', 'learn', 'learns', 'aprendizaje', 'aprende', 'aprendiendo',
+    'user.long_term_goal', 'long_term_goal', 'goal', 'goals', 'meta', 'metas', 'objetivo', 'objetivos',
     'user.situation', 'situation', 'live', 'lives', 'reside', 'resides', 'vive',
     'user.relationship', 'partner_of', 'sibling_of', 'brother_of', 'sister_of', 'friend_of', 'colleague_of',
     'relationship', 'relación', 'hermano', 'hermana', 'amigo', 'amiga', 'compañero', 'compañera', 'pareja', 'user.note',
@@ -55,10 +60,11 @@ const candidateSchema = {
         'durability', 'linguistic_confidence', 'assertion_mode', 'temporal_hints', 'update_intent',
         'sensitivity', 'suggested_disposition', 'evidence_quote'],
     properties: {
-        candidate_type: { type: 'string', enum: enums.candidateType },
+        candidate_type: { type: 'string', enum: enums.candidateType,
+            description: 'learning_activity means only explicitly stated current study; it does not imply mastery or a human language ability. long_term_goal means only an explicit goal. Both always require review.' },
         subject_text: { ...nullableString, description: 'Use exactly "user" only for an explicit first-person fact about the speaker; null if the subject is not explicit. Use a textual name for another person or exact project/workstream phrase from evidence, never an entity ID.' },
         predicate: { type: 'string', enum: PREDICATE_LABELS,
-            description: 'Controlled semantic label only. The local validator maps compatible labels to canonical A1 predicates; do not invent a predicate.' },
+            description: 'Controlled semantic label only. The local validator maps compatible labels to canonical A1 predicates; do not invent a predicate. user.learning_activity and user.long_term_goal are review-only.' },
         value_text: { type: 'string', minLength: 1, maxLength: 2000 },
         mentioned_person_text: nullableString,
         durability: { type: 'string', enum: enums.durability },

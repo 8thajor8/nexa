@@ -15,6 +15,10 @@ const AUTO_PREDICATES = Object.freeze({
     situation: new Set(['user.situation']),
     relationship: new Set(['user.relationship']),
 });
+const REVIEW_ONLY_PREDICATES = Object.freeze({
+    learning_activity: new Set(['user.learning_activity']),
+    long_term_goal: new Set(['user.long_term_goal']),
+});
 
 const SENSITIVE_PATTERNS = Object.freeze([
     ['health', /\b(?:diagnosis|diagnosed|illness|disease|medication|medicine|therapy|depression|anxiety|pregnant|pregnancy|migraine|diabetes|asthma|salud|diagn[oó]stico|enfermedad|medicaci[oó]n|terapia|depresi[oó]n|ansiedad|embarazad[oa]|migrañas?|diabetes|asma|tratamiento|s[ií]ntoma)\b/iu],
@@ -89,11 +93,14 @@ function policyDecision(candidate, validated, snapshot) {
     if (sensitivity !== 'none') return { disposition: 'ask', sensitivity, reasons: ['sensitive_or_unknown_category'] };
     const boundedDecisionRecord = isBoundedDecisionRecord(candidate);
     if (candidate.durability === 'ephemeral') return { disposition: 'ignore', sensitivity, reasons: ['ephemeral_information'] };
-    if (candidate.durability !== 'durable' && !boundedDecisionRecord)
+    const reviewOnly = Object.hasOwn(REVIEW_ONLY_PREDICATES, candidate.candidate_type);
+    if (candidate.durability !== 'durable' && !boundedDecisionRecord && !reviewOnly)
         return { disposition: 'ignore', sensitivity, reasons: ['durability_not_established'] };
     if (candidate.linguistic_confidence < MAX_POLICY_CONFIDENCE)
         return { disposition: 'ignore', sensitivity, reasons: ['confidence_below_policy_threshold'] };
-    if (!DURABLE_TYPES.has(candidate.candidate_type) || !AUTO_PREDICATES[candidate.candidate_type].has(candidate.predicate))
+    const autoPredicate = AUTO_PREDICATES[candidate.candidate_type]?.has(candidate.predicate) ?? false;
+    const reviewPredicate = REVIEW_ONLY_PREDICATES[candidate.candidate_type]?.has(candidate.predicate) ?? false;
+    if ((!DURABLE_TYPES.has(candidate.candidate_type) || !autoPredicate) && !reviewPredicate)
         return { disposition: 'ignore', sensitivity, reasons: ['category_or_predicate_not_allowlisted'] };
     if (candidate.temporal_hints.certainty === 'uncertain'
         || (candidate.temporal_hints.certainty === 'explicit' && candidate.temporal_hints.raw_text === null))
@@ -134,6 +141,10 @@ function policyDecision(candidate, validated, snapshot) {
     }
     if (candidate.candidate_type === 'relationship')
         return { disposition: 'ask', sensitivity, reasons: ['relationship_requires_review'] };
+    if (reviewOnly)
+        return { disposition: 'ask', sensitivity,
+            reasons: [candidate.candidate_type === 'learning_activity' ? 'learning_activity_requires_review' : 'long_term_goal_requires_review'],
+            entityResolution: { status: 'self', entityId: snapshot?.snapshot.self_person_id ?? null } };
 
     if (snapshot) {
         const retrieved = retrieveCandidates(snapshot, {
