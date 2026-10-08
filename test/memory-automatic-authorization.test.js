@@ -50,19 +50,19 @@ function claimsFor(request, overrides = {}) {
         snapshotDigest: binding.snapshotDigest, permissionScopes: [...binding.permissionScopes], ...overrides };
 }
 
-test('matching synthetic ADD context is policy-eligible only to request authorization and never authorized', () => {
+test('caller-supplied claims cannot resolve Self or authorize ADD even when their hashes match', () => {
     const text = 'También tengo una Fender.';
     const request = input(text, candidate(text), envelope([['user.owns_item', 'Ibanez']]));
     const result = assessAutomaticMemoryAuthorization({ ...request, contextClaims: claimsFor(request) });
-    assert.equal(result.policyEligibility, 'eligible');
+    assert.equal(result.policyEligibility, 'denied');
     assert.equal(result.authorizationRequestEligible, false);
     assert.equal(result.authorizationRequestStatus, 'blocked_trusted_context_unavailable');
-    assert.equal(result.operation, 'ADD');
-    assert.equal(result.operationClaimsMatch, true);
+    assert.equal(result.operation, 'ASK');
+    assert.equal(result.operationClaimsMatch, false);
     assert.equal(result.claims.evidenceMatches, true);
     assert.equal(result.claims.operationMatches, true);
     assert.equal(result.claims.snapshotMatches, true);
-    assert.equal(result.claims.permissionScopeMatches, true);
+    assert.equal(result.claims.permissionScopeMatches, false);
     assert.equal(result.authorization.status, 'denied');
     assert.equal(result.authorization.granted, false);
     assert.equal(result.executable, false);
@@ -145,15 +145,15 @@ test('third-party and textual-only project candidates are not eligible for autom
     assert.equal(project.authorization.granted, false);
 });
 
-test('REPLACE requires a future trusted operation-bound confirmation; generic and mismatched confirmations fail closed', () => {
+test('caller claims cannot select a Self REPLACE target or simulate operation-bound confirmation', () => {
     const text = 'Ya no uso mi laptop Acer; ahora uso una Lenovo.';
     const request = input(text, candidate(text, { candidate_type: 'tool', predicate: 'user.uses_tool',
         value_text: 'Lenovo', update_intent: 'possible_correction' }), envelope([['user.uses_tool', 'Acer']]));
     const claims = claimsFor(request);
     const replace = assessAutomaticMemoryAuthorization({ ...request, contextClaims: claims });
-    assert.equal(replace.operation, 'REPLACE');
-    assert.equal(replace.policyEligibility, 'confirmation_required');
-    assert.equal(replace.confirmation.required, true);
+    assert.equal(replace.operation, 'ASK');
+    assert.equal(replace.policyEligibility, 'denied');
+    assert.equal(replace.confirmation.required, false);
     assert.equal(replace.confirmation.trustedProofAvailable, false);
     assert.equal(replace.authorization.granted, false);
 

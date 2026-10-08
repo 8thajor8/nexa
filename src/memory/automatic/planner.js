@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { canonicalSubject } from '../entities.js';
 import { validateMemoryStore } from '../schema.js';
+import { canonicalSubject } from '../entities.js';
 import { evaluateAutomaticMemoryPolicy, snapshotFingerprint } from './policy.js';
 import { normalizeAutomaticMemoryProposal, validateAutomaticMemoryCandidates } from './schema.js';
 
@@ -25,6 +25,14 @@ function includesExactText(haystack, needle) {
     return fragment.length > 0 && source.includes(fragment);
 }
 
+function activeSelfAssertions(envelope, predicate) {
+    const selfId = envelope?.snapshot?.self_person_id;
+    if (typeof selfId !== 'string') return [];
+    return envelope.snapshot.assertions.filter(record => record.status === 'active'
+        && canonicalSubject(record.subject, envelope.snapshot).id === selfId
+        && record.predicate === predicate);
+}
+
 function validSnapshotEnvelope(envelope) {
     if (!exactRecord(envelope, ['snapshot', 'revision', 'digest'])
         || !Number.isSafeInteger(envelope.revision) || envelope.revision < 0
@@ -32,19 +40,6 @@ function validSnapshotEnvelope(envelope) {
     try { validateMemoryStore(envelope.snapshot); } catch { return false; }
     return envelope.revision === envelope.snapshot.revision
         && envelope.digest === snapshotFingerprint(envelope);
-}
-
-function isStructuralSelf(subjectText, snapshot) {
-    return normalizedText(subjectText ?? '') === 'user'
-        && snapshot?.snapshot.self_person_id
-        && snapshot.snapshot.entities.some(entity => entity.id === snapshot.snapshot.self_person_id && entity.type === 'person');
-}
-
-function activeSelfAssertions(snapshot, predicate) {
-    if (!snapshot) return [];
-    const selfId = snapshot.snapshot.self_person_id;
-    return snapshot.snapshot.assertions.filter(record => record.status === 'active' && record.predicate === predicate
-        && canonicalSubject(record.subject, snapshot.snapshot).id === selfId);
 }
 
 function operation(type, candidateIndex, reasonCodes, extra = {}) {
@@ -60,34 +55,26 @@ function planOne(candidate, validated, policyResult, snapshot) {
     }
 
     if (policyResult.disposition === 'ask') {
-        const correction = ['possible_correction', 'possible_supersession'].includes(candidate.update_intent)
-            && policyResult.reasonCodes.includes('correction_requires_explicit_target_review');
-        if (!correction) return operation('ASK', validated.index, policyResult.reasonCodes);
-
-        if (candidate.assertion_mode !== 'asserted' || validated.evidence.quotedOrImported
-            || policyResult.sensitivity !== 'none' || candidate.temporal_hints.certainty !== 'none'
-            || candidate.temporal_hints.raw_text !== null || !snapshot
-            || !isStructuralSelf(candidate.subject_text, snapshot) || candidate.mentioned_person_text
-            || !includesExactText(candidate.evidence_quote, candidate.value_text)) {
-            return operation('ASK', validated.index, ['replace_evidence_or_subject_insufficient']);
-        }
-        const matches = activeSelfAssertions(snapshot, candidate.predicate)
-            .filter(record => record.object?.type === 'text'
+        if (policyResult.reasonCodes.includes('possible_contradiction_requires_review')
+            && policyResult.entityResolution?.status === 'self'
+            && policyResult.entityResolution.entityId === snapshot?.snapshot.self_person_id
+            && ['possible_correction', 'possible_supersession'].includes(candidate.update_intent)) {
+            const existing = activeSelfAssertions(snapshot, candidate.predicate);
+            const exactTarget = existing.filter(record => record.object?.type === 'text'
                 && includesExactText(candidate.evidence_quote, record.object.value)
                 && normalizedText(record.object.value) !== normalizedText(candidate.value_text));
-        if (matches.length !== 1) return operation('ASK', validated.index, [
-            matches.length === 0 ? 'replace_target_not_found_in_evidence' : 'replace_target_ambiguous',
-        ]);
-        return operation('REPLACE', validated.index, ['unique_prior_value_in_evidence', 'explicit_confirmation_required'],
-            { targetAssertionId: matches[0].id });
+            if (existing.length === 1 && exactTarget.length === 1)
+                return operation('REPLACE', validated.index, ['exact_self_target_requires_confirmation'],
+                    { targetAssertionId: exactTarget[0].id });
+        }
+        return operation('ASK', validated.index, policyResult.reasonCodes);
     }
 
     if (policyResult.disposition !== 'auto_save')
         return operation('ASK', validated.index, ['policy_disposition_unrecognized']);
     if (policyResult.entityResolution.status === 'textual_only')
         return operation('ASK', validated.index, ['canonical_project_identity_unavailable']);
-    if (!snapshot || policyResult.entityResolution.status !== 'self'
-        || !isStructuralSelf(candidate.subject_text, snapshot) || candidate.mentioned_person_text)
+    if (!snapshot || policyResult.entityResolution.status !== 'self' || candidate.mentioned_person_text)
         return operation('ASK', validated.index, ['canonical_self_required']);
     if (policyResult.entityResolution.entityId !== snapshot.snapshot.self_person_id)
         return operation('ASK', validated.index, ['self_resolution_mismatch']);
@@ -115,7 +102,9 @@ function planOne(candidate, validated, policyResult, snapshot) {
  * Plan outcomes are advisory and cannot be passed to MemoryService as write requests.
  */
 export function planAutomaticMemoryPersistence(input) {
-    if (!exactRecord(input, ['text', 'proposal', 'snapshot'])
+    const keys = input && Object.hasOwn(input, 'trustedSpeakerContext')
+        ? ['text', 'proposal', 'snapshot', 'trustedSpeakerContext'] : ['text', 'proposal', 'snapshot'];
+    if (!exactRecord(input, keys)
         || typeof input.text !== 'string' || !input.text.isWellFormed()
         || (input.snapshot !== null && !validSnapshotEnvelope(input.snapshot))) {
         return { success: false, error: { code: 'persistence_plan_input_invalid' } };
@@ -129,7 +118,8 @@ export function planAutomaticMemoryPersistence(input) {
     const validated = validateAutomaticMemoryCandidates(normalized.proposal, input.text);
     if (!validated.success)
         return { success: false, error: { code: validated.error.code } };
-    const policy = evaluateAutomaticMemoryPolicy(validated.candidates, { snapshot: input.snapshot });
+    const policy = evaluateAutomaticMemoryPolicy(validated.candidates, { snapshot: input.snapshot,
+        ...(input.trustedSpeakerContext ? { trustedSpeakerContext: input.trustedSpeakerContext } : {}) });
     const decisions = policy.candidates.map((item, index) => planOne(
         validated.candidates[index].proposal ?? {},
         validated.candidates[index],

@@ -3,6 +3,7 @@ import { resolveEntityMentions, retrieveCandidates } from '../retrieval.js';
 import { validateMemoryStore } from '../schema.js';
 import { AUTOMATIC_MEMORY_POLICY_VERSION, parseAutomaticMemoryProposal } from './schema.js';
 import { screenMemorySecret } from '../secret-screening.js';
+import { consumeTrustedSpeakerIdentity, trustedSpeakerIdentityDetails } from '../../core/trusted-speaker-identity.js';
 
 const AUTO_PREDICATES = Object.freeze({
     preference: new Set(['user.preference']),
@@ -68,7 +69,7 @@ function sensitiveCategory(candidate) {
     return 'none';
 }
 
-function policyDecision(candidate, validated, snapshot) {
+function policyDecision(candidate, validated, snapshot, trustedSpeaker) {
     const reasons = [];
     if (validated.secretDetected) return { disposition: 'ignore', sensitivity: 'credential', reasons: ['secret_detected'] };
     if (!validated.evidence.verified) return { disposition: 'ignore', sensitivity: 'unknown', reasons: [validated.validationCode ?? 'evidence_unverified'] };
@@ -105,8 +106,6 @@ function policyDecision(candidate, validated, snapshot) {
     if (candidate.temporal_hints.certainty === 'uncertain'
         || (candidate.temporal_hints.certainty === 'explicit' && candidate.temporal_hints.raw_text === null))
         return { disposition: 'ask', sensitivity, reasons: ['temporal_scope_uncertain'] };
-    if (candidate.update_intent === 'possible_correction' || candidate.update_intent === 'possible_supersession')
-        return { disposition: 'ask', sensitivity, reasons: ['correction_requires_explicit_target_review'] };
     if (candidate.update_intent === 'unknown' || candidate.update_intent === 'relation')
         return { disposition: 'ask', sensitivity, reasons: ['update_or_relation_requires_review'] };
     if (negativePreferencePreserved) reasons.push('explicit_negative_preference');
@@ -122,7 +121,11 @@ function policyDecision(candidate, validated, snapshot) {
     }
 
     const subject = stableText(candidate.subject_text ?? '');
-    const isSelf = Boolean(snapshot && snapshot.snapshot.self_person_id
+    const isSelf = Boolean(trustedSpeaker?.origin === 'direct_user'
+        && trustedSpeaker.authenticationState === 'os_account_session_unverified'
+        && trustedSpeaker.selfBindingStatus === 'linked'
+        && trustedSpeaker.selfPersonId === snapshot?.snapshot.self_person_id
+        && snapshot && snapshot.snapshot.self_person_id
         && SELF_ROLE_LABELS.has(subject)
         && snapshot.snapshot.entities.some(entity => entity.id === snapshot.snapshot.self_person_id && entity.type === 'person'));
     if (!isSelf && candidate.candidate_type !== 'decision')
@@ -144,7 +147,7 @@ function policyDecision(candidate, validated, snapshot) {
     if (reviewOnly)
         return { disposition: 'ask', sensitivity,
             reasons: [candidate.candidate_type === 'learning_activity' ? 'learning_activity_requires_review' : 'long_term_goal_requires_review'],
-            entityResolution: { status: 'self', entityId: snapshot?.snapshot.self_person_id ?? null } };
+            entityResolution: { status: isSelf ? 'self' : 'unresolved', entityId: isSelf ? snapshot.snapshot.self_person_id : null } };
 
     if (snapshot) {
         const retrieved = retrieveCandidates(snapshot, {
@@ -156,6 +159,8 @@ function policyDecision(candidate, validated, snapshot) {
         const samePredicate = retrieved.assertions.length > 0;
         if (samePredicate && candidate.update_intent !== 'addition')
             return { disposition: 'ask', sensitivity, reasons: ['possible_contradiction_requires_review'], entityResolution: { status: isSelf ? 'self' : 'not_required', entityId: isSelf ? snapshot.snapshot.self_person_id : null } };
+        if (!samePredicate && ['possible_correction', 'possible_supersession'].includes(candidate.update_intent))
+            return { disposition: 'ask', sensitivity, reasons: ['correction_target_missing'], entityResolution: { status: isSelf ? 'self' : 'not_required', entityId: isSelf ? snapshot.snapshot.self_person_id : null } };
     }
 
     reasons.push(boundedDecisionRecord ? 'bounded_project_decision_record' : 'low_risk_durable_explicit_candidate');
@@ -165,16 +170,26 @@ function policyDecision(candidate, validated, snapshot) {
             entityId: isSelf && snapshot ? snapshot.snapshot.self_person_id : null } };
 }
 
-/** Pure recommendation policy. It has no service, repository, authorization, or commit dependency. */
+/** Pure recommendation policy. Self requires an opaque, current-turn identity capability. */
 export function evaluateAutomaticMemoryPolicy(validatedCandidates, options = {}) {
     if (!options || typeof options !== 'object' || Array.isArray(options)
         || (Object.getPrototypeOf(options) !== Object.prototype && Object.getPrototypeOf(options) !== null)
-        || Reflect.ownKeys(options).some(key => key !== 'snapshot')) throw new TypeError('candidate_evaluation_invalid');
+        || Reflect.ownKeys(options).some(key => !['snapshot', 'speakerIdentityCapability', 'trustedSpeakerContext'].includes(key))) throw new TypeError('candidate_evaluation_invalid');
     for (const key of Reflect.ownKeys(options)) {
         const descriptor = Object.getOwnPropertyDescriptor(options, key);
         if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) throw new TypeError('candidate_evaluation_invalid');
     }
     const snapshot = options.snapshot ?? null;
+    const firstRuntime = validatedCandidates?.[0]?.runtime;
+    const sourceTextSha256 = firstRuntime?.sourceTextSha256;
+    const allSameSource = Array.isArray(validatedCandidates) && validatedCandidates.every(item =>
+        item?.runtime?.sourceTextSha256 === sourceTextSha256);
+    const trustedSpeakerContext = options.trustedSpeakerContext
+        ?? (options.speakerIdentityCapability && allSameSource
+            ? consumeTrustedSpeakerIdentity(options.speakerIdentityCapability, sourceTextSha256) : null);
+    const trustedSpeaker = trustedSpeakerIdentityDetails(trustedSpeakerContext);
+    const contextMatchesSource = Boolean(trustedSpeaker && allSameSource
+        && trustedSpeaker.sourceTextSha256 === sourceTextSha256);
     if (!Array.isArray(validatedCandidates)) throw new TypeError('candidate_evaluation_invalid');
     if (snapshot && (Reflect.ownKeys(snapshot).length !== 3 || !['snapshot', 'revision', 'digest'].every(key => Object.hasOwn(snapshot, key))
         || !Number.isSafeInteger(snapshot.revision) || typeof snapshot.digest !== 'string')) throw new TypeError('memory_snapshot_invalid');
@@ -213,7 +228,7 @@ export function evaluateAutomaticMemoryPolicy(validatedCandidates, options = {})
                 updateIntent: 'unknown', temporalStatus: 'unknown' };
         }
         const decision = validated.proposal
-            ? policyDecision(validated.proposal, validated, snapshot)
+            ? policyDecision(validated.proposal, validated, snapshot, contextMatchesSource ? trustedSpeaker : null)
             : { disposition: 'ignore', sensitivity: validated.secretDetected ? 'credential' : 'unknown',
                 reasons: [validated.secretDetected ? 'secret_detected' : (validated.validationCode ?? 'candidate_unavailable')] };
         // The model suggestion is visible for offline comparison, never used by the policy.
@@ -233,7 +248,11 @@ export function evaluateAutomaticMemoryPolicy(validatedCandidates, options = {})
             temporalStatus: validated.proposal?.temporal_hints.certainty ?? 'unknown',
         };
     });
-    return { success: true, policyVersion: AUTOMATIC_MEMORY_POLICY_VERSION, candidates: decisions };
+    const identityCanBeHandedToAuthorization = Boolean(contextMatchesSource
+        && trustedSpeaker?.selfBindingStatus === 'linked'
+        && decisions.some(item => item.disposition === 'auto_save' || item.reasonCodes.includes('possible_contradiction_requires_review')));
+    return { success: true, policyVersion: AUTOMATIC_MEMORY_POLICY_VERSION, candidates: decisions,
+        ...(identityCanBeHandedToAuthorization ? { speakerIdentityContext: trustedSpeakerContext } : {}) };
 }
 
 export function snapshotFingerprint(snapshot) {

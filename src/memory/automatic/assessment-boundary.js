@@ -4,6 +4,7 @@ import { isCurrentAutomaticMemoryConsent, screenAutomaticMemoryTurn,
 import { validateAutomaticMemoryCandidates } from './schema.js';
 import { evaluateAutomaticMemoryPolicy } from './policy.js';
 import { getAutomaticMemorySourcePolicy } from './source-registry.js';
+import { trustedSpeakerIdentityBoundary } from '../../core/trusted-speaker-identity.js';
 
 const EXPOSURE_KINDS = new Set(['assistant_output', 'tool_result', 'retrieved_memory', 'derived_external_data']);
 
@@ -31,11 +32,11 @@ function denied(code) {
  * it only behind the agent's explicit, disabled-by-default assessment gate.
  */
 export function createAutomaticMemoryAssessmentBoundary(options = {}) {
-    if (!options || (Reflect.ownKeys(options).length !== 4 && Reflect.ownKeys(options).length !== 5))
+    if (!options || Reflect.ownKeys(options).length < 4 || Reflect.ownKeys(options).length > 5)
         throw new TypeError('automatic_memory_assessment_boundary_invalid');
-    exactObject(options, Reflect.ownKeys(options).includes('timeoutMs')
-        ? ['detector', 'consentStore', 'analysisEnabled', 'isConversationExcluded', 'timeoutMs']
-        : ['detector', 'consentStore', 'analysisEnabled', 'isConversationExcluded'],
+    const boundaryKeys = ['detector', 'consentStore', 'analysisEnabled', 'isConversationExcluded'];
+    if (Reflect.ownKeys(options).includes('timeoutMs')) boundaryKeys.push('timeoutMs');
+    exactObject(options, boundaryKeys,
     'automatic_memory_assessment_boundary_invalid');
     const { detector, consentStore, analysisEnabled, isConversationExcluded,
         timeoutMs = AUTOMATIC_MEMORY_ASSESSMENT_TIMEOUT_MS } = options;
@@ -52,10 +53,12 @@ export function createAutomaticMemoryAssessmentBoundary(options = {}) {
     let exposureOverflow = false;
 
     function consume(input) {
-        if (!input || (Reflect.ownKeys(input).length !== 3 && Reflect.ownKeys(input).length !== 4))
+        if (!input || Reflect.ownKeys(input).length < 3 || Reflect.ownKeys(input).length > 5)
             throw new TypeError('automatic_memory_assessment_input_invalid');
-        exactObject(input, Reflect.ownKeys(input).includes('signal')
-            ? ['capability', 'recipient', 'text', 'signal'] : ['capability', 'recipient', 'text'],
+        const inputKeys = ['capability', 'recipient', 'text'];
+        if (Reflect.ownKeys(input).includes('signal')) inputKeys.push('signal');
+        if (Reflect.ownKeys(input).includes('speakerIdentityCapability')) inputKeys.push('speakerIdentityCapability');
+        exactObject(input, inputKeys,
         'automatic_memory_assessment_input_invalid');
         const context = consumeTrustedLocalTurnContext(input.capability, input.recipient, input.text);
         if (input.signal !== undefined && !(input.signal instanceof AbortSignal))
@@ -159,8 +162,15 @@ export function createAutomaticMemoryAssessmentBoundary(options = {}) {
 
         const validated = validateAutomaticMemoryCandidates(settled.value.proposal, input.text);
         if (!validated.success) return denied('candidate_output_invalid');
-        const policy = evaluateAutomaticMemoryPolicy(validated.candidates);
+        let speakerIdentityCapability = null;
+        if (input.speakerIdentityCapability) {
+            const identity = await trustedSpeakerIdentityBoundary.resolveTurn({ capability: input.speakerIdentityCapability,
+                recipient: input.recipient, text: input.text });
+            if (identity.success) speakerIdentityCapability = identity.capability;
+        }
+        const policy = evaluateAutomaticMemoryPolicy(validated.candidates, { speakerIdentityCapability });
         return Object.freeze({ success: true, assessed: true, candidates: policy.candidates,
+            ...(policy.speakerIdentityContext ? { speakerIdentityContext: policy.speakerIdentityContext } : {}),
             authorizationGranted: false, writeReady: false, persisted: false });
     }
 

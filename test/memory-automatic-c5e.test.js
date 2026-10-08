@@ -57,7 +57,7 @@ test('C.5e extraction contract splits independent facts and distinguishes techno
     assert.ok(result.policy.candidates.every(item => item.entityResolution.status === 'unresolved'));
 });
 
-test('C.5e review-only learning activity never auto-saves, even with a synthetic canonical Self snapshot', () => {
+test('C.5f keeps Self unresolved without a linked speaker and review-only activity remains review-only', () => {
     const result = assess(MULTI_FACT, [
         candidate('Estoy aprendiendo TypeScript.', { candidate_type: 'learning_activity',
             predicate: 'user.learning_activity', value_text: 'Estoy aprendiendo TypeScript.', durability: 'temporary',
@@ -66,10 +66,10 @@ test('C.5e review-only learning activity never auto-saves, even with a synthetic
             value_text: 'Prefiero trabajar con React en mis proyectos personales.',
             evidence_quote: 'prefiero trabajar con React en mis proyectos personales' }),
     ], selfSnapshot());
-    assert.deepEqual(result.policy.candidates.map(item => item.disposition), ['ask', 'auto_save']);
-    assert.deepEqual(result.policy.candidates[0].reasonCodes, ['learning_activity_requires_review']);
-    assert.equal(result.policy.candidates[0].entityResolution.entityId, SELF);
-    assert.equal(result.policy.candidates[1].entityResolution.entityId, SELF);
+    assert.deepEqual(result.policy.candidates.map(item => item.disposition), ['ask', 'ask']);
+    assert.deepEqual(result.policy.candidates[0].reasonCodes, ['subject_not_canonically_resolved']);
+    assert.equal(result.policy.candidates[0].entityResolution.entityId, null);
+    assert.equal(result.policy.candidates[1].entityResolution.entityId, null);
     assert.equal(result.policy.candidates.some(item => item.authorizationGranted === true), false);
 });
 
@@ -77,7 +77,7 @@ test('C.5e synthetic calibration matrix keeps uncertainty, sensitive facts, thir
     const snapshot = selfSnapshot();
     const cases = [
         { name: 'stable music preference', text: 'Me gusta escuchar jazz.', candidate: candidate('Me gusta escuchar jazz.',
-            { value_text: 'Me gusta escuchar jazz.', evidence_quote: 'Me gusta escuchar jazz.' }), expected: 'auto_save' },
+            { value_text: 'Me gusta escuchar jazz.', evidence_quote: 'Me gusta escuchar jazz.' }), expected: 'ask' },
         { name: 'explicit long-term goal', text: 'Mi objetivo a largo plazo es mejorar como programador.',
             candidate: candidate('Mi objetivo a largo plazo es mejorar como programador.', { candidate_type: 'long_term_goal',
                 predicate: 'objetivo', value_text: 'Mejorar como programador.', evidence_quote: 'Mi objetivo a largo plazo es mejorar como programador.' }),
@@ -85,7 +85,7 @@ test('C.5e synthetic calibration matrix keeps uncertainty, sensitive facts, thir
         { name: 'change of opinion', text: 'Ahora prefiero té en vez de café.', candidate: candidate('Ahora prefiero té en vez de café.',
             { value_text: 'Prefiere té en vez de café.', update_intent: 'possible_correction', evidence_quote: 'Ahora prefiero té en vez de café.' }), expected: 'ask' },
         { name: 'negative preference', text: 'No me gusta el café.', candidate: candidate('No me gusta el café.',
-            { value_text: 'No me gusta el café.', assertion_mode: 'negated', evidence_quote: 'No me gusta el café.' }), expected: 'auto_save' },
+            { value_text: 'No me gusta el café.', assertion_mode: 'negated', evidence_quote: 'No me gusta el café.' }), expected: 'ask' },
         { name: 'third-party fact', text: 'Coti trabaja en un hospital.', candidate: candidate('Coti trabaja en un hospital.',
             { candidate_type: 'professional', predicate: 'user.professional_context', subject_text: 'Coti',
                 mentioned_person_text: 'Coti', value_text: 'Trabaja en un hospital.', evidence_quote: 'Coti trabaja en un hospital.' }), expected: 'ask' },
@@ -106,8 +106,8 @@ test('C.5e synthetic calibration matrix keeps uncertainty, sensitive facts, thir
     });
     assert.ok(observed.every(item => item.evidenceVerified));
     assert.deepEqual(observed.map(item => item.actual), observed.map(item => item.expected));
-    assert.equal(observed.filter(item => item.actual === 'auto_save').length, 2);
-    assert.equal(observed.filter(item => item.actual === 'ask').length, 5);
+    assert.equal(observed.filter(item => item.actual === 'auto_save').length, 0);
+    assert.equal(observed.filter(item => item.actual === 'ask').length, 7);
     assert.equal(observed.filter(item => item.actual === 'ignore').length, 2);
     assert.equal(screenAutomaticMemoryTurn('Esta semana prefiero usar modo oscuro.').eligible, false,
         'temporary preference is blocked before extraction');

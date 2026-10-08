@@ -9,6 +9,7 @@ const activeSessions = new Set();
 const contextCapabilities = new WeakMap();
 const exposureCapabilities = new WeakMap();
 const confirmationCapabilities = new WeakMap();
+const speakerCapabilities = new WeakMap();
 let reader, lines, current, currentContext, reading = false;
 
 function denied() {
@@ -26,6 +27,10 @@ function expireContext(capability) {
             state.session.capabilities.delete(state.exposureCapability);
             exposureCapabilities.delete(state.exposureCapability);
         }
+        if (state.speakerCapability) {
+            state.session.capabilities.delete(state.speakerCapability);
+            speakerCapabilities.delete(state.speakerCapability);
+        }
     }
     contextCapabilities.delete(capability);
 }
@@ -35,6 +40,7 @@ function closeSession(session) {
     for (const capability of session.capabilities) {
         contextCapabilities.delete(capability);
         exposureCapabilities.delete(capability);
+        speakerCapabilities.delete(capability);
     }
     for (const capability of session.confirmations) confirmationCapabilities.delete(capability);
     session.capabilities.clear();
@@ -88,19 +94,27 @@ export async function readDirectUserTurn(recipient) {
         current = capability;
         const runtimeContextCapability = Object.freeze(Object.create(null));
         const runtimeExposureCapability = Object.freeze(Object.create(null));
+        const speakerIdentityCapability = Object.freeze(Object.create(null));
         contextCapabilities.set(runtimeContextCapability, {
             recipient, session, turnId, sourceTextSha256, origin: 'local_cli',
             purpose: 'automatic_memory_assessment', consumed: false, exposureCapability: runtimeExposureCapability,
+            speakerCapability: speakerIdentityCapability,
         });
         exposureCapabilities.set(runtimeExposureCapability, {
             recipient, session, turnId, sourceTextSha256, origin: 'local_cli',
             purpose: 'automatic_memory_exposure_recording', consumed: false,
         });
+        speakerCapabilities.set(speakerIdentityCapability, {
+            recipient, session, turnId, sourceTextSha256, origin: 'local_cli', consumed: false,
+            runtimeContextCapability,
+        });
         turns.get(capability).runtimeContextCapability = runtimeContextCapability;
         session.capabilities.add(runtimeContextCapability);
         session.capabilities.add(runtimeExposureCapability);
+        session.capabilities.add(speakerIdentityCapability);
         currentContext = runtimeContextCapability;
-        return Object.freeze({ message: next.value, command, capability, runtimeContextCapability, runtimeExposureCapability });
+        return Object.freeze({ message: next.value, command, capability, runtimeContextCapability,
+            runtimeExposureCapability, speakerIdentityCapability });
     } finally { reading = false; }
 }
 
@@ -117,7 +131,9 @@ function exactConfirmationInput(input) {
         && typeof input.preview === 'string' && input.preview.length <= 4000
         && typeof input.phrase === 'string'
         && (/^CONFIRM ADD [A-F0-9]{8,80}$/u.test(input.phrase)
-            || /^CONFIRM REPLACE mem_[0-9a-f-]{36} [A-F0-9]{8,80}$/u.test(input.phrase));
+            || /^CONFIRM REPLACE mem_[0-9a-f-]{36} [A-F0-9]{8,80}$/u.test(input.phrase)
+            || /^CONFIRM LINK SELF [A-F0-9]{8,80}$/u.test(input.phrase)
+            || /^CONFIRM REVOKE SELF [A-F0-9]{8,80}$/u.test(input.phrase));
 }
 
 function confirmationDisplayText(value) {
@@ -222,6 +238,26 @@ export function consumeTrustedLocalTurnContext(capability, recipient, originalTe
         principalId: state.session.principalId, principalKind: state.session.principalKind,
         origin: state.origin, sourceTextSha256: state.sourceTextSha256,
         purpose: state.purpose, permissionScopes: Object.freeze([]) });
+}
+
+/** Consume a separate, stdin-issued proof for trusted speaker-context resolution.
+ * The returned local principal is a runtime session label, never authentication.
+ */
+export function consumeTrustedLocalSpeakerContext(capability, recipient, originalText) {
+    const state = capability && typeof capability === 'object' ? speakerCapabilities.get(capability) : null;
+    if (!state || state.consumed) throw denied();
+    state.consumed = true;
+    speakerCapabilities.delete(capability);
+    state.session.capabilities.delete(capability);
+    const actualHash = typeof originalText === 'string'
+        ? createHash('sha256').update(originalText, 'utf8').digest('hex') : null;
+    if (state.recipient !== recipient || state.session.closed
+        || state.session.activeTurnId !== state.turnId || currentContext !== state.runtimeContextCapability
+        || actualHash !== state.sourceTextSha256 || runtimeSessions.get(recipient) !== state.session) throw denied();
+    return Object.freeze({ origin: 'direct_user', principalId: state.session.principalId,
+        principalKind: 'local_runtime_session', authenticationState: 'unverified_local_session',
+        sessionId: state.session.sessionId, turnId: state.turnId,
+        sourceTextSha256: state.sourceTextSha256, selfBindingStatus: 'unlinked', selfPersonId: null });
 }
 
 /** Consumes the separate proof used by trusted runtime source-exposure hooks. */

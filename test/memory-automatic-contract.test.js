@@ -41,14 +41,14 @@ function contract(text, proposal, snapshot = envelope()) {
     return createAutomaticMemoryPersistenceContract({ text, proposal: { candidates: [proposal] }, snapshot });
 }
 
-test('B.2a ADD contract is append-only in intent, provenance-honest, and permanently non-executable', () => {
+test('B.2a contract refuses Self resolution from a text label when no trusted identity is supplied', () => {
     const text = 'También tengo una Fender.';
     const before = envelope([['user.owns_item', 'Ibanez']]);
     const beforeHash = createHash('sha256').update(JSON.stringify(before.snapshot)).digest('hex');
     const result = contract(text, candidate(text), before);
     const operation = result.operations[0];
-    assert.equal(operation.operation, 'ADD');
-    assert.equal(operation.targetAssertionId, null);
+    assert.equal(operation.operation, 'ASK');
+    assert.ok(operation.reasonCodes.includes('subject_not_canonically_resolved'));
     assert.equal(operation.executable, false);
     assert.equal(operation.writeReady, false);
     assert.equal(operation.committed, false);
@@ -59,16 +59,14 @@ test('B.2a ADD contract is append-only in intent, provenance-honest, and permane
     assert.equal(createHash('sha256').update(JSON.stringify(before.snapshot)).digest('hex'), beforeHash);
 });
 
-test('REPLACE remains confirmation-gated and requires the exact snapshot target selected by the planner', () => {
+test('B.2a cannot select a Self REPLACE target from subject_text alone', () => {
     const text = 'Ya no uso mi laptop Acer; ahora uso una Lenovo.';
     const current = envelope([['user.uses_tool', 'Acer']]);
     const result = contract(text, candidate(text, { candidate_type: 'tool', predicate: 'user.uses_tool',
         value_text: 'Lenovo', update_intent: 'possible_correction' }), current);
     const operation = result.operations[0];
-    assert.equal(operation.operation, 'REPLACE');
-    assert.equal(operation.targetAssertionId, current.snapshot.assertions[0].id);
-    assert.equal(operation.confirmationRequired, true);
-    assert.equal(operation.authorization.confirmationRequired, true);
+    assert.equal(operation.operation, 'ASK');
+    assert.ok(operation.reasonCodes.includes('subject_not_canonically_resolved'));
     assert.equal(operation.writeReady, false);
 });
 
@@ -95,7 +93,7 @@ test('ambiguous destinations, third parties, textual projects, and duplicates ne
 
     const duplicateText = 'Tengo una Fender.';
     const duplicate = contract(duplicateText, candidate(duplicateText), envelope([['user.owns_item', 'Fender']]));
-    assert.equal(duplicate.operations[0].operation, 'DUPLICATE');
+    assert.equal(duplicate.operations[0].operation, 'ASK', 'deduplication for Self also requires a resolved identity');
     for (const item of [ambiguous, third, project, duplicate]) {
         assert.equal(item.executable, false);
         assert.ok(item.operations.every(op => op.writeReady === false && op.authorization.granted === false));

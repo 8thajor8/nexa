@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { consumeTrustedLocalTurnContext, readDirectUserConfirmation,
     consumeDirectUserConfirmation, isTrustedLocalTurnActive } from '../../core/direct-user-input.js';
+import { consumeTrustedSpeakerAuthorizationContext, trustedSpeakerIdentityDetails } from '../../core/trusted-speaker-identity.js';
 import { createAutomaticMemoryPersistenceContract } from './persistence-contract.js';
 import { normalizeAutomaticMemoryProposal } from './schema.js';
 
@@ -60,13 +61,14 @@ function fail(code) { return { success: false, error: { code } }; }
  * Prepare a private, immutable request from a real current stdin turn and the
  * dry-run B.2a contract. This module has no repository, service, or writer.
  */
-export function prepareAutomaticMemoryAuthorization(input) {
-    const keys = ['text', 'proposal', 'snapshot', 'operationIndex', 'recipient', 'runtimeContextCapability'];
+export async function prepareAutomaticMemoryAuthorization(input) {
+    const keys = ['text', 'proposal', 'snapshot', 'operationIndex', 'recipient', 'runtimeContextCapability', 'speakerIdentityContext'];
     if (!exactRecord(input, keys) || typeof input.text !== 'string' || !input.text.isWellFormed()
         || !Number.isSafeInteger(input.operationIndex) || input.operationIndex < 0
         || !input.recipient || typeof input.recipient !== 'object'
         || !input.runtimeContextCapability || typeof input.runtimeContextCapability !== 'object'
-        || !input.snapshot || typeof input.snapshot !== 'object') return fail('authorization_prepare_input_invalid');
+        || !input.snapshot || typeof input.snapshot !== 'object'
+        || !input.speakerIdentityContext || typeof input.speakerIdentityContext !== 'object') return fail('authorization_prepare_input_invalid');
 
     let turnContext;
     try { turnContext = consumeTrustedLocalTurnContext(input.runtimeContextCapability, input.recipient, input.text); }
@@ -76,8 +78,15 @@ export function prepareAutomaticMemoryAuthorization(input) {
         return fail('trusted_source_turn_invalid');
     }
 
+    const speakerIdentityContext = await consumeTrustedSpeakerAuthorizationContext(input.speakerIdentityContext,
+        { recipient: input.recipient, text: input.text });
+    const speakerIdentity = trustedSpeakerIdentityDetails(speakerIdentityContext);
+    if (!speakerIdentity || speakerIdentity.sessionId !== turnContext.sessionId
+        || speakerIdentity.turnId !== turnContext.turnId || speakerIdentity.sourceTextSha256 !== turnContext.sourceTextSha256
+        || speakerIdentity.selfBindingStatus !== 'linked') return fail('trusted_speaker_identity_invalid');
+
     const contract = createAutomaticMemoryPersistenceContract({ text: input.text,
-        proposal: input.proposal, snapshot: input.snapshot });
+        proposal: input.proposal, snapshot: input.snapshot, trustedSpeakerContext: speakerIdentityContext });
     if (!contract.success) return fail(contract.error?.code ?? 'persistence_contract_invalid');
     const operation = contract.operations[input.operationIndex];
     if (!operation) return fail('authorization_operation_not_found');
@@ -102,6 +111,9 @@ export function prepareAutomaticMemoryAuthorization(input) {
     const requestId = randomUUID();
     const snapshotBinding = Object.freeze({ revision: contract.snapshotBinding.revision,
         digest: contract.snapshotBinding.digest, snapshotSha256: contract.snapshotBinding.snapshotSha256 });
+    const identityBindingSha256 = digestJson({ principalId: speakerIdentity.principalId,
+        sessionId: speakerIdentity.sessionId, sourceTurnId: speakerIdentity.turnId,
+        sourceTextSha256: speakerIdentity.sourceTextSha256, selfPersonId: speakerIdentity.selfPersonId });
     const operationFingerprint = digestJson({ version: 'automatic-memory-b2b7-coordinator-v1',
         operation: operation.operation, candidate, idempotencyKey: operation.idempotency.key,
         sourceBinding: operation.sourceBinding, snapshotBinding,
@@ -116,6 +128,7 @@ export function prepareAutomaticMemoryAuthorization(input) {
     pendingRequests.set(handle, { recipient: input.recipient, requestId, operation: structuredClone(operation),
         candidate: structuredClone(candidate), snapshotBinding, operationFingerprint, preview, phrase,
         sessionId: turnContext.sessionId, sourceTurnId: turnContext.turnId,
+        speakerIdentityContext, identityBindingSha256,
         expiresAt: Date.now() + PENDING_TTL_MS, consumed: false });
     activeByRecipient.set(input.recipient, handle);
     return Object.freeze({ success: true, prepared: true, request: handle, requestId,
@@ -153,6 +166,7 @@ export async function confirmAutomaticMemoryAuthorization(request, recipient) {
     grants.set(capability, { recipient, requestId: state.requestId, operation: state.operation.operation,
         targetAssertionId: state.operation.targetAssertionId ?? null,
         operationFingerprint: state.operationFingerprint, snapshotBinding: state.snapshotBinding,
+        speakerIdentityContext: state.speakerIdentityContext, identityBindingSha256: state.identityBindingSha256,
         sessionId: proof.sessionId, sourceTurnId: state.sourceTurnId,
         confirmationTurnId: proof.confirmationTurnId,
         expiresAt: Date.now() + GRANT_TTL_MS, consumed: false });
@@ -170,13 +184,17 @@ export function consumeAutomaticMemoryAuthorization(capability, expected) {
     const state = capability && typeof capability === 'object' ? grants.get(capability) : null;
     if (!state || state.consumed) return fail('authorization_capability_invalid_or_consumed');
     state.consumed = true;
-    grants.delete(capability);
     const keys = ['recipient', 'operation', 'operationFingerprint', 'snapshotRevision', 'snapshotDigest', 'targetAssertionId'];
+    const identity = trustedSpeakerIdentityDetails(state.speakerIdentityContext);
+    const identityBindingSha256 = identity ? digestJson({ principalId: identity.principalId,
+        sessionId: identity.sessionId, sourceTurnId: identity.turnId,
+        sourceTextSha256: identity.sourceTextSha256, selfPersonId: identity.selfPersonId }) : null;
     if (!exactRecord(expected, keys) || expected.recipient !== state.recipient
         || expected.operation !== state.operation || expected.operationFingerprint !== state.operationFingerprint
         || expected.snapshotRevision !== state.snapshotBinding.revision
         || expected.snapshotDigest !== state.snapshotBinding.digest
         || expected.targetAssertionId !== state.targetAssertionId
+        || identityBindingSha256 !== state.identityBindingSha256
         || Date.now() > state.expiresAt
         || !isTrustedLocalTurnActive(state.recipient, state.sessionId, state.confirmationTurnId)) {
         return fail('authorization_binding_mismatch_or_stale');
@@ -186,7 +204,17 @@ export function consumeAutomaticMemoryAuthorization(capability, expected) {
         operationFingerprint: state.operationFingerprint, snapshotBinding: state.snapshotBinding,
         sessionId: state.sessionId, sourceTurnId: state.sourceTurnId,
         confirmationTurnId: state.confirmationTurnId,
-        targetAssertionId: state.targetAssertionId, executable: false, writeReady: false });
+        targetAssertionId: state.targetAssertionId, trustedSpeakerContext: state.speakerIdentityContext,
+        identityBindingSha256: state.identityBindingSha256, executable: false, writeReady: false });
+}
+
+/** Non-authorizing inspection used only to reconstruct the exact plan inside the repository lock. */
+export function inspectAutomaticMemoryAuthorization(capability) {
+    const state = capability && typeof capability === 'object' ? grants.get(capability) : null;
+    if (!state || (!state.consumed && (Date.now() > state.expiresAt
+        || !isTrustedLocalTurnActive(state.recipient, state.sessionId, state.confirmationTurnId)))) return null;
+    return Object.freeze({ trustedSpeakerContext: state.speakerIdentityContext,
+        identityBindingSha256: state.identityBindingSha256, operationFingerprint: state.operationFingerprint });
 }
 
 /** Cancel pending UI state; this never revokes an already returned grant. */

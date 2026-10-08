@@ -23,7 +23,9 @@ function digest(value) {
  * boundary exists.
  */
 export function createAutomaticMemoryPersistenceContract(input) {
-    if (!exactRecord(input, ['text', 'proposal', 'snapshot'])
+    const keys = input && Object.hasOwn(input, 'trustedSpeakerContext')
+        ? ['text', 'proposal', 'snapshot', 'trustedSpeakerContext'] : ['text', 'proposal', 'snapshot'];
+    if (!exactRecord(input, keys)
         || typeof input.text !== 'string' || !input.text.isWellFormed()
         || (input.snapshot !== null && !exactRecord(input.snapshot, ['snapshot', 'revision', 'digest']))) {
         return { success: false, error: { code: 'persistence_contract_input_invalid' } };

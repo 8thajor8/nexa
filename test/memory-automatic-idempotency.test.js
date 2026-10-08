@@ -206,8 +206,7 @@ function makeReplaceContract(text, store, targetAssertionId) {
     const result = createAutomaticMemoryPersistenceContract({ text, proposal: { candidates: [candidate] }, snapshot });
     assert.equal(result.success, true);
     assert.equal(result.operations.length, 1);
-    assert.equal(result.operations[0].operation, 'REPLACE');
-    assert.equal(result.operations[0].targetAssertionId, targetAssertionId);
+    assert.equal(result.operations[0].operation, 'ASK', 'the production contract has no trusted Self proof');
     return { key: result.operations[0].idempotency.key, snapshot, candidate };
 }
 

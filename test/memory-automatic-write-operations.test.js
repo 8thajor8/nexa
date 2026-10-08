@@ -12,6 +12,7 @@ import { screenMemorySecret } from '../src/memory/secret-screening.js';
 import { planAutomaticMemoryPersistence } from '../src/memory/automatic/planner.js';
 import { snapshotFingerprint } from '../src/memory/automatic/policy.js';
 import { normalizeAutomaticMemoryProposal } from '../src/memory/automatic/schema.js';
+import { validateAutomaticMemoryCandidates } from '../src/memory/automatic/schema.js';
 import { createAutomaticMemoryPersistenceContract } from '../src/memory/automatic/persistence-contract.js';
 import { assessAutomaticMemoryAuthorization } from '../src/memory/automatic/authorization-contract.js';
 
@@ -79,13 +80,33 @@ async function setup(t, { store = emptyStore(), fileSystem = {} } = {}) {
     return { directory, storePath, repository };
 }
 
-function prepareTestOperation({ text, proposal, snapshot, repositoryDigest }) {
+function planWithSyntheticOwnerIdentity({ text, proposal, snapshot, repositoryDigest }) {
+    // This fixture represents a pre-verified synthetic owner only inside this
+    // test-file-local simulator. It is not accepted by production planner or writer APIs.
+    const testOwner = Object.freeze({ kind: 'test_only_verified_owner', selfPersonId: snapshot.snapshot.self_person_id });
     const normalized = normalizeAutomaticMemoryProposal(proposal);
     if (!normalized.success || normalized.proposal.candidates.length !== 1) throw coded('automatic_candidate_invalid');
-    const planned = planAutomaticMemoryPersistence({ text, proposal, snapshot });
-    if (!planned.success || planned.operations.length !== 1) throw coded('automatic_plan_invalid');
-    const operation = planned.operations[0];
-    if (!['ADD', 'REPLACE'].includes(operation.operation)) throw coded('automatic_operation_not_writable_in_test');
+    const validated = validateAutomaticMemoryCandidates(normalized.proposal, text);
+    if (!validated.success) throw coded('automatic_candidate_invalid');
+    const candidate = normalized.proposal.candidates[0];
+    const proof = validated.candidates[0];
+    if (proof.evidence.quotedOrImported || !proof.evidence.verified || candidate.assertion_mode !== 'asserted'
+        || candidate.sensitivity !== 'none' || candidate.mentioned_person_text
+        || !['user', 'self', 'i', 'me', 'my', 'mine', 'myself', 'yo', 'mí', 'mi', 'mis', 'conmigo'].includes(candidate.subject_text?.trim().toLocaleLowerCase('und'))
+        || testOwner.selfPersonId !== snapshot.snapshot.self_person_id
+        || !screenMemorySecret(JSON.stringify(candidate)).safe) throw coded('automatic_candidate_not_eligible_in_test');
+    const existing = snapshot.snapshot.assertions.filter(record => record.status === 'active'
+        && canonicalSubject(record.subject, snapshot.snapshot).id === testOwner.selfPersonId
+        && record.predicate === candidate.predicate);
+    const same = existing.find(record => record.object?.type === 'text' && record.object.value === candidate.value_text);
+    if (same) throw coded('automatic_duplicate_in_test');
+    let operation;
+    if (candidate.update_intent === 'addition') operation = { operation: 'ADD', targetAssertionId: null };
+    else if (['possible_correction', 'possible_supersession'].includes(candidate.update_intent)
+        && existing.length === 1 && existing[0].object?.type === 'text'
+        && candidate.evidence_quote.includes(existing[0].object.value))
+        operation = { operation: 'REPLACE', targetAssertionId: existing[0].id };
+    else throw coded(existing.length > 1 ? 'replace_target_ambiguous' : 'automatic_operation_not_writable_in_test');
     const prepared = { text, proposal: structuredClone(proposal), snapshot: structuredClone(snapshot),
         operation: operation.operation, targetAssertionId: operation.targetAssertionId ?? null,
         candidate: structuredClone(normalized.proposal.candidates[0]), textSha256: createHash('sha256').update(text).digest('hex'),
@@ -130,11 +151,10 @@ async function writePreparedOperationForTest(repository, prepared, permit, confi
     // Recompute the dry-run plan from its frozen inputs. The plan is a selector,
     // never authorization; only the separate private test permit enables this
     // test-file-local writer.
-    const recalculated = planAutomaticMemoryPersistence({ text: prepared.text,
-        proposal: prepared.proposal, snapshot: prepared.snapshot });
-    if (!recalculated.success || recalculated.operations.length !== 1
-        || recalculated.operations[0].operation !== prepared.operation
-        || (recalculated.operations[0].targetAssertionId ?? null) !== prepared.targetAssertionId) {
+    const recalculated = planWithSyntheticOwnerIdentity({ text: prepared.text,
+        proposal: prepared.proposal, snapshot: prepared.snapshot, repositoryDigest: prepared.repositoryDigest });
+    if (recalculated.operation !== prepared.operation
+        || recalculated.targetAssertionId !== prepared.targetAssertionId) {
         throw coded('automatic_plan_changed');
     }
     const current = await repository.readSnapshot();
@@ -189,7 +209,7 @@ async function planned(repository, text, proposal) {
     const snapshot = await repository.readSnapshot();
     const envelope = { snapshot: snapshot.snapshot, revision: snapshot.revision,
         digest: snapshotFingerprint({ snapshot: snapshot.snapshot }) };
-    return prepareTestOperation({ text, proposal, snapshot: envelope, repositoryDigest: snapshot.digest });
+    return planWithSyntheticOwnerIdentity({ text, proposal, snapshot: envelope, repositoryDigest: snapshot.digest });
 }
 
 function priorAssertion({ value = 'Ibanez', predicate = 'user.owns_item', status = 'active', serial = 10 } = {}) {
@@ -238,7 +258,7 @@ test('ADD is append-only, uses inferred provenance, and cannot use a dry-run con
     const text = 'También tengo una Fender.'; const proposal = proposalFor(text);
     const prepared = await planned(f.repository, text, proposal);
     const dryRun = createAutomaticMemoryPersistenceContract({ text, proposal, snapshot: prepared.snapshot });
-    assert.equal(dryRun.operations[0].operation, 'ADD');
+    assert.equal(dryRun.operations[0].operation, 'ASK');
     assert.equal(dryRun.operations[0].executable, false);
     assert.equal(dryRun.operations[0].writeReady, false);
     await assert.rejects(writePreparedOperationForTest(f.repository, prepared, dryRun), { code: 'test_execution_permit_invalid' });
@@ -267,7 +287,7 @@ test('ADD rejects invalid candidates, unresolved identities, secrets, and partia
         const snapshot = await f.repository.readSnapshot();
         const planSnapshot = { snapshot: snapshot.snapshot, revision: snapshot.revision,
             digest: snapshotFingerprint({ snapshot: snapshot.snapshot }) };
-        const attempt = () => prepareTestOperation({ text, proposal, snapshot: planSnapshot,
+        const attempt = () => planWithSyntheticOwnerIdentity({ text, proposal, snapshot: planSnapshot,
             repositoryDigest: snapshot.digest });
         if (proposal.candidates?.[0]?.value_text?.startsWith('sk_live_')) {
             const invalidPlan = planAutomaticMemoryPersistence({ text, proposal,
@@ -336,7 +356,7 @@ test('REPLACE refuses absent or ambiguous evidence targets and identity conflict
         proposal: toolCandidate(ambiguousText, 'Lenovo', { evidence_quote: ambiguousText }),
         snapshot: await envelope(ambiguous.repository) });
     assert.equal(ambiguousPlan.operations[0].operation, 'ASK');
-    assert.ok(ambiguousPlan.operations[0].reasonCodes.includes('replace_target_ambiguous'));
+    assert.ok(ambiguousPlan.operations[0].reasonCodes.includes('subject_not_canonically_resolved'));
 
     const conflictText = 'Dana usa una Lenovo.';
     const conflictProposal = proposalFor(conflictText, { subject_text: 'Dana', mentioned_person_text: 'Dana',

@@ -143,7 +143,8 @@ export async function createAgent({
             const job = { controller, generation };
             activeAutomaticAssessment = job;
             const result = await assessmentBoundary.assess({ capability: pending.runtimeContextCapability,
-                recipient: pending.recipient, text: pending.text, signal: controller.signal });
+                recipient: pending.recipient, text: pending.text, signal: controller.signal,
+                speakerIdentityCapability: pending.speakerIdentityCapability });
             if (activeAutomaticAssessment === job) activeAutomaticAssessment = null;
             if (controller.signal.aborted || generation !== assessmentGeneration)
                 return { success: true, assessed: false, reason: 'assessment_invalidated' };
@@ -568,7 +569,8 @@ ${memoryToPrompt(memory)}
                     && !activeDirectTurn.exposed && !activeDirectTurn.exposureRecordingFailed
                     && typeof response === 'string' && response.trim())
                     pendingAutomaticMemoryAssessment = { text: message,
-                        runtimeContextCapability: turn.runtimeContextCapability, recipient: memory2 ?? agent };
+                        runtimeContextCapability: turn.runtimeContextCapability,
+                        speakerIdentityCapability: turn.speakerIdentityCapability, recipient: memory2 ?? agent };
                 return { done: false, response };
             } finally { releaseDirectUserTurn(turn.capability); }
         });

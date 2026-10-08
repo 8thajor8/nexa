@@ -70,8 +70,11 @@ await nativeFs.writeFile(process.argv[1], JSON.stringify(rawStore, null, 2) + '\
 await repo.open();
 const recipient2 = {};
 const turn2 = await readDirectUserTurn(recipient2);
-const prepared2 = prepareAutomaticMemoryAuthorization({ text: turn2.message, proposal: ${JSON.stringify(prop)}, snapshot,
-  operationIndex: 0, recipient: recipient2, runtimeContextCapability: turn2.runtimeContextCapability });
+const speakerIdentityContext2 = await createSyntheticLinkedSpeakerContext({ turn: turn2, recipient: recipient2,
+  text: turn2.message, selfPersonId: ${JSON.stringify(SELF)} });
+const prepared2 = await prepareAutomaticMemoryAuthorization({ text: turn2.message, proposal: ${JSON.stringify(prop)}, snapshot,
+  operationIndex: 0, recipient: recipient2, runtimeContextCapability: turn2.runtimeContextCapability,
+  speakerIdentityContext: speakerIdentityContext2 });
 const grant2 = await confirmAutomaticMemoryAuthorization(prepared2.request, recipient2);
 const replay = await repo.commitAutomaticOperation({ text: turn2.message, proposal: ${JSON.stringify(prop)}, snapshot,
   operationIndex: 0, recipient: recipient2, capability: grant2.capability });
@@ -114,9 +117,12 @@ console.log('__RESULT__' + JSON.stringify({ outcomes: results.map(item => item.s
             mode === 'raceAdd' ? 'Ibanez' : mode === 'raceReplace' ? 'ThinkPad' : undefined);
         flow = `const recipient2 = {};
 const turn2 = await readDirectUserTurn(recipient2);
+const speakerIdentityContext2 = await createSyntheticLinkedSpeakerContext({ turn: turn2, recipient: recipient2,
+  text: turn2.message, selfPersonId: ${JSON.stringify(SELF)} });
 const snapshot2 = await repo.readAutomaticMemorySnapshot();
-const prepared2 = prepareAutomaticMemoryAuthorization({ text: turn2.message, proposal: ${JSON.stringify(secondProp)}, snapshot: snapshot2,
-  operationIndex: 0, recipient: recipient2, runtimeContextCapability: turn2.runtimeContextCapability });
+const prepared2 = await prepareAutomaticMemoryAuthorization({ text: turn2.message, proposal: ${JSON.stringify(secondProp)}, snapshot: snapshot2,
+  operationIndex: 0, recipient: recipient2, runtimeContextCapability: turn2.runtimeContextCapability,
+  speakerIdentityContext: speakerIdentityContext2 });
 const grant2 = await confirmAutomaticMemoryAuthorization(prepared2.request, recipient2);
 const results = await Promise.allSettled([
   repo.commitAutomaticOperation({ ${operation}, capability: grant.capability }),
@@ -167,6 +173,7 @@ console.log('__RESULT__' + JSON.stringify(result));`;
 import { readDirectUserTurn, closeDirectUserInput } from './src/core/direct-user-input.js';
 import { randomUUID } from 'node:crypto';
 import { prepareAutomaticMemoryAuthorization, confirmAutomaticMemoryAuthorization } from './src/memory/automatic/authorization-coordinator.js';
+import { createSyntheticLinkedSpeakerContext } from './test-support/synthetic-linked-speaker.js';
 import { createJsonMemoryRepository } from './src/memory/json-repository.js';
 import * as nativeFs from 'node:fs/promises';
 const recipient = {};
@@ -199,13 +206,17 @@ const fileSystem = ${JSON.stringify(special)} ? {
 const repo = createJsonMemoryRepository({ storePath: process.argv[1], fileSystem, now: () => '2036-02-03T10:20:30.000Z' });
 await repo.open();
 const turn = await readDirectUserTurn(recipient);
+const bindingState = {};
+const speakerIdentityContext = await createSyntheticLinkedSpeakerContext({ turn, recipient, bindingState,
+  text: turn.message, selfPersonId: ${JSON.stringify(SELF)} });
 const snapshot = await repo.readAutomaticMemorySnapshot();
-const prepared = prepareAutomaticMemoryAuthorization({ text: turn.message,
+const prepared = await prepareAutomaticMemoryAuthorization({ text: turn.message,
   proposal: ${JSON.stringify(prop)}, snapshot, operationIndex: 0, recipient,
-  runtimeContextCapability: turn.runtimeContextCapability });
+  runtimeContextCapability: turn.runtimeContextCapability, speakerIdentityContext });
 ${mode === 'withoutGrant' ? '' : `
 const grant = await confirmAutomaticMemoryAuthorization(prepared.request, recipient);
 `}
+${mode === 'revokeSelfAfterAuth' ? "bindingState.record = { ...bindingState.record, status: 'revoked' };" : ''}
 ${flow}
 await repo.close(); closeDirectUserInput();
 `;
@@ -305,6 +316,17 @@ test('no capability and generic commit cannot publish automatic receipts', async
     await assert.rejects(f.repository.commit({ expectedRevision: current.revision, expectedDigest: current.digest,
         changes: [{ type: 'put', collection: 'automatic_operations', record: receipt }] }), { code: 'memory_invalid_changes' });
     assert.equal((await f.repository.readSnapshot()).revision, 0);
+});
+
+test('a Self binding revoked after authorization but before the write is rejected', async t => {
+    const f = await setup(t, store());
+    const result = await runWorker({ storePath: f.storePath, text: ADD_TEXT, mode: 'revokeSelfAfterAuth' });
+    assert.equal(result.success, false);
+    assert.equal(result.error.code, 'automatic_speaker_identity_mismatch');
+    const after = JSON.parse(await fs.readFile(f.storePath, 'utf8'));
+    assert.equal(after.revision, 0);
+    assert.equal(after.assertions.length, 0);
+    assert.equal(after.automatic_operations.length, 0);
 });
 
 test('stale authorized snapshot burns capability and never writes', async t => {

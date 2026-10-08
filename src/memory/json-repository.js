@@ -5,7 +5,8 @@ import { MemorySchemaError, validateMemoryStore } from './schema.js';
 import { MemoryRepositoryError, applyChanges, contentDigest, immutableSnapshot, prepareCommitRequest } from './repository.js';
 import { createAutomaticMemoryPersistenceContract } from './automatic/persistence-contract.js';
 import { normalizeAutomaticMemoryProposal } from './automatic/schema.js';
-import { consumeAutomaticMemoryAuthorization } from './automatic/authorization-coordinator.js';
+import { consumeAutomaticMemoryAuthorization, inspectAutomaticMemoryAuthorization } from './automatic/authorization-coordinator.js';
+import { trustedSpeakerIdentityBindingIsCurrent, trustedSpeakerIdentityDetails } from '../core/trusted-speaker-identity.js';
 import { screenMemorySecret } from './secret-screening.js';
 
 const processOwners = new Map();
@@ -246,11 +247,17 @@ export function createJsonMemoryRepository({ storePath, fileSystem = {}, now = (
             consumeInvalidAttempt(input);
             return Promise.resolve(automaticFailure('automatic_input_shape_invalid'));
         }
+        const authorizationContext = inspectAutomaticMemoryAuthorization(input.capability);
+        if (!authorizationContext) {
+            consumeInvalidAttempt(input);
+            return Promise.resolve(automaticFailure('automatic_authorization_rejected'));
+        }
         let contract;
         let normalized;
         try {
             contract = createAutomaticMemoryPersistenceContract({ text: input.text,
-                proposal: input.proposal, snapshot: input.snapshot });
+                proposal: input.proposal, snapshot: input.snapshot,
+                trustedSpeakerContext: authorizationContext.trustedSpeakerContext });
             normalized = normalizeAutomaticMemoryProposal(input.proposal);
         } catch (error) {
             consumeInvalidAttempt(input);
@@ -278,6 +285,10 @@ export function createJsonMemoryRepository({ storePath, fileSystem = {}, now = (
             operation: operation.operation, candidate, idempotencyKey: operation.idempotency.key,
             sourceBinding: operation.sourceBinding, snapshotBinding,
             targetAssertionId: operation.targetAssertionId ?? null }));
+        if (operationFingerprint !== authorizationContext.operationFingerprint) {
+            consumeInvalidAttempt(input);
+            return Promise.resolve(automaticFailure('automatic_authorization_rejected'));
+        }
         const operationKey = operation.idempotency.key;
         return serialized(async () => {
             requireOpen();
@@ -305,6 +316,17 @@ export function createJsonMemoryRepository({ storePath, fileSystem = {}, now = (
                 snapshotRevision: snapshotBinding.revision, snapshotDigest: snapshotBinding.digest,
                 targetAssertionId: operation.targetAssertionId ?? null });
             if (!authorized.success) return automaticFailure(authorized.error?.code ?? 'automatic_authorization_rejected');
+
+            const speakerIdentity = trustedSpeakerIdentityDetails(authorized.trustedSpeakerContext);
+            const identityBindingSha256 = speakerIdentity && sha256(stableJson({ principalId: speakerIdentity.principalId,
+                sessionId: speakerIdentity.sessionId, sourceTurnId: speakerIdentity.turnId,
+                sourceTextSha256: speakerIdentity.sourceTextSha256, selfPersonId: speakerIdentity.selfPersonId }));
+            if (!speakerIdentity || speakerIdentity.selfBindingStatus !== 'linked'
+                || speakerIdentity.selfPersonId !== original.store.self_person_id
+                || speakerIdentity.sourceTextSha256 !== sha256(input.text)
+                || identityBindingSha256 !== authorized.identityBindingSha256
+                || !await trustedSpeakerIdentityBindingIsCurrent(authorized.trustedSpeakerContext))
+                return automaticFailure('automatic_speaker_identity_mismatch');
 
             const semanticSnapshotDigest = sha256(JSON.stringify(original.store));
             if (snapshotBinding.revision !== original.store.revision || snapshotBinding.digest !== semanticSnapshotDigest

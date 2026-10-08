@@ -44,7 +44,7 @@ const candidate = (text, replace = false, overrides = {}) => ({ candidate_type: 
     update_intent: replace ? 'possible_correction' : 'addition', sensitivity: 'none',
     suggested_disposition: 'auto_save', evidence_quote: text, ...overrides });
 
-function inlineScenario({ text, replace = false, values = [], candidateOverrides = {}, action }) {
+function inlineScenario({ text, replace = false, values = [], candidateOverrides = {}, action, identity = true }) {
     const snap = snapshot(values);
     const proposal = { candidates: [candidate(text, replace, candidateOverrides)] };
     return `
@@ -52,18 +52,21 @@ import { readDirectUserTurn, readDirectUserConfirmation, consumeDirectUserConfir
   closeDirectUserInput, closeDirectUserSession } from './src/core/direct-user-input.js';
 import { prepareAutomaticMemoryAuthorization, confirmAutomaticMemoryAuthorization,
   consumeAutomaticMemoryAuthorization } from './src/memory/automatic/authorization-coordinator.js';
+import { createSyntheticLinkedSpeakerContext } from './test-support/synthetic-linked-speaker.js';
 const recipient = {};
 const turn = await readDirectUserTurn(recipient);
-const prepared = prepareAutomaticMemoryAuthorization({ text: turn.message, proposal: ${JSON.stringify(proposal)},
+const speakerIdentityContext = ${identity ? `await createSyntheticLinkedSpeakerContext({ turn, recipient,
+  text: turn.message, selfPersonId: ${JSON.stringify(selfId)} })` : 'Object.freeze(Object.create(null))'};
+const prepared = await prepareAutomaticMemoryAuthorization({ text: turn.message, proposal: ${JSON.stringify(proposal)},
   snapshot: ${JSON.stringify(snap)}, operationIndex: 0, recipient,
-  runtimeContextCapability: turn.runtimeContextCapability });
+  runtimeContextCapability: turn.runtimeContextCapability, speakerIdentityContext });
 ${action}
 closeDirectUserInput();
 `;
 }
 
-async function runInteractive({ text, replace = false, values = [], candidateOverrides = {}, action, reply = 'valid' }) {
-    const script = inlineScenario({ text, replace, values, candidateOverrides, action });
+async function runInteractive({ text, replace = false, values = [], candidateOverrides = {}, action, reply = 'valid', identity = true }) {
+    const script = inlineScenario({ text, replace, values, candidateOverrides, action, identity });
     const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
         cwd: repoRoot, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -105,6 +108,7 @@ const expected = { recipient, operation: 'ADD', operationFingerprint: prepared.o
 const consumed = consumeAutomaticMemoryAuthorization(first.capability, expected);
 const replay = consumeAutomaticMemoryAuthorization(first.capability, expected);
 console.log('__RESULT__' + JSON.stringify({ prepared: prepared.success, operation: prepared.operation,
+  preparedAuthorized: prepared.authorizationGranted, preparedWritable: prepared.writeReady,
   granted: first.authorizationGranted, consumed: consumed.authorized, replay: replay.success,
   competing: competing.error.code, forged: forged.error.code,
   executable: first.executable, writeReady: first.writeReady }));` });
@@ -113,7 +117,7 @@ console.log('__RESULT__' + JSON.stringify({ prepared: prepared.success, operatio
     assert.match(result.stdout, /Valor que se agregaría: Fender/u);
     assert.match(result.stdout, /Provenance: inferencia no confiable/u);
     const report = JSON.parse(result.stdout.split('__RESULT__')[1]);
-    assert.deepEqual(report, { prepared: true, operation: 'ADD', granted: true,
+    assert.deepEqual(report, { prepared: true, operation: 'ADD', preparedAuthorized: false, preparedWritable: false, granted: true,
         consumed: true, replay: false, competing: 'authorization_request_invalid',
         forged: 'authorization_request_invalid', executable: false, writeReady: false });
 });
@@ -150,6 +154,16 @@ console.log('__RESULT__' + JSON.stringify({ first: first.error.code, second: sec
     assert.deepEqual(report, { first: 'trusted_confirmation_rejected', second: 'authorization_request_invalid', capability: false });
 });
 
+test('a valid stdin turn without a trusted Self identity cannot prepare an ADD authorization', async () => {
+    const result = await runInteractive({ text: addText, identity: false, action: `
+console.log('__RESULT__' + JSON.stringify({ prepared: prepared.prepared ?? false,
+  code: prepared.error.code, confirmationRequested: prepared.success && prepared.prepared }));` });
+    assert.equal(result.confirmationSent, false);
+    assert.deepEqual(JSON.parse(result.stdout.split('__RESULT__')[1]), {
+        prepared: false, code: 'trusted_speaker_identity_invalid', confirmationRequested: false,
+    });
+});
+
 test('altered operation, fingerprint, snapshot, recipient, or forged model data fail closed and burn the grant', async () => {
     const result = await runInteractive({ text: addText, action: `
 const grant = await confirmAutomaticMemoryAuthorization(prepared.request, recipient);
@@ -159,8 +173,8 @@ const altered = consumeAutomaticMemoryAuthorization(grant.capability, { recipien
 const replay = consumeAutomaticMemoryAuthorization(grant.capability, { recipient, operation: 'ADD',
   operationFingerprint: prepared.operationFingerprint, snapshotRevision: prepared.snapshotBinding.revision,
   snapshotDigest: prepared.snapshotBinding.digest, targetAssertionId: null });
-const forged = prepareAutomaticMemoryAuthorization({ text: turn.message, proposal: {}, snapshot: {}, operationIndex: 0,
-  recipient, runtimeContextCapability: { origin: 'local_cli', sessionId: 'fake', turnId: 'fake' } });
+const forged = await prepareAutomaticMemoryAuthorization({ text: turn.message, proposal: {}, snapshot: {}, operationIndex: 0,
+  recipient, runtimeContextCapability: { origin: 'local_cli', sessionId: 'fake', turnId: 'fake' }, speakerIdentityContext: {} });
 console.log('__RESULT__' + JSON.stringify({ altered: altered.success, alteredCode: altered.error.code,
   replay: replay.success, forged: forged.success, scopes: grant.scopes ?? null }));` });
     const report = JSON.parse(result.stdout.split('__RESULT__')[1]);

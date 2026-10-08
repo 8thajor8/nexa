@@ -59,11 +59,14 @@ import { createAutomaticMemoryDetector } from './src/memory/automatic/detector.j
 import { planAutomaticMemoryPersistence } from './src/memory/automatic/planner.js';
 import { createAutomaticMemoryPersistenceContract } from './src/memory/automatic/persistence-contract.js';
 import { prepareAutomaticMemoryAuthorization, confirmAutomaticMemoryAuthorization } from './src/memory/automatic/authorization-coordinator.js';
+import { createSyntheticLinkedSpeakerContext } from './test-support/synthetic-linked-speaker.js';
 import { createJsonMemoryRepository } from './src/memory/json-repository.js';
 const recipient = {};
 const repo = createJsonMemoryRepository({ storePath: process.argv[1], now: () => '2036-02-03T10:20:30.000Z' });
 await repo.open();
 const turn = await readDirectUserTurn(recipient);
+const speakerIdentityContext = await createSyntheticLinkedSpeakerContext({ turn, recipient,
+  text: turn.message, selfPersonId: ${JSON.stringify(SELF)} });
 let extractorCalls = 0;
 const detector = createAutomaticMemoryDetector({ extractCandidates: async ({ text: seen, instructions }) => {
   extractorCalls += 1;
@@ -76,10 +79,11 @@ if (!detected.success) {
   result = { detected, extractorCalls };
 } else {
   const snapshot = await repo.readAutomaticMemorySnapshot();
-  const plan = planAutomaticMemoryPersistence({ text: turn.message, proposal: detected.proposal, snapshot });
+  const plan = planAutomaticMemoryPersistence({ text: turn.message, proposal: detected.proposal, snapshot, trustedSpeakerContext: speakerIdentityContext });
   const contract = createAutomaticMemoryPersistenceContract({ text: turn.message, proposal: detected.proposal, snapshot });
-  const prepared = prepareAutomaticMemoryAuthorization({ text: turn.message, proposal: detected.proposal,
-    snapshot, operationIndex: 0, recipient, runtimeContextCapability: turn.runtimeContextCapability });
+  const prepared = await prepareAutomaticMemoryAuthorization({ text: turn.message, proposal: detected.proposal,
+    snapshot, operationIndex: 0, recipient, runtimeContextCapability: turn.runtimeContextCapability,
+    speakerIdentityContext });
   let write;
   if (prepared.prepared && ${confirm}) {
     const grant = await confirmAutomaticMemoryAuthorization(prepared.request, recipient);
@@ -146,7 +150,7 @@ test('B.3 integral REPLACE without separate stdin confirmation cannot write', as
     assert.equal(result.detected.success, true);
     assert.equal(result.plan.operations[0].operation, 'REPLACE');
     assert.equal(result.prepared.prepared, true);
-    assert.equal(result.write.error.code, 'authorization_capability_invalid_or_consumed');
+    assert.equal(result.write.error.code, 'automatic_authorization_rejected');
     assert.equal(result.revision, 0);
     assert.equal(result.snapshot.assertions[0].object.value, 'Acer');
     assert.equal(result.snapshot.automatic_operations.length, 0);
@@ -162,7 +166,7 @@ test('B.3 sensitive candidate remains ASK and model-supplied authority fields ar
     assert.equal(sensitive.result.detected.success, true);
     assert.equal(sensitive.result.plan.operations[0].operation, 'ASK');
     assert.equal(sensitive.result.prepared.prepared, false);
-    assert.equal(sensitive.result.write.error.code, 'automatic_operation_not_eligible');
+    assert.equal(sensitive.result.write.error.code, 'automatic_authorization_rejected');
     assert.equal(sensitive.result.revision, 0);
     assert.equal(sensitive.result.snapshot.automatic_operations.length, 0);
 
