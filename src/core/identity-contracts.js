@@ -112,8 +112,9 @@ export function validateSessionContract(value) {
 
 /** Device registration is a future account link, never device authentication. */
 export function validateDeviceContract(value) {
-    return exactRecord(value, ['deviceId', 'principalId', 'status', 'createdAt', 'revokedAt'])
+    return exactRecord(value, ['deviceId', 'installationId', 'principalId', 'status', 'createdAt', 'revokedAt'])
         && typeof value.deviceId === 'string' && UUID.test(value.deviceId)
+        && typeof value.installationId === 'string' && UUID.test(value.installationId)
         && typeof value.principalId === 'string' && PRINCIPAL_ID.test(value.principalId)
         && ['pending', 'active', 'revoked'].includes(value.status)
         && typeof value.createdAt === 'string' && Number.isFinite(Date.parse(value.createdAt))

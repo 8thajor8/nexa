@@ -93,7 +93,7 @@ test('sessions and devices are bounded data contracts, not authentication proofs
     const session = { sessionId: '66666666-6666-4666-8666-666666666666', installationId, principalId: ownerId,
         accountEpoch: 1, deviceId: null, authenticationMethod: 'native_passkey', assuranceLevel: 'strong',
         expiresAt: '2030-01-01T00:05:00.000Z', revokedAt: null };
-    const device = { deviceId: '77777777-7777-4777-8777-777777777777', principalId: ownerId,
+    const device = { deviceId: '77777777-7777-4777-8777-777777777777', installationId, principalId: ownerId,
         status: 'active', createdAt: now, revokedAt: null };
     assert.equal(contracts.validateSessionContract(session), true);
     assert.equal(contracts.validateSessionContract({ ...session, principalId: 'owner' }), false);
