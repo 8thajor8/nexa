@@ -69,6 +69,10 @@ export function validateRelationForget(request) {
 export function parseMemoryCommand(message) {
     if (typeof message !== 'string' || message.length > 16000) return null;
     try {
+        if (message === '/automatic-memory consent') return { operation: 'automatic_memory_consent_request' };
+        if (message === '/automatic-memory revoke-consent') return { operation: 'automatic_memory_consent_revoke' };
+        const consentConfirmation = /^\/automatic-memory confirm-consent ([0-9a-f-]{36})$/u.exec(message);
+        if (consentConfirmation) return { operation: 'automatic_memory_consent_confirm', consentChallenge: consentConfirmation[1] };
         if (message.startsWith('/relation create ')) {
             const request = JSON.parse(message.slice('/relation create '.length));
             return { operation: 'create_relation', request: validateRelationRequest(request) };

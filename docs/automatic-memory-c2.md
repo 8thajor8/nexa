@@ -8,13 +8,13 @@ En pruebas se inyecta un detector sintético. El contrato de la interfaz es `det
 
 ## Implementación
 
-`createAgent()` acepta `enableAutomaticMemoryAssessment` (default `false`) y `automaticMemoryDetector` (default `null`). Habilitar el flag sin inyectar un objeto con `detect()` falla al crear el agente; no se selecciona un extractor implícito. La aplicación CLI no pasa ninguna de estas opciones, por lo que C.2 está desactivada en Nexa normal. Un host que cambie el código y habilite explícitamente la opción aún tendría que proporcionar una dependencia; cualquier futura inyección del detector real debe pasar su propia revisión y consentimiento de privacidad.
+`createAgent()` acepta `enableAutomaticMemoryAssessment` (default `false`) y `automaticMemoryDetector` (default `null`). C.3 añade un requisito separado: consentimiento de sesión válido, solicitado y confirmado por comandos de stdin. El flag sin detector falla al crear el agente; el flag más detector sin consentimiento no evalúa. No se selecciona extractor implícito. La aplicación CLI no pasa estas opciones, así que su consentimiento no activa análisis ni envíos.
 
 Solo `readAndRun()` puede programar evaluación: toma el texto del objeto entregado por `readDirectUserTurn()` y lo conserva temporalmente en estado privado después de que el ciclo normal del modelo termine. No guarda el objeto de turno ni sus capabilities. Los comandos explícitos, mensajes vacíos, turnos que terminan en `salir` y errores del modelo no programan evaluación. `agent.run(text)` no lo hace.
 
 El CLI imprime primero la respuesta. Después invoca `completePresentedTurn()` sin argumentos y espera su finalización antes de iterar hacia otra lectura de stdin. El método consume el único pendiente antes de llamar al detector, así que una segunda llamada no repite el análisis. Si el host lee otro turno sin completar la fase previa, el pendiente se descarta en vez de competir por stdin o ejecutarse antes de presentar la respuesta. El detector no lee stdin.
 
-La evaluación recibe solo `{ text: mensajeOriginal }`. No recibe historial, salida del assistant, `function_call`, arguments/resultados de tools, contexto recuperado, command proof, runtime capability, autorización, objeto de agente ni repositorio. El agente no importa Automatic Memory, autorización automática, `json-repository` ni `commitAutomaticOperation`. La función inyectada no puede cambiar la respuesta ya producida: cualquier excepción se convierte en `automatic_memory_assessment_failed`, sin propagar detalles, texto o contenido privado al log o al resultado.
+La evaluación recibe `{ text: mensajeOriginal, signal }`. No recibe historial, salida del assistant, `function_call`, arguments/resultados de tools, contexto recuperado, command proof, runtime capability, autorización, objeto de agente ni repositorio. Un filtro C.3 previo a guardar el turno como pendiente omite entradas bloqueadas y devuelve/loguea solo códigos fijos. El agente no importa Automatic Memory writer, autorización automática ni repositorio. La función inyectada no puede cambiar la respuesta ya producida: errores se convierten en códigos seguros sin texto privado en el log o resultado.
 
 ## Flujo
 
@@ -77,18 +77,18 @@ La elegibilidad de evaluación requiere que cada respuesta de Responses API obse
 
 ## Límites y privacidad
 
-- En la configuración actual el número de llamadas extra a OpenAI por C.2 es cero. El mecanismo de A, si se inyectara explícitamente en una etapa futura, realiza un envío adicional del texto al modelo configurado. No queda autorizado por este cambio.
+- En la configuración actual el número de llamadas extra a OpenAI por C.2/C.3 es cero. El mecanismo de A, si se inyectara explícitamente en una etapa futura y hubiera consentimiento válido, realizaría un envío adicional del texto al modelo configurado. No queda autorizado por este cambio.
 - El screening de credenciales de A es heurístico y la sensibilidad semántica se determina después de la extracción. No garantiza que todo secreto o dato sensible se mantenga local. La detección real necesita decisión explícita sobre aviso, consentimiento, categorías prohibidas, retención y coste.
 - El hook es de evaluación únicamente. `auto_save` no equivale a autorización. ASK, IGNORE, DUPLICATE, ADD y REPLACE no se muestran ni escriben en esta fase; no hay confirmación ni capability nueva.
 - No se crea autoridad de turno nueva: la elegibilidad nace solo del camino `readDirectUserTurn()` → estado privado de `readAndRun()`. El hash/turno no se acepta como claim de `agent.run()` ni de tools.
 - El modelo puede usar tools en el ciclo conversacional normal, como antes; C.2 no envía el candidato ni el resultado del detector a tools. Este alcance no cambia las otras políticas de datos del agente.
 - El flag está disponible para hosts que construyen `createAgent()` y el objeto `detect` es una dependencia de código. No es una frontera contra ejecución arbitraria de módulos dentro del mismo proceso. La aplicación CLI no habilita ese camino.
-- El agente espera la finalización del detector antes de aceptar el siguiente turno. Un detector lento aumenta la pausa entre turnos; uno que nunca termina deja la cola esperando indefinidamente. Cerrar el agente limpia un pendiente aún no iniciado, pero no cancela un detector que ya comenzó. C.2 no ofrece timeout ni cancelación: un timeout superficial dejaría la operación subyacente activa y podría permitir trabajo tras el cierre. Antes de cualquier extractor real se necesita un contrato cancelable/cooperativo y una política de timeout/cierre revisados.
+- C.3 limita la espera a 5 segundos por defecto y pasa `AbortSignal`. Al timeout se libera la cola y se ignora cualquier resultado tardío. Un detector no cooperativo puede conservar su trabajo; se limita a una sola evaluación en vuelo y se omiten nuevos análisis hasta que termine o cierre el proceso. El cierre/revocación aborta un detector cooperativo; no destruye a la fuerza un detector no cooperativo. La integración real requiere revisar que el transporte subyacente respete cancelación.
 
 ## Condiciones antes de habilitar el extractor real
 
 1. Resolver privacidad y consentimiento para el envío adicional; definir qué mensajes/categorías no se transmiten.
-2. Diseñar y probar timeout/cancelación cooperativos y cierre seguro; no se implementan en C.2.
+2. Verificar timeout/cancelación con el transporte concreto: C.3 pasa `AbortSignal` y limita la espera a 5 s, pero no puede terminar a la fuerza un detector no cooperativo.
 3. Aprobar una composición explícita y controlada del detector real; jamás usar `auto_save` como permiso.
 4. Mantener clasificación, planner y coordinator separados; en una etapa posterior exigir confirmación independiente para cada ADD y REPLACE.
 5. Mantener la serialización de stdin y retención efímera de texto estrictamente acotada; verificar EOF, error, cierre y turnos concurrentes.
@@ -97,13 +97,13 @@ La elegibilidad de evaluación requiere que cada respuesta de Responses API obse
 
 ## Resultado
 
-C.2 deja un hook post-respuesta para evaluación inyectable, desactivado en la CLI normal. Un detector no terminado sí retiene la cola y puede retrasar el siguiente turno; el extractor real continúa deshabilitado. La respuesta conversacional ya producida no se altera, no se crea autoridad nueva y no se trasladan capabilities al modelo/tools. No inicia C.3 ni habilita aprendizaje real.
+C.2 deja un hook post-respuesta para evaluación inyectable, desactivado en la CLI normal. C.3 añade consentimiento de sesión, screening previo y un límite de espera con cancelación cooperativa; un detector no cooperativo puede continuar en segundo plano, aunque su resultado se invalida y no se aceptan evaluaciones posteriores mientras siga en vuelo. El extractor real continúa desconectado. La respuesta conversacional ya producida no se altera, no se crea autoridad nueva y no se trasladan capabilities al modelo/tools.
 
 ## Validación de cierre
 
-- C.2: 8/8 pruebas.
-- Automatic Memory: 80/80 pruebas.
-- Memory: 301/301 pruebas.
-- Suite completa: 494/494 pruebas en la ejecución permitida para Chromium. La ejecución dentro del sandbox produjo 493/494 por `spawn EPERM` al iniciar Chromium en la prueba de voz; la repetición sin ese bloqueo pasó.
+- C.2/C.3 y ensamblado de contexto: 30/30 pruebas.
+- Automatic Memory: 87/87 pruebas.
+- Memory: 309/309 pruebas.
+- Suite completa: 502/502 pruebas en la ejecución con permiso para iniciar Chromium. La ejecución restringida produjo 501/502 por `spawn EPERM` en la prueba existente de audio/voz.
 - `git diff --check`: limpio.
-- No se hicieron llamadas reales a OpenAI ni escrituras de memoria. Memory1 permaneció intacta; Memory2 continuó desactivada y no se creó un store personal.
+- No se hicieron llamadas reales a OpenAI ni escrituras de memoria. Memory1 permaneció intacta; Memory2 continuó desactivada y no se creó un store personal. La configuración actual de la CLI no inyecta el detector, así que el número de llamadas adicionales por Automatic Memory es cero.

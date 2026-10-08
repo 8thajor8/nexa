@@ -278,3 +278,24 @@ test('Memory1 agent still uses legacy prompt memory and never adds Memory2 conte
     assert.equal(requests[0].input.some(item => item.type === 'function_call_output'), false);
     await agent.close();
 });
+
+test('Memory2 retrieval can be disabled independently while Memory1 retrieval controls remain untouched', async () => {
+    const { repository } = fixture();
+    const requests = [];
+    const agent = await createAgent({ memoryBackend: 'memory2', memory2Repository: repository,
+        memoryRetrievalEnabled: false,
+        ask: async request => { requests.push(request); return final('ok'); }, getTools: () => [] });
+    assert.deepEqual(agent.automaticMemoryControls, { automaticAnalysisEnabled: false,
+        automaticSavingEnabled: false, memoryRetrievalEnabled: false, consentPolicyVersion: null });
+    await agent.run('Synthetic question.');
+    assert.equal(requests[0].input[0].role, 'user');
+    assert.equal(requests[0].input[0].content, 'Synthetic question.');
+    assert.equal(requests[0].input.some(item => item.type === 'function_call_output'), false);
+    await agent.close();
+
+    const memory1 = await createAgent({ memoryBackend: 'memory1', load: async () => ({ user: {}, preferences: {}, facts: [] }),
+        ask: async () => final('ok'), getTools: () => [], save: async () => {} });
+    assert.equal(memory1.automaticMemoryControls.memoryRetrievalEnabled, null);
+    assert.equal(memory1.automaticMemoryControls.automaticSavingEnabled, false);
+    await memory1.close();
+});
