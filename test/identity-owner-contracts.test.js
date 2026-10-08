@@ -98,6 +98,7 @@ test('sessions and devices are bounded data contracts, not authentication proofs
     assert.equal(contracts.validateSessionContract(session), true);
     assert.equal(contracts.validateSessionContract({ ...session, principalId: 'owner' }), false);
     assert.equal(contracts.validateDeviceContract(device), true);
+    assert.equal(contracts.validateDeviceContract({ ...device, status: 'suspended' }), true);
     assert.equal(contracts.validateDeviceContract({ ...device, status: 'revoked' }), false);
     assert.equal(contracts.evaluateMemoryScopeAccess(owner(), session, personId, 'private').allowed, false);
 });

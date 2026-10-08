@@ -116,7 +116,7 @@ export function validateDeviceContract(value) {
         && typeof value.deviceId === 'string' && UUID.test(value.deviceId)
         && typeof value.installationId === 'string' && UUID.test(value.installationId)
         && typeof value.principalId === 'string' && PRINCIPAL_ID.test(value.principalId)
-        && ['pending', 'active', 'revoked'].includes(value.status)
+        && ['pending', 'active', 'suspended', 'revoked'].includes(value.status)
         && typeof value.createdAt === 'string' && Number.isFinite(Date.parse(value.createdAt))
         && (value.revokedAt === null || (typeof value.revokedAt === 'string' && Number.isFinite(Date.parse(value.revokedAt))))
         && ((value.status === 'revoked') === (value.revokedAt !== null));
