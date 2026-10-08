@@ -8,6 +8,7 @@ import { AutomaticMemoryResponseError, extractAutomaticMemoryProposal } from '..
 import { createAutomaticMemoryDetector, EXTRACTION_INSTRUCTIONS } from '../src/memory/automatic/detector.js';
 import { createAutomaticMemoryDryRun, evaluateAutomaticMemoryCorpus } from '../src/memory/automatic/evaluation.js';
 import { evaluateAutomaticMemoryPolicy } from '../src/memory/automatic/policy.js';
+import { AUTOMATIC_MEMORY_PLAN_VERSION, planAutomaticMemoryPersistence } from '../src/memory/automatic/planner.js';
 import { AUTOMATIC_MEMORY_OUTPUT_SCHEMA, normalizeAutomaticMemoryProposal, parseAutomaticMemoryProposal, validateAutomaticMemoryCandidates } from '../src/memory/automatic/schema.js';
 import { validateMemoryStore } from '../src/memory/schema.js';
 import { EVALUATION_CASES } from '../scripts/evaluate-automatic-memory.js';
@@ -576,6 +577,98 @@ test('A.5 project decisions stay textual, bounded pauses remain reviewable recor
     assert.match(EXTRACTION_INSTRUCTIONS, /exact project or workstream name\/phrase.*never a canonical ID/u);
 });
 
+test('B.1 dry-run planner separates ADD, REPLACE, ASK, DUPLICATE and IGNORE without write-ready requests', () => {
+    const snapshot = makeStore({ assertions: [
+        { predicate: 'user.owns_item', value: 'Ibanez' },
+        { predicate: 'user.preference', value: 'respuestas largas' },
+        { predicate: 'user.uses_tool', value: 'Acer' },
+    ] });
+    const plan = (text, proposal, current = snapshot) =>
+        planAutomaticMemoryPersistence({ text, proposal: { candidates: [proposal] }, snapshot: current });
+    const base = (text, overrides) => candidate(text, overrides);
+    const before = createHash('sha256').update(JSON.stringify(snapshot.snapshot)).digest('hex');
+
+    const addText = 'También tengo una Fender.';
+    const add = plan(addText, base(addText, { candidate_type: 'purchase', subject_text: 'user',
+        predicate: 'user.owns_item', value_text: 'Fender', update_intent: 'addition' }));
+    assert.equal(add.success, true);
+    assert.equal(add.planVersion, AUTOMATIC_MEMORY_PLAN_VERSION);
+    assert.equal(add.executable, false);
+    assert.equal(add.operations[0].operation, 'ADD');
+    assert.equal(add.operations[0].writeReady, false);
+    assert.equal(add.operations[0].targetAssertionId, null);
+
+    const duplicateText = 'Tengo una Ibanez.';
+    const duplicate = plan(duplicateText, base(duplicateText, { candidate_type: 'purchase', subject_text: 'user',
+        predicate: 'user.owns_item', value_text: 'Ibanez' }));
+    assert.equal(duplicate.operations[0].operation, 'DUPLICATE');
+
+    const conflictText = 'Prefiero respuestas breves.';
+    const conflict = plan(conflictText, base(conflictText, { candidate_type: 'preference', subject_text: 'user',
+        predicate: 'user.preference', value_text: 'respuestas breves' }));
+    assert.equal(conflict.operations[0].operation, 'ASK');
+    assert.ok(conflict.operations[0].reasonCodes.includes('possible_contradiction_requires_review'));
+
+    const replaceText = 'Ya no uso mi laptop Acer ni la Toshiba; ahora uso una Lenovo.';
+    const replace = plan(replaceText, base(replaceText, { candidate_type: 'tool', subject_text: 'user',
+        predicate: 'user.uses_tool', value_text: 'Lenovo', update_intent: 'possible_correction' }));
+    assert.equal(replace.operations[0].operation, 'REPLACE');
+    assert.equal(replace.operations[0].targetAssertionId,
+        snapshot.snapshot.assertions.find(item => item.predicate === 'user.uses_tool').id);
+    assert.equal(replace.operations[0].confirmationRequired, true);
+    assert.equal(replace.operations[0].writeReady, false);
+
+    const ambiguousReplace = plan(replaceText, base(replaceText, { candidate_type: 'tool', subject_text: 'user',
+        predicate: 'user.uses_tool', value_text: 'Lenovo', update_intent: 'possible_correction' }),
+    makeStore({ assertions: [
+        { predicate: 'user.uses_tool', value: 'Acer' },
+        { predicate: 'user.uses_tool', value: 'Toshiba' },
+    ] }));
+    assert.equal(ambiguousReplace.operations[0].operation, 'ASK');
+    assert.ok(ambiguousReplace.operations[0].reasonCodes.includes('replace_target_ambiguous'));
+
+    const thirdPartyText = 'Coti cambió de trabajo.';
+    const thirdParty = plan(thirdPartyText, base(thirdPartyText, { candidate_type: 'professional', subject_text: 'Coti',
+        predicate: 'user.professional_context', value_text: 'cambió de trabajo', mentioned_person_text: 'Coti' }));
+    assert.equal(thirdParty.operations[0].operation, 'ASK');
+    assert.equal(thirdParty.operations[0].targetAssertionId, undefined);
+
+    const quoteText = 'Un correo dice: «Prefiero respuestas breves».';
+    const quoted = plan(quoteText, base(quoteText, { candidate_type: 'preference', subject_text: 'user',
+        predicate: 'user.preference', value_text: 'respuestas breves', assertion_mode: 'quoted_or_imported' }));
+    assert.equal(quoted.operations[0].operation, 'IGNORE');
+
+    const negativeText = 'No me gusta el café.';
+    const wrongPolarity = plan(negativeText, base(negativeText, { candidate_type: 'preference', subject_text: 'user',
+        predicate: 'user.preference', value_text: 'me gusta el café' }));
+    assert.equal(wrongPolarity.operations[0].operation, 'IGNORE');
+    assert.ok(wrongPolarity.operations[0].reasonCodes.includes('negative_preference_polarity_not_preserved'));
+    const correctNegative = plan(negativeText, base(negativeText, { candidate_type: 'preference', subject_text: 'user',
+        predicate: 'user.preference', value_text: 'No me gusta el café', assertion_mode: 'negated' }));
+    assert.equal(correctNegative.operations[0].operation, 'ASK');
+    assert.ok(correctNegative.operations[0].reasonCodes.includes('possible_contradiction_requires_review'));
+
+    const projectText = 'En el proyecto Atlas decidimos conservar la API actual.';
+    const project = plan(projectText, base(projectText, { candidate_type: 'decision', subject_text: 'Atlas',
+        predicate: 'project.decision', value_text: 'conservar la API actual' }));
+    assert.equal(project.operations[0].operation, 'ASK');
+    assert.ok(project.operations[0].reasonCodes.includes('canonical_project_identity_unavailable'));
+
+    const sensitiveText = 'Tengo migrañas ocasionales.';
+    const sensitive = plan(sensitiveText, base(sensitiveText, { candidate_type: 'situation', subject_text: 'user',
+        predicate: 'user.situation', value_text: 'migrañas ocasionales' }));
+    assert.equal(sensitive.operations[0].operation, 'ASK');
+
+    const inventedId = { ...base(addText, { candidate_type: 'purchase', subject_text: 'user',
+        predicate: 'user.owns_item', value_text: 'Fender' }), entity_id: 'person_00000000-0000-4000-8000-000000000099' };
+    assert.equal(planAutomaticMemoryPersistence({ text: addText, proposal: { candidates: [inventedId] }, snapshot }).success, false);
+    const allPlans = [add, duplicate, conflict, replace, ambiguousReplace, thirdParty, quoted, wrongPolarity,
+        correctNegative, project, sensitive];
+    assert.ok(allPlans.every(result => result.executable === false
+        && result.operations.every(item => item.writeReady === false)));
+    assert.equal(createHash('sha256').update(JSON.stringify(snapshot.snapshot)).digest('hex'), before);
+});
+
 test('exact entity resolution never accepts invented IDs and ambiguous/partial names ask', async () => {
     const juan1 = 'person_00000000-0000-4000-8000-000000000011';
     const juan2 = 'person_00000000-0000-4000-8000-000000000012';
@@ -668,7 +761,7 @@ function snapshotFingerprintForTest(value) { return createHash('sha256').update(
 test('A modules and their imports exclude agent, service, repository, authorization and write routes', async () => {
     const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
     const root = path.join(repo, 'src/memory/automatic');
-    const pending = ['detector.js', 'evaluation.js', 'policy.js', 'schema.js'].map(file => path.resolve(root, file));
+    const pending = ['detector.js', 'evaluation.js', 'policy.js', 'planner.js', 'schema.js'].map(file => path.resolve(root, file));
     pending.push(path.join(repo, 'src/brain/openai.js'));
     const visited = new Set();
     while (pending.length) {
