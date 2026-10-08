@@ -32,7 +32,7 @@ export async function initializeEmptyMemoryStore({ storePath, now = () => new Da
     const selfId = 'person_' + randomUUID();
     const store = { schema_version: SCHEMA_VERSION, self_person_id: selfId,
         entities: [{ id: selfId, type: 'person', created_at: timestamp }], store_id: 'store_' + randomUUID(), revision: 0,
-        created_at: timestamp, updated_at: timestamp, assertions: [], sources: [], evidence: [], migrations: [] };
+        created_at: timestamp, updated_at: timestamp, assertions: [], sources: [], evidence: [], migrations: [], automatic_operations: [] };
     try { validateMemoryStore(store); }
     catch { throw publicStartupError('memory_store_initialization_failed'); }
     let handle;

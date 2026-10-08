@@ -98,6 +98,29 @@ test('typed puts/deletes apply together across collections and migration receipt
         changes: [{ type: 'delete', collection: 'migrations', source_sha256: receipt.source_sha256 }] });
     assert.equal(final.snapshot.migrations.length, 0);
 });
+
+test('v5 repository accepts a validated operation receipt append-only and v4 rejects that collection', async t => {
+    const v5 = fixture(); v5.schema_version = 5; v5.automatic_operations = [];
+    const f = await setup(t, { data: v5 }); const snapshot = await f.repo.open();
+    const receipt = { operation_key: 'a'.repeat(64), operation_fingerprint_sha256: 'b'.repeat(64), operation_kind: 'ADD',
+        status: 'applied', authorization_request_id: 'req_00000001-1111-4111-8111-111111111111', expected_revision: 0,
+        expected_digest: snapshot.digest, result_revision: 1, result_assertion_id: snapshot.snapshot.assertions[0].id,
+        target_assertion_id: null, result_code: null, recorded_at: later };
+    const committed = await f.repo.commit({ expectedRevision: snapshot.revision, expectedDigest: snapshot.digest,
+        changes: [{ type: 'put', collection: 'automatic_operations', record: receipt }] });
+    assert.equal(committed.revision, 1); assert.deepEqual(committed.snapshot.automatic_operations, [receipt]);
+    const bytes = await fs.readFile(f.storePath, 'utf8');
+    await assert.rejects(f.repo.commit({ expectedRevision: committed.revision, expectedDigest: committed.digest,
+        changes: [{ type: 'delete', collection: 'automatic_operations', operation_key: receipt.operation_key }] }), code('memory_invalid_changes'));
+    const replacement = { ...receipt, operation_fingerprint_sha256: 'c'.repeat(64) };
+    await assert.rejects(f.repo.commit({ expectedRevision: committed.revision, expectedDigest: committed.digest,
+        changes: [{ type: 'put', collection: 'automatic_operations', record: replacement }] }), code('memory_invalid_changes'));
+    assert.equal(await fs.readFile(f.storePath, 'utf8'), bytes);
+
+    const legacy = await setup(t); const old = await legacy.repo.open();
+    await assert.rejects(legacy.repo.commit({ expectedRevision: old.revision, expectedDigest: old.digest,
+        changes: [{ type: 'put', collection: 'automatic_operations', record: receipt }] }), code('memory_invalid_changes'));
+});
 test('invalid, duplicate or dangling changes fail without altering bytes', async t => {
     const f = await setup(t); const snap = await f.repo.open(); const bytes = await fs.readFile(f.storePath, 'utf8');
     for (const changes of [[], [{ type: 'patch', collection: 'assertions', path: '/permissions', value: true }],

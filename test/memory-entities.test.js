@@ -62,10 +62,10 @@ function assertionChanges(proposal, { kind = 'user_statement', origin_trust = 'u
     return [['assertions', assertion], ['sources', source], ['evidence', evidence]].map(([collection, record]) => ({ type: 'put', collection, record }));
 }
 
-test('schema 3 initialization has exactly one anonymous self and reopen preserves it', async t => {
+test('schema v5 initialization has exactly one anonymous self and reopen preserves it', async t => {
     const { service, repository, storePath } = await setup(t);
     const current = await repository.readSnapshot();
-    assert.equal(current.snapshot.schema_version, 4);
+    assert.equal(current.snapshot.schema_version, 5);
     assert.equal(current.snapshot.entities.length, 1);
     assert.equal(current.snapshot.self_person_id, current.snapshot.entities[0].id);
     assert.equal(current.snapshot.assertions.length, 0);
@@ -78,10 +78,10 @@ test('schema 3 initialization has exactly one anonymous self and reopen preserve
     assert.deepEqual(await fs.readFile(storePath), bytes);
 });
 
-test('old formats are rejected explicitly without reinterpretation or writes', async t => {
+test('unsupported formats are rejected explicitly without reinterpretation or writes', async t => {
     const { repository, storePath } = await setup(t);
     const current = await repository.readSnapshot(); await repository.close();
-    for (const version of [1, 2, 3, 5, '4']) {
+    for (const version of [1, 2, 3, 6, '4']) {
         const store = structuredClone(current.snapshot); store.schema_version = version;
         delete store.entities; delete store.self_person_id;
         const bytes = JSON.stringify(store); await fs.writeFile(storePath, bytes);

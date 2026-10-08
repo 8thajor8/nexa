@@ -1,8 +1,13 @@
 import { canonicalSubject, normalizeEntityName, isEntityName } from './entities.js';
 import { getRelationPredicate } from './relation-predicates.js';
 // Memory is inert data. This module performs no I/O and never interprets values.
-export const SCHEMA_VERSION = 4;
-export const COLLECTIONS = Object.freeze(['entities', 'assertions', 'sources', 'evidence', 'migrations']);
+export const SCHEMA_VERSION = 5;
+export const PREVIOUS_SCHEMA_VERSION = 4;
+export const COLLECTIONS_V4 = Object.freeze(['entities', 'assertions', 'sources', 'evidence', 'migrations']);
+export const COLLECTIONS_V5 = Object.freeze([...COLLECTIONS_V4, 'automatic_operations']);
+// Latest collections are used for new stores; validation selects the exact set
+// from the stored version so v4 repositories remain readable and writable.
+export const COLLECTIONS = COLLECTIONS_V5;
 export const COMPATIBILITY_CATEGORIES = Object.freeze(['fact', 'preference', 'person', 'project', 'routine', 'user']);
 export const SOURCE_TRUST = Object.freeze({
     user_statement: 'user_asserted', legacy_memory_1: 'unknown',
@@ -13,6 +18,8 @@ export const SOURCE_TRUST = Object.freeze({
 export const PREDICATE_PATTERN = /^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$/u;
 const uuid = '[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 const prefixes = { assertions: 'mem', sources: 'src', evidence: 'ev', store: 'store', person: 'person', entities: 'person' };
+const SHA256 = /^[a-f0-9]{64}$/u;
+const REQUEST_ID = /^req_[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 export class MemorySchemaError extends Error {
     constructor(path, code = 'memory_schema_invalid') {
@@ -181,34 +188,80 @@ function migration(value, path) {
     integer(value.source_entry_count, path + '.source_entry_count');
     integer(value.created_assertion_count, path + '.created_assertion_count');
 }
-const validators = { entities: entity, assertions: assertion, sources: source, evidence, migrations: migration };
+const SAFE_AUTOMATIC_RESULT_CODES = Object.freeze(['policy_rejected', 'target_conflict', 'operation_invalid']);
+function automaticOperation(value, path) {
+    assertExactObject(value, ['operation_key', 'operation_fingerprint_sha256', 'operation_kind', 'status',
+        'authorization_request_id', 'expected_revision', 'expected_digest', 'result_revision',
+        'result_assertion_id', 'target_assertion_id', 'result_code', 'recorded_at'], path);
+    requireValue(SHA256.test(value.operation_key), path + '.operation_key');
+    requireValue(SHA256.test(value.operation_fingerprint_sha256), path + '.operation_fingerprint_sha256');
+    requireValue(['ADD', 'REPLACE'].includes(value.operation_kind), path + '.operation_kind');
+    requireValue(['applied', 'rejected_terminal'].includes(value.status), path + '.status');
+    requireValue(typeof value.authorization_request_id === 'string' && REQUEST_ID.test(value.authorization_request_id), path + '.authorization_request_id');
+    integer(value.expected_revision, path + '.expected_revision');
+    requireValue(SHA256.test(value.expected_digest), path + '.expected_digest');
+    integer(value.result_revision, path + '.result_revision');
+    requireValue(value.result_revision === value.expected_revision + 1, path + '.result_revision');
+    requireValue(value.target_assertion_id === null || (() => { try { validateId(value.target_assertion_id, 'assertions', path + '.target_assertion_id'); return true; } catch { return false; } })(), path + '.target_assertion_id');
+    if (value.operation_kind === 'ADD') requireValue(value.target_assertion_id === null, path + '.target_assertion_id');
+    else requireValue(value.target_assertion_id !== null, path + '.target_assertion_id');
+    if (value.status === 'applied') {
+        validateId(value.result_assertion_id, 'assertions', path + '.result_assertion_id');
+        requireValue(value.result_code === null, path + '.result_code');
+    } else {
+        requireValue(value.result_assertion_id === null && SAFE_AUTOMATIC_RESULT_CODES.includes(value.result_code), path + '.result_code');
+    }
+    validateTimestamp(value.recorded_at, path + '.recorded_at');
+}
+const validators = { entities: entity, assertions: assertion, sources: source, evidence, migrations: migration,
+    automatic_operations: automaticOperation };
 export function validateMemoryRecord(collection, value, path = 'record') {
     requireValue(typeof collection === 'string' && Object.hasOwn(validators, collection), path);
     validators[collection](value, path);
     return value;
 }
 export function validateMemoryStore(store) {
-    // Recognize incompatible versions before requiring fields introduced in v3.
+    // Recognize incompatible versions before requiring version-specific fields.
     const version = Object.getOwnPropertyDescriptor(store ?? {}, 'schema_version');
-    if (version && Object.hasOwn(version, 'value') && version.value !== SCHEMA_VERSION) {
+    if (version && Object.hasOwn(version, 'value') && ![PREVIOUS_SCHEMA_VERSION, SCHEMA_VERSION].includes(version.value)) {
         throw new MemorySchemaError('store.schema_version', 'memory_schema_unsupported');
     }
-    assertExactObject(store, ['schema_version', 'store_id', 'self_person_id', 'revision', 'created_at', 'updated_at', ...COLLECTIONS], 'store');
-    if (store.schema_version !== SCHEMA_VERSION) throw new MemorySchemaError('store.schema_version', 'memory_schema_unsupported');
+    const collections = store?.schema_version === PREVIOUS_SCHEMA_VERSION ? COLLECTIONS_V4 : COLLECTIONS_V5;
+    assertExactObject(store, ['schema_version', 'store_id', 'self_person_id', 'revision', 'created_at', 'updated_at', ...collections], 'store');
     validateId(store.store_id, 'store', 'store.store_id');
     integer(store.revision, 'store.revision');
     validateTimestamp(store.created_at, 'store.created_at');
     validateTimestamp(store.updated_at, 'store.updated_at');
     requireValue(Date.parse(store.updated_at) >= Date.parse(store.created_at), 'store.updated_at');
     const ids = new Set();
-    for (const collection of COLLECTIONS) {
+    for (const collection of collections) {
         assertDenseArray(store[collection], 'store.' + collection);
         store[collection].forEach((record, i) => {
             const path = 'store.' + collection + '[' + i + ']';
             validateMemoryRecord(collection, record, path);
-            const key = collection === 'migrations' ? record.source_sha256 : record.id;
-            requireValue(!ids.has(key), path);
-            ids.add(key);
+            const key = collection === 'migrations' ? record.source_sha256
+                : collection === 'automatic_operations' ? record.operation_key : record.id;
+            const uniqueKey = collection + ':' + key;
+            requireValue(!ids.has(uniqueKey), path);
+            ids.add(uniqueKey);
+        });
+    }
+    if (store.schema_version === SCHEMA_VERSION) {
+        const fingerprints = new Set();
+        store.automatic_operations.forEach((record, i) => {
+            const path = 'store.automatic_operations[' + i + ']';
+            requireValue(!fingerprints.has(record.operation_fingerprint_sha256), path + '.operation_fingerprint_sha256');
+            requireValue(record.result_revision <= store.revision, path + '.result_revision');
+            fingerprints.add(record.operation_fingerprint_sha256);
+            if (record.operation_kind === 'REPLACE') {
+                requireValue(store.assertions.some(assertion => assertion.id === record.target_assertion_id), path + '.target_assertion_id');
+            }
+            if (record.status === 'applied') {
+                const result = store.assertions.find(assertion => assertion.id === record.result_assertion_id);
+                requireValue(Boolean(result), path + '.result_assertion_id');
+                if (record.operation_kind === 'REPLACE') requireValue(result.supersedes.includes(record.target_assertion_id), path + '.target_assertion_id');
+                else requireValue(!result.supersedes.length, path + '.result_assertion_id');
+            }
         });
     }
     validateId(store.self_person_id, 'person', 'store.self_person_id');

@@ -67,14 +67,15 @@ export function prepareCommitRequest(request) {
                 assertExactObject(change, ['type', 'collection', 'record']);
                 validateMemoryRecord(collection, change.record);
             } else if (type === 'delete') {
-                if (collection === 'entities') throw new Error(); // Entity deletion is outside B.1.
+                if (collection === 'entities' || collection === 'automatic_operations') throw new Error(); // Entity/receipt deletion is forbidden.
                 assertExactObject(change, ['type', 'collection', collection === 'migrations' ? 'source_sha256' : 'id']);
                 if (collection === 'migrations') {
                     if (typeof change.source_sha256 !== 'string' || !/^[a-f0-9]{64}$/u.test(change.source_sha256)) throw new Error();
                 } else validateId(change.id, collection);
             } else throw new Error();
             const record = type === 'put' ? change.record : change;
-            const key = collection + ':' + (collection === 'migrations' ? record.source_sha256 : record.id);
+            const key = collection + ':' + (collection === 'migrations' ? record.source_sha256
+                : collection === 'automatic_operations' ? record.operation_key : record.id);
             if (keys.has(key)) throw new Error();
             keys.add(key);
         }
@@ -85,11 +86,14 @@ export function applyChanges(store, changes, updatedAt) {
     try {
         const candidate = structuredClone(store);
         for (const change of changes) {
-            const key = change.collection === 'migrations' ? 'source_sha256' : 'id';
+            const key = change.collection === 'migrations' ? 'source_sha256'
+                : change.collection === 'automatic_operations' ? 'operation_key' : 'id';
             const id = change.type === 'put' ? change.record[key] : change[key];
             const records = candidate[change.collection];
+            if (!Array.isArray(records)) throw new Error(); // v4 does not carry v5 operation receipts.
             const index = records.findIndex(record => record[key] === id);
             if (change.type === 'put') {
+                if (change.collection === 'automatic_operations' && index !== -1) throw new Error(); // Applied receipts are append-only.
                 if (index === -1) records.push(structuredClone(change.record));
                 else {
                     if (change.collection === 'entities' && (records[index].type !== change.record.type
@@ -97,7 +101,7 @@ export function applyChanges(store, changes, updatedAt) {
                     records[index] = structuredClone(change.record);
                 }
             } else {
-                if (change.collection === 'entities' || index === -1) throw new Error();
+                if (change.collection === 'entities' || change.collection === 'automatic_operations' || index === -1) throw new Error();
                 records.splice(index, 1);
             }
         }

@@ -42,7 +42,7 @@ test('valid store, empty store, nullable provenance and fictional person referen
     validateMemoryStore(store);
 });
 test('unsupported schema versions are explicit and never coerced', () => {
-    for (const version of [1, 2, 3, 5, '4', null]) invalid(s => { s.schema_version = version; }, 'memory_schema_unsupported');
+    for (const version of [1, 2, 3, 6, '4', null]) invalid(s => { s.schema_version = version; }, 'memory_schema_unsupported');
 });
 test('malformed roots, collections and record types are rejected', () => {
     for (const root of [null, [], 'secret', 2]) assert.throws(() => validateMemoryStore(root), MemorySchemaError);

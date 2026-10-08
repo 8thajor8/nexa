@@ -51,10 +51,10 @@ async function commit(repository, changes) {
     return repository.commit({ expectedRevision: s.revision, expectedDigest: s.digest, changes });
 }
 
-test('schema v4 relation shape, endpoint integrity, canonical symmetry and duplicate invariants', async t => {
+test('schema v5 relation shape, endpoint integrity, canonical symmetry and duplicate invariants', async t => {
     const { repository, self, createPerson } = await setup(t); const other = await createPerson();
     const store = (await repository.readSnapshot()).snapshot;
-    assert.equal(SCHEMA_VERSION, 4); assert.equal(getRelationPredicate('partner_of').symmetric, true);
+    assert.equal(SCHEMA_VERSION, 5); assert.equal(getRelationPredicate('partner_of').symmetric, true);
     const [left, right] = [self, other].sort();
     const relation = { id: uid('mem'), kind: 'fact', subject: ref(left), predicate: 'partner_of',
         object: { type: 'entity_reference', entity_type: 'person', id: right }, status: 'active', valid_from: null, valid_to: null,
