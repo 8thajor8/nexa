@@ -2,13 +2,18 @@ import 'dotenv/config';
 import { closeDirectUserInput } from './core/direct-user-input.js';
 
 import { createAgent } from './core/agent.js';
+import { createAutomaticMemoryDetector } from './memory/automatic/detector.js';
+import { formatAutomaticMemoryAssessment } from './memory/automatic/assessment-presentation.js';
 import { closeWhatsAppBrowser } from './integrations/whatsapp/bridge/session.js';
 import { closeSpeechService, initializeSpeechService } from './speech/service.js';
 
 let nexa;
 try {
     await initializeSpeechService();
-    nexa = await createAgent();
+    // Compose the production detector behind a hard-off CLI gate. This stage
+    // validates the complete path with mocks; real assessment remains disabled.
+    nexa = await createAgent({ automaticMemoryDetector: createAutomaticMemoryDetector(),
+        enableAutomaticMemoryAssessment: false });
     console.log(`Nexa memory backend: ${nexa.memoryBackend}`);
     console.log('');
     console.log('╔══════════════════════════════════╗');
@@ -27,9 +32,9 @@ try {
                 console.log(`Nexa > ${response}`);
                 console.log('');
             }
-            // Experimental assessment runs only after the answer is visible and before
-            // the next direct-user stdin read. It is disabled unless explicitly injected.
-            await nexa.completePresentedTurn();
+            // Assessment remains hard-disabled in the personal CLI until a later approval.
+            const assessment = await nexa.completePresentedTurn();
+            for (const line of formatAutomaticMemoryAssessment(assessment)) console.log(line);
         } catch (error) {
             console.error('Nexa ERROR >', error.message);
             console.log('');

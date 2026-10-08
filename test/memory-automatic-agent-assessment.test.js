@@ -14,11 +14,12 @@ function worker(mode) {
 import assert from 'node:assert/strict';
 import { createAgent } from './src/core/agent.js';
 import { createAutomaticMemoryDetector } from './src/memory/automatic/detector.js';
+import { extractAutomaticMemoryProposal } from './src/brain/openai.js';
 import { closeDirectUserInput } from './src/core/direct-user-input.js';
 const mode = ${JSON.stringify(mode)};
 const policyVersion = ${JSON.stringify(AUTOMATIC_MEMORY_CONSENT_POLICY_VERSION)};
 const events = [], detected = [];
-let askCount = 0, toolCount = 0, saveCount = 0, releaseDetector = null;
+let askCount = 0, toolCount = 0, saveCount = 0, queueEnqueueCount = 0, releaseDetector = null, assessmentResult = null, extractionRequest = null, extractionSignalAborted = null;
 let storedConsent = null;
 const syntheticConsentStore = {
   load: async () => storedConsent,
@@ -29,6 +30,7 @@ const syntheticConsentStore = {
   revoke: async () => { storedConsent = null; return { success: true }; },
 };
 const syntheticProposalQueue = { listGrouped: async () => [], review: async () => null,
+  enqueue: async () => { queueEnqueueCount++; return { status: 'pending' }; },
   approve: async (id, fingerprint) => { events.push('proposal-approved:' + id + ':' + fingerprint); return { success: true }; }, reject: async () => ({ success: false }),
   discard: async () => ({ success: false }), excludeConversation: async id => { events.push('excluded:' + id); return { success: true }; },
   revokeConsent: async id => { events.push('consent-revoked:' + id); return { success: true }; } };
@@ -42,7 +44,19 @@ if (mode === 'missing-detector') {
     automaticMemoryAssessmentTimeoutMs: 5001 }), /automatic_memory_assessment_configuration_invalid/u);
   console.log('__ASSESSMENT_RESULT__' + JSON.stringify({ accepted: false }));
 } else {
-  const detector = { detect: async input => {
+  const detector = mode === 'c5c-mock' ? createAutomaticMemoryDetector({ extractCandidates: async input => {
+    detected.push({ keys: Object.keys(input).sort(), text: input.text });
+    const candidates = [{ candidate_type: 'preference', subject_text: 'user', predicate: 'user.preference',
+      value_text: 'respuestas concisas', mentioned_person_text: null, durability: 'durable',
+      linguistic_confidence: 0.99, assertion_mode: 'asserted', temporal_hints: { raw_text: null, certainty: 'none' },
+      update_intent: 'new_fact', sensitivity: 'none', suggested_disposition: 'auto_save',
+      evidence_quote: 'Prefiero respuestas concisas.' }];
+    return extractAutomaticMemoryProposal({ ...input, client: { responses: { create: async (request, options) => {
+      extractionRequest = request;
+      extractionSignalAborted = options?.signal?.aborted ?? null;
+      return { status: 'completed', output_text: JSON.stringify({ candidates }) };
+    } } } });
+  } }) : { detect: async input => {
     events.push('detector:start');
     detected.push({ keys: Object.keys(input).sort(), text: input.text });
     if (mode === 'failure') throw new Error('synthetic private extractor detail');
@@ -172,10 +186,13 @@ if (mode === 'missing-detector') {
     const turn = await agent.readAndRun();
     events.push('response:visible:' + turn.response);
     const completed = await agent.completePresentedTurn();
+    assessmentResult = completed;
     events.push('completion:' + completed.assessed);
     await agent.close();
   }
   console.log('__ASSESSMENT_RESULT__' + JSON.stringify({ events, detected, askCount, toolCount, saveCount,
+    extractionRequest, extractionSignalAborted,
+    queueEnqueueCount, assessmentResult,
     controls: agent.automaticMemoryControls }));
 }
 closeDirectUserInput();
@@ -267,8 +284,33 @@ test('C.2 refuses explicit enablement without a detector and blocks the default 
     assert.doesNotMatch(source, /automatic\/authorization-coordinator|commitAutomaticOperation|json-repository/u);
     const cli = await (await import('node:fs/promises')).readFile(path.join(root, 'src/index.js'), 'utf8');
     assert.ok(cli.indexOf('console.log(`Nexa > ${response}`)') < cli.indexOf('await nexa.completePresentedTurn()'));
-    assert.match(cli, /createAgent\(\)/u);
-    assert.doesNotMatch(cli, /createAutomaticMemoryDetector|extractAutomaticMemoryProposal|automaticMemoryDetector/u);
+    assert.match(cli, /createAgent\(/u);
+    assert.match(cli, /automaticMemoryDetector:\s*createAutomaticMemoryDetector\(\)/u);
+    assert.match(cli, /enableAutomaticMemoryAssessment:\s*false/u);
+});
+
+test('C.5c composes the real detector adapter with synthetic extraction, returns policy review data, and persists no proposal or memory', async () => {
+    const input = 'Prefiero respuestas concisas.';
+    const { result } = await run('c5c-mock', input + '\n');
+    assert.equal(result.detected.length, 1);
+    assert.deepEqual(result.detected[0].keys, ['instructions', 'signal', 'text']);
+    assert.equal(result.detected[0].text, input);
+    assert.deepEqual(result.extractionRequest.tools, []);
+    assert.equal(result.extractionRequest.store, false);
+    assert.equal(result.extractionRequest.text.format.strict, true);
+    assert.equal(result.extractionRequest.max_output_tokens, 2400);
+    assert.equal(result.extractionRequest.input[0].content[0].text, input);
+    assert.equal(result.extractionSignalAborted, false);
+    assert.equal(result.assessmentResult.success, true);
+    assert.equal(result.assessmentResult.assessed, true);
+    assert.equal(result.assessmentResult.candidates.length, 1);
+    assert.equal(result.assessmentResult.candidates[0].disposition, 'ask',
+        'Memory1 provides no canonical Self snapshot, so the extractor label user cannot resolve identity');
+    assert.equal(result.assessmentResult.authorizationGranted, false);
+    assert.equal(result.assessmentResult.writeReady, false);
+    assert.equal(result.assessmentResult.persisted, false);
+    assert.equal(result.queueEnqueueCount, 0);
+    assert.equal(result.saveCount, 0);
 });
 
 test('C.2 skips assessment after a model failure, then assesses only the next completed direct turn', async () => {
