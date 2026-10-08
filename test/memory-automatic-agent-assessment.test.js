@@ -13,6 +13,7 @@ function worker(mode) {
     return `
 import assert from 'node:assert/strict';
 import { createAgent } from './src/core/agent.js';
+import { createAutomaticMemoryDetector } from './src/memory/automatic/detector.js';
 import { closeDirectUserInput } from './src/core/direct-user-input.js';
 const mode = ${JSON.stringify(mode)};
 const policyVersion = ${JSON.stringify(AUTOMATIC_MEMORY_CONSENT_POLICY_VERSION)};
@@ -35,6 +36,9 @@ if (mode === 'missing-detector') {
   await assert.rejects(createAgent({ memoryBackend: 'memory1', load: async () => ({}),
     enableAutomaticMemoryAssessment: true }), /automatic_memory_assessment_configuration_invalid/u);
   await assert.rejects(createAgent({ memoryBackend: 'memory1', load: async () => ({}),
+    enableAutomaticMemoryAssessment: true, automaticMemoryDetector: createAutomaticMemoryDetector() }),
+    /automatic_memory_assessment_configuration_invalid/u);
+  await assert.rejects(createAgent({ memoryBackend: 'memory1', load: async () => ({}),
     automaticMemoryAssessmentTimeoutMs: 5001 }), /automatic_memory_assessment_configuration_invalid/u);
   console.log('__ASSESSMENT_RESULT__' + JSON.stringify({ accepted: false }));
 } else {
@@ -48,7 +52,7 @@ if (mode === 'missing-detector') {
     });
     await new Promise(resolve => setTimeout(resolve, 40));
     events.push('detector:end');
-    return { success: true, proposal: { private: 'ignored result' } };
+    return { success: true, proposal: { candidates: [] } };
   } };
   const agent = await createAgent({ memoryBackend: 'memory1', load: async () => ({ user: {}, preferences: {}, facts: [] }),
     automaticMemoryConsentStore: syntheticConsentStore, automaticMemoryProposalQueue: syntheticProposalQueue,
@@ -236,25 +240,19 @@ test('C.2 assessment is disabled by default even when a synthetic detector is av
     assert.ok(result.events.includes('completion:false'));
 });
 
-test('C.2 assesses only original direct-user turns once, after visible response, and serializes before next stdin turn', async () => {
+test('C.5b tool-exposed turn and session are conservatively ineligible for assessment', async () => {
     const { result } = await run('flow');
-    assert.equal(result.detected.length, 2);
-    assert.deepEqual(result.detected.map(item => item.text), [
-        'Mensaje sintético original uno.', 'Mensaje sintético original dos.',
-    ]);
-    assert.ok(result.detected.every(item => JSON.stringify(item.keys) === JSON.stringify(['signal', 'text'])));
-    assert.ok(!result.detected.some(item => item.text.includes('tool output') || item.text.includes('Respuesta conversacional')));
+    assert.equal(result.detected.length, 0);
     assert.equal(result.toolCount, 1);
     assert.equal(result.saveCount, 0);
-    assert.equal(result.events.filter(item => item.startsWith('detector:start')).length, 2);
-    assert.ok(result.events.indexOf('response:visible:Respuesta conversacional visible.') < result.events.indexOf('detector:start'));
-    assert.ok(result.events.indexOf('detector:end') < result.events.lastIndexOf('response:visible:Respuesta conversacional visible.'));
+    assert.ok(result.events.includes('diagnostic:automatic_memory_source_exposed:'));
+    assert.equal(result.events.filter(item => item.startsWith('detector:start')).length, 0);
     assert.ok(result.events.includes('second_completion:false'));
 });
 
 test('C.2 detector failure is sanitized and does not alter responses, trigger writes, or leak details', async () => {
     const { result, stdout, stderr } = await run('failure');
-    assert.equal(result.detected.length, 2);
+    assert.equal(result.detected.length, 1, 'a provider exposure keeps the session in the conservative blocked state');
     assert.equal(result.events.filter(item => item.startsWith('response:visible:')).length, 2);
     assert.equal(result.saveCount, 0);
     assert.ok(result.events.includes('completion:false'));
@@ -262,7 +260,7 @@ test('C.2 detector failure is sanitized and does not alter responses, trigger wr
     assert.equal(stderr.includes('synthetic private extractor detail'), false);
 });
 
-test('C.2 refuses explicit enablement without an injected detector and agent has no automatic writer imports', async () => {
+test('C.2 refuses explicit enablement without a detector and blocks the default live detector from the legacy hook', async () => {
     const { result } = await run('missing-detector', '');
     assert.equal(result.accepted, false);
     const source = await (await import('node:fs/promises')).readFile(path.join(root, 'src/core/agent.js'), 'utf8');
@@ -286,14 +284,14 @@ test('C.2 skips assessment when the conversational response is incomplete', asyn
     assert.equal(result.detected.length, 0);
 });
 
-test('C.2 documents current serialization: a detector that never settles holds later turns', async () => {
+test('C.5b timeout bounds the in-flight assessment and later turns remain blocked by provider exposure', async () => {
     const { result } = await run('hang');
-    assert.equal(result.detected.length, 2);
+    assert.equal(result.detected.length, 1);
     assert.ok(result.events.includes('second_turn_waiting:true'));
     assert.ok(result.events.indexOf('detector:end') < result.events.lastIndexOf('response:visible:Respuesta conversacional visible.'));
 });
 
-test('C.2 closing during an in-flight detector does not cancel that detector', async () => {
+test('C.5b closing during an in-flight detector cancels its result without waiting for a non-cooperative detector', async () => {
     const { result } = await run('hang-close', 'Mensaje sintético para cierre.\n');
     assert.equal(result.detected.length, 1);
     assert.ok(result.events.includes('closed_while_detector_pending'));
@@ -304,14 +302,14 @@ test('C.3 abort signal and bounded timeout ignore a late detector result', async
     const { result } = await run('timeout', 'Synthetic turn for timeout test.\n');
     assert.equal(result.detected.length, 1);
     assert.ok(result.detected[0].keys.includes('signal'));
-    assert.ok(result.events.includes('completion:automatic_memory_assessment_timeout'));
+    assert.ok(result.events.includes('completion:assessment_timeout'));
     assert.equal(result.events.includes('diagnostic:automatic_memory_assessment_completed:true'), false);
 });
 
 test('C.3 revocation after timeout invalidates a non-cooperative late result', async () => {
     const input = 'Synthetic in-flight turn.\n/automatic-memory revoke-consent\nMensaje tras revocar el consentimiento.\n';
     const { result } = await run('timeout-revoke', input);
-    assert.ok(result.events.includes('completion:automatic_memory_assessment_timeout'));
+    assert.ok(result.events.includes('completion:assessment_timeout'));
     assert.ok(result.events.some(event => event.startsWith('revoked:')));
     assert.equal(result.events.includes('diagnostic:automatic_memory_assessment_completed:true'), false);
     assert.equal(result.detected.length, 1);

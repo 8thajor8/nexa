@@ -1,11 +1,11 @@
-import { readDirectUserTurn, releaseDirectUserTurn } from './direct-user-input.js';
+import { readDirectUserTurn, releaseDirectUserTurn, finalizeTrustedLocalTurnContext } from './direct-user-input.js';
 import { createMemoryService } from '../memory/service.js';
 import { authorizeMemoryRemember, authorizeMemoryForget, authorizePersonCreation, authorizeRelationCreation,
     authorizeRelationCorrection, authorizeRelationForget } from '../memory/authorization.js';
 import { createMemoryContextProvider, MEMORY_CONTEXT_POLICY } from '../memory/context-provider.js';
 import { openMemoryBackend } from '../memory/backend.js';
 import { randomUUID } from 'node:crypto';
-import { askOpenAI } from '../brain/openai.js';
+import { askOpenAI, isAutomaticMemoryLiveDetector } from '../brain/openai.js';
 import { config } from '../config.js';
 import { NEXA_INSTRUCTIONS } from '../prompts/nexa.js';
 import { loadMemory, memoryToPrompt, saveMemory } from '../memory/memory.js';
@@ -15,6 +15,8 @@ import { AUTOMATIC_MEMORY_ASSESSMENT_TIMEOUT_MS, AUTOMATIC_MEMORY_CONSENT_POLICY
     isCurrentAutomaticMemoryConsent, screenAutomaticMemoryTurn } from '../memory/automatic/privacy.js';
 import { createDefaultAutomaticMemoryConsentStore } from '../memory/automatic/consent-store.js';
 import { createDefaultAutomaticMemoryProposalQueue } from '../memory/automatic/proposal-queue.js';
+import { createAutomaticMemoryAssessmentBoundary } from '../memory/automatic/assessment-boundary.js';
+import { getAutomaticMemorySourcePolicy, getAutomaticMemoryToolSource } from '../memory/automatic/source-registry.js';
 
 function stableValue(value) {
     if (Array.isArray(value)) return value.map(stableValue);
@@ -74,6 +76,7 @@ export async function createAgent({
     if (typeof enableAutomaticMemoryAssessment !== 'boolean'
         || (automaticMemoryDetector !== null && typeof automaticMemoryDetector?.detect !== 'function')
         || (enableAutomaticMemoryAssessment && automaticMemoryDetector === null)
+        || (enableAutomaticMemoryAssessment && isAutomaticMemoryLiveDetector(automaticMemoryDetector))
         || !Number.isSafeInteger(automaticMemoryAssessmentTimeoutMs) || automaticMemoryAssessmentTimeoutMs < 1
         || automaticMemoryAssessmentTimeoutMs > AUTOMATIC_MEMORY_ASSESSMENT_TIMEOUT_MS
         || typeof automaticMemoryConsentStore?.load !== 'function' || typeof automaticMemoryConsentStore?.grant !== 'function'
@@ -107,6 +110,9 @@ export async function createAgent({
     let activeAutomaticAssessment = null, assessmentGeneration = 0;
     let conversationAutomaticMemoryExcluded = false;
     let lastRunAssessmentEligible = false;
+    let activeDirectTurn = null;
+    let automaticAssessmentContextTainted = false;
+    let automaticAssessmentSessionUsed = false;
     const memoryToolNames = new Set(['remember', 'forget', 'recall', 'memory_context_snapshot', 'create_person',
         'create_relation', 'correct_relation', 'forget_relation', 'relations_for_entity']);
     function enqueue(operation) {
@@ -117,61 +123,87 @@ export async function createAgent({
 
     async function completePendingAutomaticMemoryAssessment() {
         const pending = pendingAutomaticMemoryAssessment;
+        const directTurn = activeDirectTurn;
         pendingAutomaticMemoryAssessment = null; // consume before awaiting; repeated calls cannot assess twice.
-        await refreshPersistentAutomaticMemoryConsent();
-        if (!enableAutomaticMemoryAssessment || !automaticMemoryDetector || !pending
-            || !isCurrentAutomaticMemoryConsent(automaticMemoryConsent, sessionId)
-            || automaticMemoryConsent.excludedConversations?.includes(sessionId))
-            return { success: true, assessed: false };
-        const screening = screenAutomaticMemoryTurn(pending.text);
-        if (!screening.eligible) {
-            diagnostic('automatic_memory_assessment_skipped', { code: screening.reason });
-            return { success: true, assessed: false, reason: screening.reason };
-        }
-        if (activeAutomaticAssessment) return { success: true, assessed: false, reason: 'assessment_already_in_flight' };
+        const finishTurn = () => {
+            if (!directTurn) return;
+            finalizeTrustedLocalTurnContext(directTurn.runtimeContextCapability, directTurn.recipient);
+            if (activeDirectTurn === directTurn) activeDirectTurn = null;
+        };
+        try {
+            await refreshPersistentAutomaticMemoryConsent();
+            if (!enableAutomaticMemoryAssessment || !assessmentBoundary || !pending
+                || !isCurrentAutomaticMemoryConsent(automaticMemoryConsent, sessionId)
+                || automaticMemoryConsent.excludedConversations?.includes(sessionId))
+                return { success: true, assessed: false };
+            if (activeAutomaticAssessment) return { success: true, assessed: false, reason: 'assessment_already_in_flight' };
 
-        const controller = new AbortController();
-        const generation = assessmentGeneration;
-        const consent = automaticMemoryConsent;
-        const job = { controller, generation };
-        activeAutomaticAssessment = job;
-        // Attach both settlement handlers immediately. Even a non-cooperative detector
-        // cannot create an unhandled rejection after timeout/revocation.
-        const settled = Promise.resolve().then(() => automaticMemoryDetector.detect({ text: pending.text,
-            signal: controller.signal })).then(() => {
-            if (controller.signal.aborted || generation !== assessmentGeneration
-                || !isCurrentAutomaticMemoryConsent(automaticMemoryConsent, sessionId)
-                || automaticMemoryConsent !== consent) return { success: true, assessed: false, reason: 'assessment_invalidated' };
-            diagnostic('automatic_memory_assessment_completed', { success: true });
-            return { success: true, assessed: true };
-        }, () => {
-            if (controller.signal.aborted || generation !== assessmentGeneration
-                || !isCurrentAutomaticMemoryConsent(automaticMemoryConsent, sessionId)
-                || automaticMemoryConsent !== consent) return { success: true, assessed: false, reason: 'assessment_invalidated' };
+            const controller = new AbortController();
+            const generation = assessmentGeneration;
+            const job = { controller, generation };
+            activeAutomaticAssessment = job;
+            const result = await assessmentBoundary.assess({ capability: pending.runtimeContextCapability,
+                recipient: pending.recipient, text: pending.text, signal: controller.signal });
+            if (activeAutomaticAssessment === job) activeAutomaticAssessment = null;
+            if (controller.signal.aborted || generation !== assessmentGeneration)
+                return { success: true, assessed: false, reason: 'assessment_invalidated' };
+            if (result.success && result.assessed) {
+                diagnostic('automatic_memory_assessment_completed', { success: true,
+                    candidateCount: result.candidates.length });
+                return result;
+            }
+            const code = result.error?.code ?? result.reason ?? 'automatic_memory_assessment_failed';
+            diagnostic('automatic_memory_assessment_completed', { success: false, code });
+            return result;
+        } catch {
             diagnostic('automatic_memory_assessment_completed', { success: false,
                 code: 'automatic_memory_assessment_failed' });
-            return { success: false, assessed: true, error: { code: 'automatic_memory_assessment_failed' } };
-        });
-        settled.then(() => { if (activeAutomaticAssessment === job) activeAutomaticAssessment = null; });
-
-        let timer;
-        const timeout = new Promise(resolve => {
-            timer = setTimeout(() => {
-                assessmentGeneration++;
-                controller.abort();
-                diagnostic('automatic_memory_assessment_timed_out', { code: 'automatic_memory_assessment_timeout' });
-                resolve({ success: false, assessed: true, error: { code: 'automatic_memory_assessment_timeout' } });
-            }, automaticMemoryAssessmentTimeoutMs);
-        });
-        try { return await Promise.race([settled, timeout]); }
-        finally { clearTimeout(timer); }
+            return { success: false, assessed: false, error: { code: 'automatic_memory_assessment_failed' } };
+        } finally {
+            if (activeAutomaticAssessment?.controller.signal.aborted) activeAutomaticAssessment = null;
+            finishTurn();
+        }
     }
     const sessionId = randomUUID();
+    const assessmentBoundary = automaticMemoryDetector ? createAutomaticMemoryAssessmentBoundary({
+        detector: { detect: input => {
+            automaticAssessmentSessionUsed = true;
+            return automaticMemoryDetector.detect(input);
+        } },
+        consentStore: { load: async () => { await refreshPersistentAutomaticMemoryConsent(); return automaticMemoryConsent; } },
+        analysisEnabled: async () => Boolean(enableAutomaticMemoryAssessment && automaticMemoryDetector
+            && !automaticAssessmentContextTainted),
+        isConversationExcluded: async () => Boolean(conversationAutomaticMemoryExcluded
+            || automaticMemoryConsent?.excludedConversations?.includes(sessionId)),
+        timeoutMs: automaticMemoryAssessmentTimeoutMs,
+    }) : null;
     try { automaticMemoryConsent = await automaticMemoryConsentStore.load(); }
     catch { automaticMemoryConsent = null; }
 
     function diagnostic(event, details = {}) {
         try { logger(event, details); } catch { /* diagnostics never change agent behavior */ }
+    }
+
+    function recordTrustedExposure(kind, sourcePolicy) {
+        const turn = activeDirectTurn;
+        if (!turn) {
+            automaticAssessmentContextTainted = true;
+            assessmentBoundary?.cancelActive();
+            return false;
+        }
+        lastRunAssessmentEligible = false;
+        turn.exposed = true;
+        automaticAssessmentContextTainted = true;
+        if (!assessmentBoundary || turn.exposureRecorded) return Boolean(assessmentBoundary);
+        turn.exposureRecorded = true;
+        const event = assessmentBoundary.recordUntrustedContextExposure({
+            capability: turn.runtimeExposureCapability, recipient: turn.recipient, text: turn.message,
+            kind, sourceId: sourcePolicy?.source ?? 'tool:unclassified',
+        });
+        if (event.success !== true) turn.exposureRecordingFailed = true;
+        diagnostic('automatic_memory_source_exposed', { source: event.source ?? 'tool:unclassified',
+            memoryPolicy: event.memoryPolicy ?? 'never_store' });
+        return event.success === true;
     }
 
     function invalidateAutomaticMemorySessionState() {
@@ -181,6 +213,7 @@ export async function createAgent({
         pendingAutomaticMemoryAssessment = null;
         assessmentGeneration++;
         activeAutomaticAssessment?.controller.abort();
+        assessmentBoundary?.cancelActive();
     }
 
     async function refreshPersistentAutomaticMemoryConsent() {
@@ -193,6 +226,7 @@ export async function createAgent({
             pendingAutomaticMemoryAssessment = null;
             assessmentGeneration++;
             activeAutomaticAssessment?.controller.abort();
+            assessmentBoundary?.cancelActive();
         }
         automaticMemoryConsent = latest;
         return latest;
@@ -232,6 +266,7 @@ export async function createAgent({
     function automaticMemoryControlState() {
         return Object.freeze({
             automaticAnalysisEnabled: Boolean(enableAutomaticMemoryAssessment && automaticMemoryDetector
+                && !automaticAssessmentContextTainted && !automaticAssessmentSessionUsed
                 && !conversationAutomaticMemoryExcluded && isCurrentAutomaticMemoryConsent(automaticMemoryConsent, sessionId)),
             automaticSavingEnabled: false,
             memoryRetrievalEnabled: selectedBackend.backend === 'memory2' ? memoryRetrievalEnabled : null,
@@ -256,6 +291,7 @@ ${memoryToPrompt(memory)}
     async function getModelResponse(tools, iteration, finalOnly = false) {
         const memoryContext = contextProvider && memoryRetrievalEnabled ? await contextProvider.read({ message: currentMessage,
             recentUserMessages: currentRecentUserMessages }) : null;
+        if (memoryContext) recordTrustedExposure('retrieved_memory', getAutomaticMemorySourcePolicy('memory'));
         if (memoryContext && contextDigest !== null && contextDigest !== memoryContext.digest) {
             // Discard all derived history, including possible assistant echoes of deleted facts.
             conversation.length = 0;
@@ -294,6 +330,7 @@ ${memoryToPrompt(memory)}
 
     async function run(userMessage, source = 'untrusted') {
         if (typeof userMessage !== 'string') throw new TypeError('user_message_must_be_text');
+        if (!activeDirectTurn || source !== 'direct_user') automaticAssessmentContextTainted = true;
         lastRunAssessmentEligible = true;
         currentMessage = userMessage; currentSource = source;
         currentRecentUserMessages = recentUserTurns.slice(-4);
@@ -360,6 +397,7 @@ ${memoryToPrompt(memory)}
 
                 const isSpotify = isSpotifyTool(toolCall.name);
                 const output = isSpotify ? spotifyModelSafeOutput(toolCall.name, result) : result;
+                recordTrustedExposure('tool_result', getAutomaticMemoryToolSource(toolCall.name));
                 if (isSpotify) spotifyMessages.push(formatSpotifyToolResult(toolCall.name, result));
                 conversation.push({
                     type: 'function_call_output',
@@ -382,9 +420,15 @@ ${memoryToPrompt(memory)}
         return enqueue(async () => {
             // A host that failed to complete the prior post-presentation phase loses that
             // assessment; never let it race with stdin or silently run it before a reply.
+            if (activeDirectTurn) {
+                finalizeTrustedLocalTurnContext(activeDirectTurn.runtimeContextCapability, activeDirectTurn.recipient);
+                activeDirectTurn = null;
+            }
             pendingAutomaticMemoryAssessment = null;
             const turn = await readDirectUserTurn(memory2 ?? agent);
             if (!turn) return { done: true };
+            activeDirectTurn = { ...turn, recipient: memory2 ?? agent, message: turn.message,
+                exposureRecorded: false, exposureRecordingFailed: false, exposed: false };
             try {
                 await refreshPersistentAutomaticMemoryConsent();
                 const { message, command, capability } = turn;
@@ -511,7 +555,9 @@ ${memoryToPrompt(memory)}
                     // No memory payload or proof is passed to the model or to tools.
                     return { done: false, response: result.success ? 'Memoria actualizada.' : result.error.message, memoryResult: result };
                 }
-                const mayAssess = enableAutomaticMemoryAssessment && automaticMemoryDetector && !conversationAutomaticMemoryExcluded
+                const mayAssess = enableAutomaticMemoryAssessment && automaticMemoryDetector
+                    && !automaticAssessmentContextTainted && !automaticAssessmentSessionUsed
+                    && !conversationAutomaticMemoryExcluded
                     && isCurrentAutomaticMemoryConsent(automaticMemoryConsent, sessionId);
                 const preflight = mayAssess ? screenAutomaticMemoryTurn(message) : null;
                 if (preflight && !preflight.eligible)
@@ -519,8 +565,10 @@ ${memoryToPrompt(memory)}
                 const response = await run(message, 'direct_user');
                 if (enableAutomaticMemoryAssessment && !command && message.trim()
                     && mayAssess && preflight?.eligible && lastRunAssessmentEligible
+                    && !activeDirectTurn.exposed && !activeDirectTurn.exposureRecordingFailed
                     && typeof response === 'string' && response.trim())
-                    pendingAutomaticMemoryAssessment = { text: message };
+                    pendingAutomaticMemoryAssessment = { text: message,
+                        runtimeContextCapability: turn.runtimeContextCapability, recipient: memory2 ?? agent };
                 return { done: false, response };
             } finally { releaseDirectUserTurn(turn.capability); }
         });
@@ -531,6 +579,13 @@ ${memoryToPrompt(memory)}
         completePresentedTurn: () => enqueue(completePendingAutomaticMemoryAssessment),
         memory, memoryBackend: selectedBackend.backend,
         get automaticMemoryControls() { return automaticMemoryControlState(); },
-        close: async () => { invalidateAutomaticMemorySessionState(); return selectedBackend.close(); } };
+        close: async () => {
+            if (activeDirectTurn) {
+                finalizeTrustedLocalTurnContext(activeDirectTurn.runtimeContextCapability, activeDirectTurn.recipient);
+                activeDirectTurn = null;
+            }
+            invalidateAutomaticMemorySessionState();
+            return selectedBackend.close();
+        } };
     return agent;
 }

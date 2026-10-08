@@ -7,6 +7,7 @@ const turns = new WeakMap();
 const runtimeSessions = new WeakMap();
 const activeSessions = new Set();
 const contextCapabilities = new WeakMap();
+const exposureCapabilities = new WeakMap();
 const confirmationCapabilities = new WeakMap();
 let reader, lines, current, currentContext, reading = false;
 
@@ -21,13 +22,20 @@ function expireContext(capability) {
     const state = contextCapabilities.get(capability);
     if (state) {
         state.session.capabilities.delete(capability);
+        if (state.exposureCapability) {
+            state.session.capabilities.delete(state.exposureCapability);
+            exposureCapabilities.delete(state.exposureCapability);
+        }
     }
     contextCapabilities.delete(capability);
 }
 
 function closeSession(session) {
     if (!session) return;
-    for (const capability of session.capabilities) contextCapabilities.delete(capability);
+    for (const capability of session.capabilities) {
+        contextCapabilities.delete(capability);
+        exposureCapabilities.delete(capability);
+    }
     for (const capability of session.confirmations) confirmationCapabilities.delete(capability);
     session.capabilities.clear();
     session.confirmations.clear();
@@ -79,14 +87,20 @@ export async function readDirectUserTurn(recipient) {
         turns.set(capability, { recipient, command: structuredClone(command), used: false });
         current = capability;
         const runtimeContextCapability = Object.freeze(Object.create(null));
+        const runtimeExposureCapability = Object.freeze(Object.create(null));
         contextCapabilities.set(runtimeContextCapability, {
             recipient, session, turnId, sourceTextSha256, origin: 'local_cli',
-            purpose: 'automatic_memory_assessment', consumed: false,
+            purpose: 'automatic_memory_assessment', consumed: false, exposureCapability: runtimeExposureCapability,
+        });
+        exposureCapabilities.set(runtimeExposureCapability, {
+            recipient, session, turnId, sourceTextSha256, origin: 'local_cli',
+            purpose: 'automatic_memory_exposure_recording', consumed: false,
         });
         turns.get(capability).runtimeContextCapability = runtimeContextCapability;
         session.capabilities.add(runtimeContextCapability);
+        session.capabilities.add(runtimeExposureCapability);
         currentContext = runtimeContextCapability;
-        return Object.freeze({ message: next.value, command, capability, runtimeContextCapability });
+        return Object.freeze({ message: next.value, command, capability, runtimeContextCapability, runtimeExposureCapability });
     } finally { reading = false; }
 }
 
@@ -188,9 +202,8 @@ export function isDirectUserTurnCurrent(capability, recipient) {
 }
 
 export function releaseDirectUserTurn(capability) {
-    const turn = turns.get(capability);
     turns.delete(capability);
-    if (turn?.runtimeContextCapability) expireContext(turn.runtimeContextCapability);
+    // Provenance remains valid only for the post-response completion window.
 }
 
 /** Consumes a one-use, purpose-bound proof issued only while reading real stdin.
@@ -200,8 +213,6 @@ export function consumeTrustedLocalTurnContext(capability, recipient, originalTe
     const state = capability && typeof capability === 'object' ? contextCapabilities.get(capability) : null;
     if (!state || state.consumed) throw denied();
     state.consumed = true;
-    state.session.capabilities.delete(capability);
-    contextCapabilities.delete(capability);
     const actualHash = typeof originalText === 'string'
         ? createHash('sha256').update(originalText, 'utf8').digest('hex') : null;
     if (state.recipient !== recipient || state.session.closed
@@ -211,6 +222,33 @@ export function consumeTrustedLocalTurnContext(capability, recipient, originalTe
         principalId: state.session.principalId, principalKind: state.session.principalKind,
         origin: state.origin, sourceTextSha256: state.sourceTextSha256,
         purpose: state.purpose, permissionScopes: Object.freeze([]) });
+}
+
+/** Consumes the separate proof used by trusted runtime source-exposure hooks. */
+export function consumeTrustedLocalTurnExposure(capability, recipient, originalText) {
+    const state = capability && typeof capability === 'object' ? exposureCapabilities.get(capability) : null;
+    if (!state || state.consumed) throw denied();
+    state.consumed = true;
+    const actualHash = typeof originalText === 'string'
+        ? createHash('sha256').update(originalText, 'utf8').digest('hex') : null;
+    if (state.recipient !== recipient || state.session.closed
+        || state.session.activeTurnId !== state.turnId || actualHash !== state.sourceTextSha256
+        || runtimeSessions.get(recipient) !== state.session) throw denied();
+    return Object.freeze({ sessionId: state.session.sessionId, turnId: state.turnId,
+        principalId: state.session.principalId, principalKind: state.session.principalKind,
+        origin: state.origin, sourceTextSha256: state.sourceTextSha256,
+        purpose: state.purpose, permissionScopes: Object.freeze([]) });
+}
+
+/** End the post-response provenance window; it grants no operation permission. */
+export function finalizeTrustedLocalTurnContext(capability, recipient) {
+    const state = capability && typeof capability === 'object' ? contextCapabilities.get(capability) : null;
+    if (!state || state.recipient !== recipient) return false;
+    const currentTurn = state.session.activeTurnId === state.turnId;
+    expireContext(capability);
+    if (currentTurn) state.session.activeTurnId = null;
+    if (currentContext === capability) currentContext = undefined;
+    return true;
 }
 
 export function closeDirectUserSession(recipient) {

@@ -1,4 +1,4 @@
-import { extractAutomaticMemoryProposal } from '../../brain/openai.js';
+import { extractAutomaticMemoryProposal, registerAutomaticMemoryLiveDetector } from '../../brain/openai.js';
 import { screenMemorySecret } from '../secret-screening.js';
 import { AUTOMATIC_MEMORY_MAX_INPUT_CHARS, normalizeAutomaticMemoryProposal } from './schema.js';
 
@@ -29,29 +29,50 @@ For a project decision, subject_text must be the exact project or workstream nam
 
 /** A proposal-only model adapter. No agent, MemoryService, repository, tools, or authorization is accepted. */
 export function createAutomaticMemoryDetector(options = {}) {
-    exactObject(options, ['extractCandidates'], 'automatic_memory_detector_options_invalid');
-    const extractCandidates = options.extractCandidates ?? extractAutomaticMemoryProposal;
+    if (!options || Reflect.ownKeys(options).length > 1) throw new TypeError('automatic_memory_detector_options_invalid');
+    if (Reflect.ownKeys(options).length === 1)
+        exactObject(options, ['extractCandidates'], 'automatic_memory_detector_options_invalid');
+    else exactObject(options, [], 'automatic_memory_detector_options_invalid');
+    const hasCustomExtractor = Object.hasOwn(options, 'extractCandidates') && options.extractCandidates !== undefined;
+    if (hasCustomExtractor && typeof options.extractCandidates !== 'function')
+        throw new TypeError('automatic_memory_detector_invalid');
+    const extractCandidates = hasCustomExtractor ? options.extractCandidates : extractAutomaticMemoryProposal;
+    const usesDefaultLiveExtractor = !hasCustomExtractor;
     if (typeof extractCandidates !== 'function') throw new TypeError('automatic_memory_detector_invalid');
-    return Object.freeze({
+    const detector = Object.freeze({
         async detect(input) {
-            exactObject(input, ['text'], 'automatic_memory_detector_input_invalid');
+            if (!input || (Reflect.ownKeys(input).length !== 1 && Reflect.ownKeys(input).length !== 2))
+                throw new TypeError('automatic_memory_detector_input_invalid');
+            exactObject(input, Reflect.ownKeys(input).includes('signal') ? ['text', 'signal'] : ['text'],
+                'automatic_memory_detector_input_invalid');
+            if (input.signal !== undefined && !(input.signal instanceof AbortSignal))
+                throw new TypeError('automatic_memory_detector_input_invalid');
+            if (input.signal?.aborted) return { success: false, error: { code: 'candidate_detection_cancelled', message: 'Candidate detection was cancelled.' } };
             if (typeof input.text !== 'string' || !input.text.isWellFormed() || input.text.length > AUTOMATIC_MEMORY_MAX_INPUT_CHARS)
                 return { success: false, error: { code: 'candidate_input_invalid', message: 'Candidate input was rejected.' } };
             // Do not send a likely credential to this additional extraction call.
             if (!screenMemorySecret(input.text).safe)
                 return { success: false, error: { code: 'secret_blocked_before_detection', message: 'Sensitive credential-like input was not evaluated.' } };
             let output;
-            try { output = await extractCandidates({ text: input.text, instructions: EXTRACTION_INSTRUCTIONS }); }
+            try { output = await extractCandidates({ text: input.text, instructions: EXTRACTION_INSTRUCTIONS,
+                ...(input.signal === undefined ? {} : { signal: input.signal }) }); }
             catch (error) {
                 const knownCodes = new Set(['automatic_memory_response_incomplete', 'automatic_memory_response_refused', 'automatic_memory_response_invalid']);
                 const code = error?.name === 'AutomaticMemoryResponseError' && knownCodes.has(error.code)
                     ? error.code : 'candidate_detection_unavailable';
                 return { success: false, error: { code, message: 'Candidate detection is unavailable.' } };
             }
+            if (input.signal?.aborted)
+                return { success: false, error: { code: 'candidate_detection_cancelled', message: 'Candidate detection was cancelled.' } };
             const normalized = normalizeAutomaticMemoryProposal(output);
             return normalized.success ? normalized : { success: false, error: normalized.error, normalization: normalized.normalization ?? [] };
         },
     });
+    // Prevent the C.2 test hook from accidentally making the default live
+    // Responses adapter callable with plain text. Explicit evaluation remains
+    // a separate, gated CLI workflow.
+    if (usesDefaultLiveExtractor) registerAutomaticMemoryLiveDetector(detector);
+    return detector;
 }
 
 export { EXTRACTION_INSTRUCTIONS };
