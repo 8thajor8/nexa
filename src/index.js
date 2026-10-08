@@ -23,10 +23,13 @@ try {
             const turn = await nexa.readAndRun();
             if (turn.done) break;
             const response = turn.response;
-            if (!response) continue;
-
-            console.log(`Nexa > ${response}`);
-            console.log('');
+            if (response) {
+                console.log(`Nexa > ${response}`);
+                console.log('');
+            }
+            // Experimental assessment runs only after the answer is visible and before
+            // the next direct-user stdin read. It is disabled unless explicitly injected.
+            await nexa.completePresentedTurn();
         } catch (error) {
             console.error('Nexa ERROR >', error.message);
             console.log('');

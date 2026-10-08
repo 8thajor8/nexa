@@ -60,7 +60,14 @@ export async function createAgent({
     execute = executeTool,
     maxToolIterations = config.maxToolIterations,
     logger = writeAgentDiagnostic,
+    enableAutomaticMemoryAssessment = false,
+    automaticMemoryDetector = null,
 } = {}) {
+    if (typeof enableAutomaticMemoryAssessment !== 'boolean'
+        || (automaticMemoryDetector !== null && typeof automaticMemoryDetector?.detect !== 'function')
+        || (enableAutomaticMemoryAssessment && automaticMemoryDetector === null)) {
+        throw new TypeError('automatic_memory_assessment_configuration_invalid');
+    }
     let selectedBackend;
     if (memory2Repository) {
         if (memoryBackend !== 'memory2') throw new Error('Injected Memory 2 repository requires memoryBackend=memory2.');
@@ -77,12 +84,32 @@ export async function createAgent({
     let queue = Promise.resolve();
     let currentMessage = '', currentSource = 'untrusted', contextDigest = null;
     let recentUserTurns = [], currentRecentUserMessages = [];
+    let pendingAutomaticMemoryAssessment = null;
+    let lastRunAssessmentEligible = false;
     const memoryToolNames = new Set(['remember', 'forget', 'recall', 'memory_context_snapshot', 'create_person',
         'create_relation', 'correct_relation', 'forget_relation', 'relations_for_entity']);
     function enqueue(operation) {
         const next = queue.then(operation);
         queue = next.catch(() => {});
         return next;
+    }
+
+    async function completePendingAutomaticMemoryAssessment() {
+        const pending = pendingAutomaticMemoryAssessment;
+        pendingAutomaticMemoryAssessment = null; // consume before awaiting; repeated calls cannot assess twice.
+        if (!enableAutomaticMemoryAssessment || !pending) return { success: true, assessed: false };
+        try {
+            // The detector receives only the exact original direct-user text. It receives
+            // no turn capability, authorization coordinator, repository, history, or tools.
+            await automaticMemoryDetector.detect({ text: pending.text });
+            diagnostic('automatic_memory_assessment_completed', { success: true });
+            return { success: true, assessed: true };
+        } catch {
+            // An experimental assessment failure must not change the already-produced reply.
+            diagnostic('automatic_memory_assessment_completed', { success: false,
+                code: 'automatic_memory_assessment_failed' });
+            return { success: false, assessed: true, error: { code: 'automatic_memory_assessment_failed' } };
+        }
     }
     const sessionId = randomUUID();
 
@@ -118,6 +145,7 @@ ${memoryToPrompt(memory)}
             input: memoryContext ? [...memoryContext.items, ...structuredClone(conversation)] : conversation,
             tools: memory2 ? tools.filter(tool => !memoryToolNames.has(tool.name)) : tools,
         });
+        if (response?.status !== 'completed') lastRunAssessmentEligible = false;
         conversation.push(...(response.output ?? []));
         const toolCalls = (response.output ?? []).filter(item => item.type === 'function_call');
         diagnostic('model_response', {
@@ -142,6 +170,7 @@ ${memoryToPrompt(memory)}
 
     async function run(userMessage, source = 'untrusted') {
         if (typeof userMessage !== 'string') throw new TypeError('user_message_must_be_text');
+        lastRunAssessmentEligible = true;
         currentMessage = userMessage; currentSource = source;
         currentRecentUserMessages = recentUserTurns.slice(-4);
         recentUserTurns = [...recentUserTurns, userMessage.slice(0, 1000)].slice(-8);
@@ -227,6 +256,9 @@ ${memoryToPrompt(memory)}
     // No method accepting a caller string can assert trusted Memory 2 provenance.
     async function readAndRun() {
         return enqueue(async () => {
+            // A host that failed to complete the prior post-presentation phase loses that
+            // assessment; never let it race with stdin or silently run it before a reply.
+            pendingAutomaticMemoryAssessment = null;
             const turn = await readDirectUserTurn(memory2 ?? agent);
             if (!turn) return { done: true };
             try {
@@ -258,11 +290,19 @@ ${memoryToPrompt(memory)}
                     // No memory payload or proof is passed to the model or to tools.
                     return { done: false, response: result.success ? 'Memoria actualizada.' : result.error.message, memoryResult: result };
                 }
-                return { done: false, response: await run(message, 'direct_user') };
+                const response = await run(message, 'direct_user');
+                if (enableAutomaticMemoryAssessment && !command && message.trim()
+                    && lastRunAssessmentEligible && typeof response === 'string' && response.trim())
+                    pendingAutomaticMemoryAssessment = { text: message };
+                return { done: false, response };
             } finally { releaseDirectUserTurn(turn.capability); }
         });
     }
-    const agent = { run: message => enqueue(() => run(message)), readAndRun, memory,
-        memoryBackend: selectedBackend.backend, close: () => selectedBackend.close() };
+    const agent = { run: message => enqueue(() => run(message)), readAndRun,
+        // The CLI calls this only after presenting readAndRun()'s response. It takes no
+        // caller text or proof and is deliberately not exposed as a model tool.
+        completePresentedTurn: () => enqueue(completePendingAutomaticMemoryAssessment),
+        memory, memoryBackend: selectedBackend.backend,
+        close: () => { pendingAutomaticMemoryAssessment = null; return selectedBackend.close(); } };
     return agent;
 }
