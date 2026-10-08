@@ -10,6 +10,10 @@ const patterns = Object.freeze([
     ['credential', /\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|secret[_ -]?key)\s*[:=]\s*["']?[A-Za-z0-9_./+=-]{12,}/iu],
     ['password', /\b(?:password|passwd|pwd)\s*[:=]\s*["']?[^\s"'`]{12,}/iu],
     ['credential', /\b(?:auth[_ -]?cookie|session[_ -]?cookie)\s*[:=]\s*["']?[^\s"'`]{12,}/iu],
+    // User-labelled credentials and recovery codes are screened even when a
+    // synthetic or newly issued value is shorter than provider-specific tokens.
+    ['credential', /\b(?:password|passwd|pwd|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|secret[_ -]?key|session[_ -]?cookie|auth[_ -]?cookie)\s*[:=]\s*["']?[^\s"'`]{1,}/iu],
+    ['recovery_code', /\b(?:recovery|backup|one[- ]time)\s+(?:code|codes|key)\s*[:=]?\s*["']?[A-Za-z0-9-]{4,}/iu],
 ]);
 
 /** Returns a reason code only; never returns the match or surrounding text. */
