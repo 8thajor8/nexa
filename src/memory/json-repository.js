@@ -1,8 +1,12 @@
 import * as nativeFs from 'node:fs/promises';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { MemorySchemaError, validateMemoryStore } from './schema.js';
 import { MemoryRepositoryError, applyChanges, contentDigest, immutableSnapshot, prepareCommitRequest } from './repository.js';
+import { createAutomaticMemoryPersistenceContract } from './automatic/persistence-contract.js';
+import { normalizeAutomaticMemoryProposal } from './automatic/schema.js';
+import { consumeAutomaticMemoryAuthorization } from './automatic/authorization-coordinator.js';
+import { screenMemorySecret } from './secret-screening.js';
 
 const processOwners = new Map();
 
@@ -83,6 +87,71 @@ export function createJsonMemoryRepository({ storePath, fileSystem = {}, now = (
         published = immutableSnapshot(current.store, current.digest);
         return published;
     }
+    const automaticFailure = code => ({ success: false, outcome: 'rejected', error: { code } });
+    function stableJson(value) {
+        if (Array.isArray(value)) return '[' + value.map(stableJson).join(',') + ']';
+        if (value && typeof value === 'object') return '{' + Object.keys(value).sort()
+            .map(key => JSON.stringify(key) + ':' + stableJson(value[key])).join(',') + '}';
+        return JSON.stringify(value);
+    }
+    const sha256 = value => createHash('sha256').update(value).digest('hex');
+    function consumeInvalidAttempt(input) {
+        try {
+            consumeAutomaticMemoryAuthorization(input?.capability, { recipient: input?.recipient,
+                operation: null, operationFingerprint: '', snapshotRevision: -1,
+                snapshotDigest: '', targetAssertionId: null });
+        } catch { /* The coordinator consumes before validating the binding. */ }
+    }
+    async function persistCandidate(original, candidate) {
+        const bytes = Buffer.from(JSON.stringify(candidate, null, 2) + '\n', 'utf8');
+        const candidateDigest = contentDigest(bytes);
+        const temporaryPath = path.join(path.dirname(destination), '.' + path.basename(destination) + '.' + randomUUID() + '.tmp');
+        let temporaryCreated = false;
+        let handle;
+        let replacementAttempted = false;
+        try {
+            handle = await fs.open(temporaryPath, 'wx', 0o600);
+            temporaryCreated = true;
+            await handle.writeFile(bytes);
+            await handle.sync();
+            await handle.close();
+            handle = undefined;
+            await verifyOwnership();
+            assertUnchanged(await readDisk());
+            replacementAttempted = true;
+            await fs.rename(temporaryPath, destination);
+            const committed = await readDisk();
+            if (committed.digest !== candidateDigest || committed.store.store_id !== original.store.store_id) {
+                state = 'uncertain';
+                throw new MemoryRepositoryError('memory_commit_uncertain');
+            }
+            return publish(committed);
+        } catch (cause) {
+            if (replacementAttempted) {
+                let current;
+                try { current = await readDisk(); }
+                catch (readCause) {
+                    state = 'uncertain';
+                    throw new MemoryRepositoryError('memory_commit_uncertain', { cause: readCause });
+                }
+                if (current.digest === candidateDigest && current.store.store_id === original.store.store_id) {
+                    state = 'open';
+                    return publish(current);
+                }
+                if (current.digest === original.digest && current.store.store_id === original.store.store_id) {
+                    state = 'open';
+                    throw new MemoryRepositoryError('memory_persist_failed', { cause });
+                }
+                state = 'uncertain';
+                throw new MemoryRepositoryError('memory_commit_uncertain', { cause });
+            }
+            if (cause instanceof MemoryRepositoryError) throw cause;
+            throw new MemoryRepositoryError('memory_persist_failed', { cause });
+        } finally {
+            if (handle) await handle.close().catch(() => {});
+            if (temporaryCreated) await fs.unlink(temporaryPath).catch(() => {});
+        }
+    }
     async function open() {
         return serialized(async () => {
             if (state === 'open') return published;
@@ -132,6 +201,17 @@ export function createJsonMemoryRepository({ storePath, fileSystem = {}, now = (
             return published;
         });
     }
+    function readAutomaticMemorySnapshot() {
+        return serialized(async () => {
+            requireOpen();
+            await verifyOwnership();
+            const current = await readDisk();
+            assertUnchanged(current);
+            // B.2a fingerprints canonical JSON semantics; the repository's
+            // `digest` remains the byte-level CAS token used for persistence.
+            return immutableSnapshot(current.store, sha256(JSON.stringify(current.store)));
+        });
+    }
     function commit(request) {
         let prepared;
         try { prepared = prepareCommitRequest(request); }
@@ -147,58 +227,132 @@ export function createJsonMemoryRepository({ storePath, fileSystem = {}, now = (
             let candidate;
             try { candidate = applyChanges(original.store, prepared.changes, now()); }
             catch (cause) { throw cause instanceof MemoryRepositoryError ? cause : new MemoryRepositoryError('memory_invalid_changes', { cause }); }
-            const bytes = Buffer.from(JSON.stringify(candidate, null, 2) + '\n', 'utf8');
-            const candidateDigest = contentDigest(bytes);
-            const temporaryPath = path.join(path.dirname(destination), '.' + path.basename(destination) + '.' + randomUUID() + '.tmp');
-            let temporaryCreated = false;
-            let handle;
-            let replacementAttempted = false;
-            try {
-                handle = await fs.open(temporaryPath, 'wx', 0o600);
-                temporaryCreated = true;
-                await handle.writeFile(bytes);
-                await handle.sync();
-                await handle.close();
-                handle = undefined;
-                // Recheck after staging; never overwrite an observed external edit.
-                await verifyOwnership();
-                assertUnchanged(await readDisk());
-                replacementAttempted = true;
-                await fs.rename(temporaryPath, destination);
-                const committed = await readDisk();
-                if (committed.digest !== candidateDigest || committed.store.store_id !== original.store.store_id) {
-                    state = 'uncertain';
-                    throw new MemoryRepositoryError('memory_commit_uncertain');
-                }
-                return publish(committed);
-            } catch (cause) {
-                if (replacementAttempted) {
-                    // A rename can succeed before its wrapper/OS reports an error.
-                    // Reconcile actual bytes before publishing or claiming failure.
-                    let current;
-                    try { current = await readDisk(); }
-                    catch (readCause) {
-                        state = 'uncertain';
-                        throw new MemoryRepositoryError('memory_commit_uncertain', { cause: readCause });
-                    }
-                    if (current.digest === candidateDigest && current.store.store_id === original.store.store_id) {
-                        state = 'open';
-                        return publish(current);
-                    }
-                    if (current.digest === original.digest && current.store.store_id === original.store.store_id) {
-                        state = 'open';
-                        throw new MemoryRepositoryError('memory_persist_failed', { cause });
-                    }
-                    state = 'uncertain';
-                    throw new MemoryRepositoryError('memory_commit_uncertain', { cause });
-                }
-                if (cause instanceof MemoryRepositoryError) throw cause;
-                throw new MemoryRepositoryError('memory_persist_failed', { cause });
-            } finally {
-                if (handle) await handle.close().catch(() => {});
-                // Never remove a path we failed to exclusively create.
-                if (temporaryCreated) await fs.unlink(temporaryPath).catch(() => {});
+            // Recheck after staging inside persistCandidate; never overwrite an observed edit.
+            return persistCandidate(original, candidate);
+        });
+    }
+    function commitAutomaticOperation(input) {
+        const required = ['text', 'proposal', 'snapshot', 'operationIndex', 'recipient', 'capability'];
+        const validShape = input && typeof input === 'object' && !Array.isArray(input)
+            && (Object.getPrototypeOf(input) === Object.prototype || Object.getPrototypeOf(input) === null)
+            && Reflect.ownKeys(input).length === required.length
+            && Reflect.ownKeys(input).every(key => typeof key === 'string' && required.includes(key)
+                && Object.hasOwn(Object.getOwnPropertyDescriptor(input, key) ?? {}, 'value')
+                && Object.getOwnPropertyDescriptor(input, key).enumerable);
+        if (!validShape || typeof input.text !== 'string' || !input.text.isWellFormed()
+            || !Number.isSafeInteger(input.operationIndex) || input.operationIndex < 0
+            || !input.recipient || typeof input.recipient !== 'object'
+            || !input.snapshot || typeof input.snapshot !== 'object') {
+            consumeInvalidAttempt(input);
+            return Promise.resolve(automaticFailure('automatic_input_shape_invalid'));
+        }
+        let contract;
+        let normalized;
+        try {
+            contract = createAutomaticMemoryPersistenceContract({ text: input.text,
+                proposal: input.proposal, snapshot: input.snapshot });
+            normalized = normalizeAutomaticMemoryProposal(input.proposal);
+        } catch (error) {
+            consumeInvalidAttempt(input);
+            return Promise.resolve(automaticFailure(typeof error?.code === 'string' && /^[a-z0-9_]{1,80}$/u.test(error.code)
+                ? error.code : 'automatic_contract_exception'));
+        }
+        if (!contract.success || !normalized.success) {
+            consumeInvalidAttempt(input);
+            return Promise.resolve(automaticFailure(contract.error?.code ?? normalized.error?.code ?? 'automatic_operation_invalid'));
+        }
+        const operation = contract.operations[input.operationIndex];
+        const candidate = operation && normalized.proposal.candidates[operation.candidateIndex];
+        if (!operation || !candidate || !['ADD', 'REPLACE'].includes(operation.operation)
+            || input.snapshot.snapshot?.schema_version !== 5 || !contract.snapshotBinding
+            || operation.executable !== false || operation.writeReady !== false
+            || operation.authorization?.granted !== false
+            || (operation.operation === 'ADD' && operation.targetAssertionId !== null)
+            || (operation.operation === 'REPLACE' && typeof operation.targetAssertionId !== 'string')) {
+            consumeInvalidAttempt(input);
+            return Promise.resolve(automaticFailure('automatic_operation_not_eligible'));
+        }
+        const snapshotBinding = { revision: contract.snapshotBinding.revision,
+            digest: contract.snapshotBinding.digest, snapshotSha256: contract.snapshotBinding.snapshotSha256 };
+        const operationFingerprint = sha256(stableJson({ version: 'automatic-memory-b2b7-coordinator-v1',
+            operation: operation.operation, candidate, idempotencyKey: operation.idempotency.key,
+            sourceBinding: operation.sourceBinding, snapshotBinding,
+            targetAssertionId: operation.targetAssertionId ?? null }));
+        const operationKey = operation.idempotency.key;
+        return serialized(async () => {
+            requireOpen();
+            await verifyOwnership();
+            const original = await readDisk();
+            assertUnchanged(original);
+            if (original.store.schema_version !== 5) {
+                consumeInvalidAttempt(input);
+                return automaticFailure('memory_schema_unsupported');
             }
+            const byKey = original.store.automatic_operations.find(item => item.operation_key === operationKey);
+            const byFingerprint = original.store.automatic_operations.find(item => item.operation_fingerprint_sha256 === operationFingerprint);
+            if (byKey || byFingerprint) {
+                if (byKey?.status === 'applied' && byKey.operation_fingerprint_sha256 === operationFingerprint
+                    && byKey.operation_kind === operation.operation && byKey === byFingerprint) {
+                    return { success: true, outcome: 'already_applied', revision: original.store.revision };
+                }
+                consumeInvalidAttempt(input);
+                return automaticFailure('automatic_idempotency_conflict');
+            }
+
+            // The coordinator burns the proof before validating these bindings.
+            const authorized = consumeAutomaticMemoryAuthorization(input.capability, { recipient: input.recipient,
+                operation: operation.operation, operationFingerprint,
+                snapshotRevision: snapshotBinding.revision, snapshotDigest: snapshotBinding.digest,
+                targetAssertionId: operation.targetAssertionId ?? null });
+            if (!authorized.success) return automaticFailure(authorized.error?.code ?? 'automatic_authorization_rejected');
+
+            const semanticSnapshotDigest = sha256(JSON.stringify(original.store));
+            if (snapshotBinding.revision !== original.store.revision || snapshotBinding.digest !== semanticSnapshotDigest
+                || snapshotBinding.snapshotSha256 !== semanticSnapshotDigest) {
+                return automaticFailure('memory_revision_conflict');
+            }
+            if (!screenMemorySecret(input.text).safe || !screenMemorySecret(JSON.stringify(candidate)).safe)
+                return automaticFailure('automatic_secret_blocked');
+
+            const timestamp = now();
+            const assertionId = `mem_${randomUUID()}`;
+            const sourceId = `src_${randomUUID()}`;
+            const evidenceId = `ev_${randomUUID()}`;
+            const targetId = operation.targetAssertionId ?? null;
+            const target = targetId && original.store.assertions.find(record => record.id === targetId);
+            if (operation.operation === 'REPLACE' && (!target || target.status !== 'active'
+                || target.subject.type !== 'entity' || target.subject.id !== original.store.self_person_id
+                || target.predicate !== candidate.predicate || target.object?.type !== 'text')) {
+                return automaticFailure('automatic_target_conflict');
+            }
+            const assertion = { id: assertionId, kind: candidate.candidate_type === 'preference' ? 'preference' : 'fact',
+                subject: { type: 'entity', entity_type: 'person', id: original.store.self_person_id },
+                predicate: candidate.predicate, object: { type: 'text', value: candidate.value_text },
+                status: 'active', valid_from: null, valid_to: null, recorded_at: timestamp,
+                supersedes: targetId ? [targetId] : [], compatibility: null };
+            const source = { id: sourceId, kind: 'inference', origin_trust: 'derived_untrusted', authority: 'data_only',
+                locator: null, occurred_at: null, recorded_at: timestamp };
+            const evidence = { id: evidenceId, assertion_id: assertionId, source_id: sourceId,
+                derivation: 'inferred', extraction_confidence: candidate.linguistic_confidence,
+                learned_at: timestamp, last_confirmed_at: null, legacy_ref: null };
+            const receipt = { operation_key: operationKey, operation_fingerprint_sha256: operationFingerprint,
+                operation_kind: operation.operation, status: 'applied', authorization_request_id: `req_${authorized.requestId}`,
+                expected_revision: original.store.revision, expected_digest: original.digest,
+                result_revision: original.store.revision + 1, result_assertion_id: assertionId,
+                target_assertion_id: targetId, result_code: null, recorded_at: timestamp };
+            const changes = [
+                ...(target ? [{ type: 'put', collection: 'assertions', record: { ...target, status: 'superseded' } }] : []),
+                { type: 'put', collection: 'assertions', record: assertion },
+                { type: 'put', collection: 'sources', record: source },
+                { type: 'put', collection: 'evidence', record: evidence },
+                { type: 'put', collection: 'automatic_operations', record: receipt },
+            ];
+            let candidateStore;
+            try { candidateStore = applyChanges(original.store, changes, timestamp); }
+            catch { return automaticFailure('automatic_operation_invalid'); }
+            const committed = await persistCandidate(original, candidateStore);
+            return { success: true, outcome: 'applied', revision: committed.revision,
+                assertionId, operationKey };
         });
     }
     function close() {
@@ -208,5 +362,6 @@ export function createJsonMemoryRepository({ storePath, fileSystem = {}, now = (
             finally { state = 'closed'; published = undefined; }
         });
     }
-    return Object.freeze({ open, readSnapshot, commit, close });
+    return Object.freeze({ open, readSnapshot, readAutomaticMemorySnapshot, commit,
+        commitAutomaticOperation, close });
 }

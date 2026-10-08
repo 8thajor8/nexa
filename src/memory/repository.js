@@ -65,6 +65,9 @@ export function prepareCommitRequest(request) {
             if (!COLLECTIONS.includes(collection)) throw new Error();
             if (type === 'put') {
                 assertExactObject(change, ['type', 'collection', 'record']);
+                // Automatic-operation receipts can only be published by the
+                // authorized transaction owned by the JSON repository.
+                if (collection === 'automatic_operations') throw new Error();
                 validateMemoryRecord(collection, change.record);
             } else if (type === 'delete') {
                 if (collection === 'entities' || collection === 'automatic_operations') throw new Error(); // Entity/receipt deletion is forbidden.
