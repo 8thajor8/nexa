@@ -1,5 +1,7 @@
 # Automatic Memory C.3 — Consentimiento y controles de privacidad
 
+> Nota de evolución: C.3 documenta el consentimiento volátil original. Automatic Memory C.4 agrega el consentimiento local persistente y la cola experimental; el estado actual y sus límites están en `automatic-memory-c4.md`.
+
 ## Estado
 
 C.3 implementa controles de sesión, consentimiento explícito, filtro previo y límite de ejecución para el hook experimental. El extractor real no está conectado a la CLI, no se hacen llamadas adicionales a OpenAI y el detector simulado solo se usa en pruebas. No hay aprendizaje ni escritura de recuerdos.

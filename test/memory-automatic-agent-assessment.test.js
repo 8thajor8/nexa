@@ -15,8 +15,22 @@ import assert from 'node:assert/strict';
 import { createAgent } from './src/core/agent.js';
 import { closeDirectUserInput } from './src/core/direct-user-input.js';
 const mode = ${JSON.stringify(mode)};
+const policyVersion = ${JSON.stringify(AUTOMATIC_MEMORY_CONSENT_POLICY_VERSION)};
 const events = [], detected = [];
 let askCount = 0, toolCount = 0, saveCount = 0, releaseDetector = null;
+let storedConsent = null;
+const syntheticConsentStore = {
+  load: async () => storedConsent,
+  grant: async () => storedConsent = { consentId: '00000000-0000-4000-8000-000000000001',
+    grantedAt: new Date().toISOString(), policyVersion,
+    purpose: 'assess_future_direct_user_turns_for_possible_memory_candidates',
+    scope: 'future_direct_user_turns_across_runtime_sessions', grantsMemoryWrite: false },
+  revoke: async () => { storedConsent = null; return { success: true }; },
+};
+const syntheticProposalQueue = { listGrouped: async () => [], review: async () => null,
+  approve: async (id, fingerprint) => { events.push('proposal-approved:' + id + ':' + fingerprint); return { success: true }; }, reject: async () => ({ success: false }),
+  discard: async () => ({ success: false }), excludeConversation: async id => { events.push('excluded:' + id); return { success: true }; },
+  revokeConsent: async id => { events.push('consent-revoked:' + id); return { success: true }; } };
 if (mode === 'missing-detector') {
   await assert.rejects(createAgent({ memoryBackend: 'memory1', load: async () => ({}),
     enableAutomaticMemoryAssessment: true }), /automatic_memory_assessment_configuration_invalid/u);
@@ -37,6 +51,7 @@ if (mode === 'missing-detector') {
     return { success: true, proposal: { private: 'ignored result' } };
   } };
   const agent = await createAgent({ memoryBackend: 'memory1', load: async () => ({ user: {}, preferences: {}, facts: [] }),
+    automaticMemoryConsentStore: syntheticConsentStore, automaticMemoryProposalQueue: syntheticProposalQueue,
     save: async () => { saveCount++; }, getTools: () => [{ name: 'synthetic_tool' }],
     execute: async (name, args) => { toolCount++; return { success: true, value: 'tool output must not be assessed' }; },
     logger: (event, details) => events.push('diagnostic:' + event + ':' + (details.success ?? details.code ?? '')),
@@ -67,6 +82,22 @@ if (mode === 'missing-detector') {
     const next = await agent.readAndRun();
     events.push('response:visible:' + next.response);
     await agent.completePresentedTurn();
+    await agent.close();
+  } else if (mode === 'exclude') {
+    const excluded = await agent.readAndRun();
+    events.push('excluded-response:' + excluded.response);
+    const next = await agent.readAndRun();
+    events.push('after-exclusion:' + next.response);
+    await agent.completePresentedTurn();
+    await agent.close();
+  } else if (mode === 'proposal') {
+    syntheticProposalQueue.review = async id => id === 'prop_00000000-0000-4000-8000-000000000002'
+      ? { proposalId: id, fingerprint: 'a'.repeat(64), action: 'ADD', category: 'health_sensitive', sensitive: true,
+        summary: 'Seguimiento de salud personal', targetSummary: null } : null;
+    const review = await agent.readAndRun();
+    console.log('__PROPOSAL_REVIEW__' + review.response);
+    const confirmation = await agent.readAndRun();
+    console.log('__PROPOSAL_CONFIRM__' + confirmation.response);
     await agent.close();
   } else if (mode === 'hang') {
     const first = await agent.readAndRun();
@@ -165,7 +196,7 @@ async function run(mode, input = 'Mensaje sintético original uno.\nMensaje sint
             const original = markers.get(marker);
             markers.set(marker, () => { clearTimeout(timeout); original(); });
         });
-    if (!['disabled', 'missing-detector', 'no-consent'].includes(mode)) {
+    if (!['disabled', 'missing-detector', 'no-consent', 'proposal'].includes(mode)) {
         child.stdin.write('/automatic-memory consent\n');
         await waitForMarker('__CONSENT_REQUEST__');
         const start = stdout.indexOf('__CONSENT_REQUEST__') + '__CONSENT_REQUEST__'.length;
@@ -176,7 +207,17 @@ async function run(mode, input = 'Mensaje sintético original uno.\nMensaje sint
         child.stdin.write(`/automatic-memory confirm-consent ${mode === 'wrong-consent' ? '00000000-0000-4000-8000-000000000000' : challenge}\n`);
         await waitForMarker('__CONSENT_CONFIRMED__');
     }
-    child.stdin.write(input);
+    if (mode === 'proposal') {
+        child.stdin.write('/automatic-memory review prop_00000000-0000-4000-8000-000000000002\n');
+        await waitForMarker('__PROPOSAL_REVIEW__');
+        const from = stdout.indexOf('__PROPOSAL_REVIEW__') + '__PROPOSAL_REVIEW__'.length;
+        const end = stdout.indexOf('\n', from);
+        const preview = stdout.slice(from, end < 0 ? undefined : end);
+        const challenge = /confirm-proposal prop_00000000-0000-4000-8000-000000000002 ([0-9a-f-]{36})/u.exec(preview)?.[1];
+        assert.ok(challenge, preview);
+        child.stdin.write(`/automatic-memory confirm-proposal prop_00000000-0000-4000-8000-000000000002 ${input === 'wrong' ? '00000000-0000-4000-8000-000000000000' : challenge}\n`);
+        await waitForMarker('__PROPOSAL_CONFIRM__');
+    } else child.stdin.write(input);
     child.stdin.end();
     const exitCode = await new Promise((resolve, reject) => {
         child.once('error', reject); child.once('exit', resolve);
@@ -276,15 +317,17 @@ test('C.3 revocation after timeout invalidates a non-cooperative late result', a
     assert.equal(result.detected.length, 1);
 });
 
-test('C.3 consent is an exact trusted stdin challenge, session-scoped, versioned, and grants no writes', async () => {
+test('C.3 consent is an exact trusted stdin challenge, persisted by the injected local store, and grants no writes', async () => {
     const { result, stdout } = await run('flow', 'Mensaje para evaluar después del consentimiento.\n');
-    assert.match(stdout, /Consentimiento opcional para evaluar turnos directos futuros/u);
+    assert.match(stdout, /Consentimiento opcional y persistente solo para evaluar nuevos turnos directos/u);
     assert.ok(stdout.includes(AUTOMATIC_MEMORY_CONSENT_POLICY_VERSION));
     const confirmationStart = stdout.indexOf('__CONSENT_CONFIRMED__');
     const confirmationEnd = stdout.indexOf('\n', confirmationStart);
     const consent = JSON.parse(stdout.slice(confirmationStart + '__CONSENT_CONFIRMED__'.length, confirmationEnd)).controls;
     assert.equal(consent.automaticAnalysisEnabled, true);
     assert.equal(consent.automaticSavingEnabled, false);
+    assert.equal(consent.consentPersisted, true);
+    assert.equal(consent.conversationAutomaticMemoryExcluded, false);
     assert.equal(result.saveCount, 0);
     const record = createAutomaticMemorySessionConsent({ sessionId: 'session', consentId: 'consent' });
     assert.equal(isCurrentAutomaticMemoryConsent(record, 'session'), true);
@@ -299,6 +342,8 @@ test('C.3 absent or incorrect consent cannot assess, and consent commands never 
     assert.equal(wrong.result.askCount, 1);
     assert.equal(noConsent.result.controls.automaticAnalysisEnabled, false);
     assert.equal(noConsent.result.controls.automaticSavingEnabled, false);
+    assert.equal(parseMemoryCommand('Nexa, no recuerdes esta conversación').operation, 'automatic_memory_exclude_conversation');
+    assert.equal(parseMemoryCommand('/automatic-memory proposals').operation, 'automatic_memory_proposals_list');
     assert.equal(parseMemoryCommand('/automatic-memory consent').operation, 'automatic_memory_consent_request');
     assert.equal(parseMemoryCommand('/automatic-memory revoke-consent').operation, 'automatic_memory_consent_revoke');
 });
@@ -307,7 +352,15 @@ test('C.3 revocation prevents assessment of later turns', async () => {
     const { result } = await run('revoke', '/automatic-memory revoke-consent\nMensaje después de revocar.\n');
     assert.equal(result.detected.length, 0);
     assert.equal(result.askCount, 1);
-    assert.ok(result.events.some(event => event.includes('Consentimiento de análisis revocado')));
+    assert.ok(result.events.some(event => event.includes('Consentimiento persistente de análisis revocado')));
+});
+
+test('C.4 exact no-memory command excludes only this CLI conversation and does not touch existing memories', async () => {
+    const { result } = await run('exclude', '/automatic-memory exclude-conversation\nEste turno posterior queda fuera.\n');
+    assert.equal(result.detected.length, 0);
+    assert.ok(result.events.some(event => event.startsWith('excluded:')));
+    assert.equal(result.controls.conversationAutomaticMemoryExcluded, true);
+    assert.equal(result.saveCount, 0);
 });
 
 test('C.3 preflight blocks excluded whole turns and lets permitted sensitive topics reach ASK-capable policy', () => {

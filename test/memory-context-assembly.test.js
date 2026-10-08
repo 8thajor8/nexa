@@ -286,7 +286,8 @@ test('Memory2 retrieval can be disabled independently while Memory1 retrieval co
         memoryRetrievalEnabled: false,
         ask: async request => { requests.push(request); return final('ok'); }, getTools: () => [] });
     assert.deepEqual(agent.automaticMemoryControls, { automaticAnalysisEnabled: false,
-        automaticSavingEnabled: false, memoryRetrievalEnabled: false, consentPolicyVersion: null });
+        automaticSavingEnabled: false, memoryRetrievalEnabled: false, consentPolicyVersion: null,
+        consentPersisted: false, conversationAutomaticMemoryExcluded: false });
     await agent.run('Synthetic question.');
     assert.equal(requests[0].input[0].role, 'user');
     assert.equal(requests[0].input[0].content, 'Synthetic question.');

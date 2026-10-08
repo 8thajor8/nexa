@@ -1,5 +1,7 @@
 # Automatic Memory C.2 — Evaluación conversacional experimental
 
+> Evolución posterior: C.3 agregó el consentimiento de sesión; C.4 lo sustituye por un registro local persistente versionado y añade una cola de propuestas aislada. Consulta `automatic-memory-c4.md` para el estado vigente.
+
 ## Alcance y estado
 
 C.2 conecta una interfaz de evaluación posterior a la respuesta dentro del agente, pero permanece **apagada por defecto**. La instancia actual de Nexa (`src/index.js`) no configura ni inyecta detector: el flag no está en `config`, no viene de `.env` y no existe un fallback a `createAutomaticMemoryDetector()` o a OpenAI. Esta etapa no incorpora planner, coordinador, writer, repository ni persistencia automática al agente.

@@ -12,7 +12,9 @@ import { loadMemory, memoryToPrompt, saveMemory } from '../memory/memory.js';
 import { getToolsForModel, executeTool } from '../tools/index.js';
 import { formatSpotifyToolResult, isSpotifyTool, spotifyModelSafeOutput } from '../tools/spotify.js';
 import { AUTOMATIC_MEMORY_ASSESSMENT_TIMEOUT_MS, AUTOMATIC_MEMORY_CONSENT_POLICY_VERSION,
-    createAutomaticMemorySessionConsent, isCurrentAutomaticMemoryConsent, screenAutomaticMemoryTurn } from '../memory/automatic/privacy.js';
+    isCurrentAutomaticMemoryConsent, screenAutomaticMemoryTurn } from '../memory/automatic/privacy.js';
+import { createDefaultAutomaticMemoryConsentStore } from '../memory/automatic/consent-store.js';
+import { createDefaultAutomaticMemoryProposalQueue } from '../memory/automatic/proposal-queue.js';
 
 function stableValue(value) {
     if (Array.isArray(value)) return value.map(stableValue);
@@ -65,6 +67,8 @@ export async function createAgent({
     enableAutomaticMemoryAssessment = false,
     automaticMemoryDetector = null,
     automaticMemoryAssessmentTimeoutMs = AUTOMATIC_MEMORY_ASSESSMENT_TIMEOUT_MS,
+    automaticMemoryConsentStore = createDefaultAutomaticMemoryConsentStore(),
+    automaticMemoryProposalQueue = createDefaultAutomaticMemoryProposalQueue(),
     memoryRetrievalEnabled = memoryBackend === 'memory2',
 } = {}) {
     if (typeof enableAutomaticMemoryAssessment !== 'boolean'
@@ -72,6 +76,13 @@ export async function createAgent({
         || (enableAutomaticMemoryAssessment && automaticMemoryDetector === null)
         || !Number.isSafeInteger(automaticMemoryAssessmentTimeoutMs) || automaticMemoryAssessmentTimeoutMs < 1
         || automaticMemoryAssessmentTimeoutMs > AUTOMATIC_MEMORY_ASSESSMENT_TIMEOUT_MS
+        || typeof automaticMemoryConsentStore?.load !== 'function' || typeof automaticMemoryConsentStore?.grant !== 'function'
+        || typeof automaticMemoryConsentStore?.revoke !== 'function'
+        || typeof automaticMemoryProposalQueue?.listGrouped !== 'function'
+        || typeof automaticMemoryProposalQueue?.review !== 'function' || typeof automaticMemoryProposalQueue?.approve !== 'function'
+        || typeof automaticMemoryProposalQueue?.reject !== 'function' || typeof automaticMemoryProposalQueue?.discard !== 'function'
+        || typeof automaticMemoryProposalQueue?.excludeConversation !== 'function'
+        || typeof automaticMemoryProposalQueue?.revokeConsent !== 'function'
         || typeof memoryRetrievalEnabled !== 'boolean') {
         throw new TypeError('automatic_memory_assessment_configuration_invalid');
     }
@@ -92,8 +103,9 @@ export async function createAgent({
     let currentMessage = '', currentSource = 'untrusted', contextDigest = null;
     let recentUserTurns = [], currentRecentUserMessages = [];
     let pendingAutomaticMemoryAssessment = null;
-    let automaticMemoryConsent = null, pendingConsentChallenge = null;
+    let automaticMemoryConsent = null, pendingConsentChallenge = null, pendingProposalConfirmation = null;
     let activeAutomaticAssessment = null, assessmentGeneration = 0;
+    let conversationAutomaticMemoryExcluded = false;
     let lastRunAssessmentEligible = false;
     const memoryToolNames = new Set(['remember', 'forget', 'recall', 'memory_context_snapshot', 'create_person',
         'create_relation', 'correct_relation', 'forget_relation', 'relations_for_entity']);
@@ -106,8 +118,10 @@ export async function createAgent({
     async function completePendingAutomaticMemoryAssessment() {
         const pending = pendingAutomaticMemoryAssessment;
         pendingAutomaticMemoryAssessment = null; // consume before awaiting; repeated calls cannot assess twice.
+        await refreshPersistentAutomaticMemoryConsent();
         if (!enableAutomaticMemoryAssessment || !automaticMemoryDetector || !pending
-            || !isCurrentAutomaticMemoryConsent(automaticMemoryConsent, sessionId))
+            || !isCurrentAutomaticMemoryConsent(automaticMemoryConsent, sessionId)
+            || automaticMemoryConsent.excludedConversations?.includes(sessionId))
             return { success: true, assessed: false };
         const screening = screenAutomaticMemoryTurn(pending.text);
         if (!screening.eligible) {
@@ -153,26 +167,77 @@ export async function createAgent({
         finally { clearTimeout(timer); }
     }
     const sessionId = randomUUID();
+    try { automaticMemoryConsent = await automaticMemoryConsentStore.load(); }
+    catch { automaticMemoryConsent = null; }
 
     function diagnostic(event, details = {}) {
         try { logger(event, details); } catch { /* diagnostics never change agent behavior */ }
     }
 
-    function revokeAutomaticMemoryConsent() {
+    function invalidateAutomaticMemorySessionState() {
         automaticMemoryConsent = null;
         pendingConsentChallenge = null;
+        pendingProposalConfirmation = null;
         pendingAutomaticMemoryAssessment = null;
         assessmentGeneration++;
         activeAutomaticAssessment?.controller.abort();
     }
 
+    async function refreshPersistentAutomaticMemoryConsent() {
+        let latest = null;
+        try { latest = await automaticMemoryConsentStore.load(); }
+        catch { diagnostic('automatic_memory_consent_read_failed', { code: 'automatic_memory_storage_unavailable' }); }
+        if (latest?.consentId !== automaticMemoryConsent?.consentId) {
+            pendingConsentChallenge = null;
+            pendingProposalConfirmation = null;
+            pendingAutomaticMemoryAssessment = null;
+            assessmentGeneration++;
+            activeAutomaticAssessment?.controller.abort();
+        }
+        automaticMemoryConsent = latest;
+        return latest;
+    }
+
+    async function revokePersistentAutomaticMemoryConsent() {
+        const previousConsent = automaticMemoryConsent;
+        invalidateAutomaticMemorySessionState();
+        let consentRevoked = false, queueInvalidated = !previousConsent?.consentId;
+        try { await automaticMemoryConsentStore.revoke(); consentRevoked = true; }
+        catch { diagnostic('automatic_memory_consent_revoke_failed', { code: 'automatic_memory_storage_unavailable' }); }
+        try {
+            if (previousConsent?.consentId) {
+                await automaticMemoryProposalQueue.revokeConsent(previousConsent.consentId);
+                queueInvalidated = true;
+            }
+        } catch {
+            diagnostic('automatic_memory_consent_revoke_failed', { code: 'automatic_memory_storage_unavailable' });
+        }
+        return { consentRevoked, queueInvalidated };
+    }
+
+    async function excludeCurrentAutomaticMemoryConversation() {
+        conversationAutomaticMemoryExcluded = true;
+        pendingAutomaticMemoryAssessment = null;
+        pendingProposalConfirmation = null;
+        assessmentGeneration++;
+        activeAutomaticAssessment?.controller.abort();
+        let persisted = false, queueInvalidated = false;
+        try { persisted = Boolean((await automaticMemoryConsentStore.excludeConversation(sessionId))?.success); }
+        catch { diagnostic('automatic_memory_conversation_exclusion_failed', { code: 'automatic_memory_storage_unavailable' }); }
+        try { await automaticMemoryProposalQueue.excludeConversation(sessionId); queueInvalidated = true; }
+        catch { diagnostic('automatic_memory_conversation_exclusion_failed', { code: 'automatic_memory_storage_unavailable' }); }
+        return { persisted, queueInvalidated };
+    }
+
     function automaticMemoryControlState() {
         return Object.freeze({
             automaticAnalysisEnabled: Boolean(enableAutomaticMemoryAssessment && automaticMemoryDetector
-                && isCurrentAutomaticMemoryConsent(automaticMemoryConsent, sessionId)),
+                && !conversationAutomaticMemoryExcluded && isCurrentAutomaticMemoryConsent(automaticMemoryConsent, sessionId)),
             automaticSavingEnabled: false,
             memoryRetrievalEnabled: selectedBackend.backend === 'memory2' ? memoryRetrievalEnabled : null,
             consentPolicyVersion: automaticMemoryConsent?.policyVersion ?? null,
+            consentPersisted: Boolean(automaticMemoryConsent && automaticMemoryConsent.scope === 'future_direct_user_turns_across_runtime_sessions'),
+            conversationAutomaticMemoryExcluded,
         });
     }
 
@@ -321,30 +386,104 @@ ${memoryToPrompt(memory)}
             const turn = await readDirectUserTurn(memory2 ?? agent);
             if (!turn) return { done: true };
             try {
+                await refreshPersistentAutomaticMemoryConsent();
                 const { message, command, capability } = turn;
                 const operation = command?.operation;
                 if (pendingConsentChallenge) {
                     const expected = pendingConsentChallenge;
                     pendingConsentChallenge = null;
                     if (operation === 'automatic_memory_consent_confirm' && command.consentChallenge === expected) {
-                        automaticMemoryConsent = createAutomaticMemorySessionConsent({ sessionId, consentId: expected });
+                        try { automaticMemoryConsent = await automaticMemoryConsentStore.grant(); }
+                        catch {
+                            diagnostic('automatic_memory_consent_save_failed', { code: 'automatic_memory_storage_unavailable' });
+                            return { done: false, response: 'No pude guardar el consentimiento local; el análisis sigue desactivado.' };
+                        }
                         const inactiveNotice = enableAutomaticMemoryAssessment && automaticMemoryDetector
-                            ? '' : ' Este proceso no tiene detector conectado, así que no analizará ni enviará mensajes.';
-                        return { done: false, response: `Consentimiento de análisis registrado para esta sesión bajo ${AUTOMATIC_MEMORY_CONSENT_POLICY_VERSION}. Solo cubre turnos directos futuros y no autoriza guardado.${inactiveNotice}` };
+                            ? '' : ' El extractor no está conectado, así que no analizará ni enviará mensajes.';
+                        return { done: false, response: `Consentimiento local persistente registrado bajo ${AUTOMATIC_MEMORY_CONSENT_POLICY_VERSION}. Solo cubre turnos directos futuros; no analiza historial, no activa por sí mismo un extractor y no autoriza guardado.${inactiveNotice}` };
                     }
                 }
+                if (pendingProposalConfirmation) {
+                    const expected = pendingProposalConfirmation;
+                    pendingProposalConfirmation = null;
+                    if (operation === 'automatic_memory_proposal_confirm'
+                        && command.proposalId === expected.proposalId && command.proposalChallenge === expected.challenge
+                        && Date.now() < expected.expiresAt) {
+                        const result = await automaticMemoryProposalQueue.approve(expected.proposalId, expected.fingerprint);
+                        if (result.success) return { done: false, response: 'Propuesta aprobada individualmente para revisión futura. No se escribió ningún recuerdo.' };
+                        return { done: false, response: 'La propuesta ya no está vigente; no se escribió ningún recuerdo.' };
+                    }
+                }
+                if (operation === 'automatic_memory_proposal_confirm')
+                    return { done: false, response: 'La confirmación de propuesta no está vigente; no se escribió ningún recuerdo.' };
                 if (operation === 'automatic_memory_consent_request') {
-                    revokeAutomaticMemoryConsent();
                     const challenge = randomUUID();
                     pendingConsentChallenge = challenge;
-                    return { done: false, response: `Consentimiento opcional para evaluar turnos directos futuros de esta sesión (${AUTOMATIC_MEMORY_CONSENT_POLICY_VERSION}). Si en una composición futura se conecta explícitamente un extractor, el texto no excluido podría enviarse a OpenAI. Pueden evaluarse salud, finanzas personales, relaciones, asuntos legales/migratorios, trabajo, temas emocionales y contexto general de terceros; cualquier dato sensible requeriría confirmación antes de guardar. Se excluyen credenciales y secretos, credenciales financieras, documentos de identidad, ubicación y movimientos precisos, contenido temporal, citas/importaciones, datos de pacientes o secretos profesionales y entradas ambiguas detectadas por el filtro. No se guarda ningún recuerdo y el consentimiento expira al cerrar esta sesión. Para aceptar solo este alcance, escribe como tu siguiente entrada: /automatic-memory confirm-consent ${challenge}. Cualquier otra entrada cancela esta solicitud.` };
+                    return { done: false, response: `Consentimiento opcional y persistente solo para evaluar nuevos turnos directos (${AUTOMATIC_MEMORY_CONSENT_POLICY_VERSION}). No analiza historial, no activa por sí solo el extractor real y no permite guardar recuerdos. Si se conecta explícitamente un extractor en una fase posterior, el texto elegible podría enviarse a OpenAI. Podrían evaluarse temas de salud, finanzas personales, relaciones, asuntos legales/migratorios, trabajo/proyectos, contexto emocional y contexto general de terceros. Se excluyen secretos/credenciales, datos financieros de autenticación, documentos de identidad, ubicación y movimiento precisos, contenido temporal, citas/importaciones, datos de pacientes, secretos profesionales y entradas ambiguas detectadas por el filtro. Temas sensibles permitidos nunca se guardan sin confirmación individual; consentimiento de análisis no equivale a consentimiento de guardado. El archivo local contendrá únicamente versión, propósito, alcance y fecha de consentimiento. Para aceptar exactamente este alcance, escribe en tu siguiente entrada: /automatic-memory confirm-consent ${challenge}. Cualquier otra entrada cancela esta solicitud.` };
                 }
                 if (operation === 'automatic_memory_consent_revoke') {
-                    revokeAutomaticMemoryConsent();
-                    return { done: false, response: 'Consentimiento de análisis revocado para esta sesión. Memory1 y sus funciones continúan sin cambios.' };
+                    const revoked = await revokePersistentAutomaticMemoryConsent();
+                    return { done: false, response: revoked.consentRevoked && revoked.queueInvalidated
+                        ? 'Consentimiento persistente de análisis revocado. Las propuestas pendientes asociadas se invalidaron; los recuerdos existentes y Memory1 no se modificaron.'
+                        : revoked.consentRevoked
+                            ? 'El consentimiento persistente quedó revocado y el análisis está desactivado; no pude limpiar la cola local. Las propuestas quedan ocultas mientras no haya consentimiento y requieren revisión local.'
+                            : 'El análisis queda desactivado en esta sesión, pero no pude guardar la revocación local. Revísalo antes de cerrar Nexa.' };
                 }
                 if (operation === 'automatic_memory_consent_confirm')
                     return { done: false, response: 'La solicitud de consentimiento no está vigente; no se habilitó el análisis.' };
+                if (operation === 'automatic_memory_exclude_conversation') {
+                    const excluded = await excludeCurrentAutomaticMemoryConversation();
+                    return { done: false, response: excluded.persisted && excluded.queueInvalidated
+                        ? 'Esta conversación de CLI queda excluida de nuevos análisis. Sus propuestas pendientes se descartaron; no se borraron recuerdos anteriores.'
+                        : excluded.persisted
+                            ? 'La exclusión local quedó guardada y no se harán nuevos análisis; no pude limpiar la cola. Las propuestas de esta conversación quedan ocultas.'
+                            : 'Esta conversación queda excluida en esta sesión, pero no pude confirmar la exclusión persistente. No se harán nuevos análisis en esta ejecución.' };
+                }
+                if (operation === 'automatic_memory_proposals_list') {
+                    try {
+                        const groups = await automaticMemoryProposalQueue.listGrouped({
+                            consentId: automaticMemoryConsent?.consentId ?? null,
+                            excludedConversationId: conversationAutomaticMemoryExcluded ? sessionId : null,
+                            excludedConversationIds: automaticMemoryConsent?.excludedConversations ?? [],
+                        });
+                        if (!groups.length) return { done: false, response: 'No hay propuestas pendientes.' };
+                        const lines = ['Propuestas pendientes (revisión agrupada; cada aprobación es individual):'];
+                        for (const group of groups) {
+                            lines.push(`\n${group.category} · ${group.action}${group.sensitive ? ' · sensible' : ''}`);
+                            for (const item of group.proposals.slice(0, 20))
+                                lines.push(`- ${item.proposalId}: ${item.summary}${item.targetSummary ? ` (reemplazar: ${item.targetSummary})` : ''}`);
+                        }
+                        return { done: false, response: lines.join('\n') };
+                    } catch { return { done: false, response: 'La cola local no está disponible o requiere revisión; no se modificó ningún recuerdo.' }; }
+                }
+                if (operation === 'automatic_memory_proposal_review') {
+                    try {
+                        const item = await automaticMemoryProposalQueue.review(command.proposalId);
+                        if (!item) return { done: false, response: 'La propuesta no existe, expiró o ya fue procesada.' };
+                        if (!automaticMemoryConsent || item.consentId !== automaticMemoryConsent.consentId
+                            || automaticMemoryConsent.excludedConversations?.includes(item.conversationId)
+                            || item.conversationId === sessionId && conversationAutomaticMemoryExcluded)
+                            return { done: false, response: 'La propuesta quedó invalidada por revocación o exclusión; no se escribió ningún recuerdo.' };
+                        const challenge = randomUUID();
+                        pendingProposalConfirmation = { proposalId: item.proposalId, fingerprint: item.fingerprint,
+                            challenge, expiresAt: Date.now() + 60_000 };
+                        const clean = value => value.replace(/[\p{Cc}\p{Cf}]/gu, ' ').slice(0, 180);
+                        const sensitivity = item.sensitive ? 'Es sensible y exige esta confirmación individual.' : 'La aprobación también será individual.';
+                        return { done: false, response: `Revisión: ${item.action} · ${item.category}. ${sensitivity}\nPropuesta: ${clean(item.summary)}${item.targetSummary ? `\nObjetivo de reemplazo: ${clean(item.targetSummary)}` : ''}\nAceptar solo esta propuesta y solo como elemento revisado: /automatic-memory confirm-proposal ${item.proposalId} ${challenge}. Cualquier otro turno cancela la confirmación. Aceptar no escribe ni autoriza una escritura de memoria.` };
+                    } catch { return { done: false, response: 'La propuesta no pudo revisarse; no se escribió ningún recuerdo.' }; }
+                }
+                if (operation === 'automatic_memory_proposal_reject' || operation === 'automatic_memory_proposal_discard') {
+                    try {
+                        const item = await automaticMemoryProposalQueue.review(command.proposalId);
+                        if (!item) return { done: false, response: 'La propuesta no existe, expiró o ya fue procesada.' };
+                        const result = operation === 'automatic_memory_proposal_reject'
+                            ? await automaticMemoryProposalQueue.reject(item.proposalId, item.fingerprint)
+                            : await automaticMemoryProposalQueue.discard(item.proposalId);
+                        return { done: false, response: result.success
+                            ? operation === 'automatic_memory_proposal_reject' ? 'Propuesta rechazada y su resumen eliminado.' : 'Propuesta descartada.'
+                            : 'La propuesta ya no está vigente.' };
+                    } catch { return { done: false, response: 'La propuesta no pudo procesarse; no se escribió ningún recuerdo.' }; }
+                }
                 if (message.trim().toLowerCase() === 'salir') return { done: true };
                 if (!message.trim()) return { done: false, response: '' };
                 if (memory2 && command) {
@@ -372,7 +511,7 @@ ${memoryToPrompt(memory)}
                     // No memory payload or proof is passed to the model or to tools.
                     return { done: false, response: result.success ? 'Memoria actualizada.' : result.error.message, memoryResult: result };
                 }
-                const mayAssess = enableAutomaticMemoryAssessment && automaticMemoryDetector
+                const mayAssess = enableAutomaticMemoryAssessment && automaticMemoryDetector && !conversationAutomaticMemoryExcluded
                     && isCurrentAutomaticMemoryConsent(automaticMemoryConsent, sessionId);
                 const preflight = mayAssess ? screenAutomaticMemoryTurn(message) : null;
                 if (preflight && !preflight.eligible)
@@ -392,6 +531,6 @@ ${memoryToPrompt(memory)}
         completePresentedTurn: () => enqueue(completePendingAutomaticMemoryAssessment),
         memory, memoryBackend: selectedBackend.backend,
         get automaticMemoryControls() { return automaticMemoryControlState(); },
-        close: () => { revokeAutomaticMemoryConsent(); return selectedBackend.close(); } };
+        close: async () => { invalidateAutomaticMemorySessionState(); return selectedBackend.close(); } };
     return agent;
 }

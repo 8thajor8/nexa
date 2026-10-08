@@ -71,6 +71,19 @@ export function parseMemoryCommand(message) {
     try {
         if (message === '/automatic-memory consent') return { operation: 'automatic_memory_consent_request' };
         if (message === '/automatic-memory revoke-consent') return { operation: 'automatic_memory_consent_revoke' };
+        if (message === '/automatic-memory exclude-conversation'
+            || /^nexa,\s*no recuerdes esta conversaci[oó]n[.!]?$/iu.test(message.trim()))
+            return { operation: 'automatic_memory_exclude_conversation' };
+        if (message === '/automatic-memory proposals') return { operation: 'automatic_memory_proposals_list' };
+        const reviewProposal = /^\/automatic-memory review (prop_[0-9a-f-]{36})$/iu.exec(message);
+        if (reviewProposal) return { operation: 'automatic_memory_proposal_review', proposalId: reviewProposal[1] };
+        const confirmProposal = /^\/automatic-memory confirm-proposal (prop_[0-9a-f-]{36}) ([0-9a-f-]{36})$/iu.exec(message);
+        if (confirmProposal) return { operation: 'automatic_memory_proposal_confirm',
+            proposalId: confirmProposal[1], proposalChallenge: confirmProposal[2] };
+        const rejectProposal = /^\/automatic-memory reject-proposal (prop_[0-9a-f-]{36})$/iu.exec(message);
+        if (rejectProposal) return { operation: 'automatic_memory_proposal_reject', proposalId: rejectProposal[1] };
+        const discardProposal = /^\/automatic-memory discard-proposal (prop_[0-9a-f-]{36})$/iu.exec(message);
+        if (discardProposal) return { operation: 'automatic_memory_proposal_discard', proposalId: discardProposal[1] };
         const consentConfirmation = /^\/automatic-memory confirm-consent ([0-9a-f-]{36})$/u.exec(message);
         if (consentConfirmation) return { operation: 'automatic_memory_consent_confirm', consentChallenge: consentConfirmation[1] };
         if (message.startsWith('/relation create ')) {

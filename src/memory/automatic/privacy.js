@@ -1,10 +1,11 @@
 import { screenMemorySecret } from '../secret-screening.js';
 import { AUTOMATIC_MEMORY_MAX_INPUT_CHARS } from './schema.js';
 
-export const AUTOMATIC_MEMORY_CONSENT_POLICY_VERSION = 'automatic-memory-c3-v1';
+export const AUTOMATIC_MEMORY_CONSENT_POLICY_VERSION = 'automatic-memory-c4-v1';
 export const AUTOMATIC_MEMORY_ASSESSMENT_TIMEOUT_MS = 5000;
 
 const excluded = Object.freeze([
+    ['user_requested_message_exclusion', /^\s*(?:nexa,\s*)?no\s+aprendas\s+de\s+este\s+mensaje[.!]?(?:\s*[:—-]\s*[\s\S]*)?\s*$/iu],
     ['credential', /\b(?:contrase(?:ñ|n)a|clave(?:\s+(?:api|secreta|de\s+acceso))?|token(?:\s+de\s+(?:acceso|recuperaci[oó]n))?|c[oó]digo\s+2fa)\s*[:=]\s*\S+/iu],
     ['financial_credential', /\b(?:(?:credit|debit|cr[eé]dito|d[eé]bito)\s+card|tarjeta\s+(?:de\s+)?(?:cr[eé]dito|d[eé]bito))\b.{0,32}\b(?:number|no\.?|#|n[uú]mero)?\s*[:=]?\s*(?:\d[ -]?){13,19}\b|\b(?:pin|cvv|cvc)\s*[:=]?\s*\d{3,8}\b/iu],
     ['identity_document', /\b(?:passport|pasaporte|dni|nie|ssn|social\s+security\s+number|national\s+id|identity\s+(?:document|number)|documento\s+de\s+identidad)\b/iu],
@@ -59,7 +60,10 @@ export function createAutomaticMemorySessionConsent({ sessionId, consentId, gran
 }
 
 export function isCurrentAutomaticMemoryConsent(consent, sessionId) {
-    return Boolean(consent && consent.policyVersion === AUTOMATIC_MEMORY_CONSENT_POLICY_VERSION
-        && consent.sessionId === sessionId && consent.scope === 'future_direct_user_turns_in_this_runtime_session'
-        && consent.grantsMemoryWrite === false);
+    if (!consent || consent.policyVersion !== AUTOMATIC_MEMORY_CONSENT_POLICY_VERSION
+        || consent.grantsMemoryWrite !== false
+        || consent.purpose !== 'assess_future_direct_user_turns_for_possible_memory_candidates') return false;
+    if (consent.scope === 'future_direct_user_turns_across_runtime_sessions')
+        return typeof consent.consentId === 'string' && typeof consent.grantedAt === 'string';
+    return consent.sessionId === sessionId && consent.scope === 'future_direct_user_turns_in_this_runtime_session';
 }
