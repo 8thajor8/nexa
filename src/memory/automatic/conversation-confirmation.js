@@ -269,8 +269,8 @@ function batchFailure(code) {
     return Object.freeze({ ...noAuthorityFailure(code), decisions: Object.freeze([]), issues: Object.freeze([code]) });
 }
 
-function batchDecision(proposal, result) {
-    return Object.freeze({ proposalId: proposal.proposalId, responseOutcome: result.responseOutcome,
+function batchDecision(proposal, result, responseIntent = null) {
+    return Object.freeze({ proposalId: proposal.proposalId, responseIntent, responseOutcome: result.responseOutcome,
         reasonCodes: result.reasonCodes, proposal: result.proposal,
         authorization: Object.freeze({ granted: false, executable: false }), writeReady: false,
         persistence: Object.freeze({ performed: false }) });
@@ -400,7 +400,8 @@ export function evaluateSimulatedMemoryConfirmationBatch(input) {
                 requestedScope: answer.requestedScope,
             };
             return batchDecision(proposal, evaluateSimulatedMemoryConfirmation({ proposal, response: singleResponse,
-                evaluatedAt: input.evaluatedAt, currentRevision: revision, optOut: false, consentRevoked: false }));
+                evaluatedAt: input.evaluatedAt, currentRevision: revision, optOut: false, consentRevoked: false }),
+            INTENTS.has(answer.intent) ? answer.intent : null);
         });
 
         return Object.freeze({ success: true, simulationOnly: true,
