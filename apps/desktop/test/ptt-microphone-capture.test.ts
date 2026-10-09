@@ -151,7 +151,7 @@ describe("PTT microphone capture and WAV encoding", () => {
 
   it("starts a valid session, captures, sends WAV on finish, and releases resources", async () => {
     const harness = makeAudioHarness();
-    await expect(harness.capture.start()).resolves.toEqual({ sessionId: "session-1" });
+    await expect(harness.capture.start()).resolves.toEqual({ sessionId: "session-1", requestId: "request-1" });
     harness.emitInput(new Float32Array(480).fill(0.25));
     const ack = await harness.capture.finish("es");
     expect(ack).toMatchObject({ ok: true, accepted: true });
@@ -186,7 +186,7 @@ describe("PTT microphone capture and WAV encoding", () => {
     expect(harness.calls.finish).toHaveLength(0);
     expect(harness.track.stop).toHaveBeenCalledOnce();
     expect(harness.context.close).toHaveBeenCalledOnce();
-    await expect(harness.capture.start()).resolves.toEqual({ sessionId: "session-2" });
+    await expect(harness.capture.start()).resolves.toMatchObject({ sessionId: "session-2", requestId: expect.any(String) });
   });
 
   it("targets the finish request when cancelling an accepted transcription", async () => {
@@ -222,7 +222,7 @@ describe("PTT microphone capture and WAV encoding", () => {
 
     await harness.capture.recoverMainCancellation();
     expect(harness.capture.mainCancellationPending).toBe(false);
-    await expect(harness.capture.start()).resolves.toEqual({ sessionId: "session-2" });
+    await expect(harness.capture.start()).resolves.toMatchObject({ sessionId: "session-2", requestId: expect.any(String) });
     expect(harness.calls.cancel).toHaveLength(2);
     expect(harness.calls.cancel[0]).toMatchObject({ sessionId: "session-1", targetRequestId: "request-1" });
     expect(harness.calls.cancel[1]).toMatchObject({ sessionId: "session-1", targetRequestId: "request-1" });
@@ -241,7 +241,7 @@ describe("PTT microphone capture and WAV encoding", () => {
     await harness.capture.start();
     await expect(harness.capture.cancel()).resolves.toBeUndefined();
     expect(harness.capture.mainCancellationPending).toBe(false);
-    await expect(harness.capture.start()).resolves.toEqual({ sessionId: "session-2" });
+    await expect(harness.capture.start()).resolves.toMatchObject({ sessionId: "session-2", requestId: expect.any(String) });
     await harness.capture.cancel();
   });
 
@@ -273,7 +273,7 @@ describe("PTT microphone capture and WAV encoding", () => {
     expect(harness.calls.cancel[1]).toMatchObject({ sessionId: "session-1", targetRequestId: "request-2" });
     expect(harness.calls.cancel[2]).toMatchObject({ sessionId: "session-1", targetRequestId: "request-1" });
     expect(harness.capture.mainCancellationPending).toBe(false);
-    await expect(harness.capture.start()).resolves.toEqual({ sessionId: "session-2" });
+    await expect(harness.capture.start()).resolves.toMatchObject({ sessionId: "session-2", requestId: expect.any(String) });
     await harness.capture.cancel();
   });
 
@@ -374,7 +374,7 @@ describe("PTT microphone capture and WAV encoding", () => {
     expect(harness.calls.cancel[0]).toMatchObject({ sessionId: "session-1", targetRequestId: "request-1" });
 
     await harness.capture.recoverMainCancellation();
-    await expect(harness.capture.start()).resolves.toEqual({ sessionId: "session-2" });
+    await expect(harness.capture.start()).resolves.toMatchObject({ sessionId: "session-2", requestId: expect.any(String) });
     await harness.capture.cancel();
   });
 
@@ -494,11 +494,16 @@ describe("PTT microphone capture and WAV encoding", () => {
   it("releases the session when a real ended event arrives from the active Voice session", async () => {
     const harness = makeAudioHarness();
     await harness.capture.start();
-    harness.emit({ requestId: "request-1", sessionId: "session-1", sequence: 1,
+    harness.emit({ requestId: "wrong-request", sessionId: "session-1", sequence: 1,
       event: { type: "voice.session.ended", sessionId: "session-1", turnId: null, timestamp: 1 } });
-    await expect(harness.capture.start()).resolves.toEqual({ sessionId: "session-2" });
-    harness.emit({ requestId: "request-1", sessionId: "session-1", sequence: 2,
+    harness.emit({ requestId: "request-1", sessionId: "session-1", sequence: 0,
       event: { type: "voice.session.ended", sessionId: "session-1", turnId: null, timestamp: 2 } });
+    await expect(harness.capture.start()).rejects.toMatchObject({ code: "capture_in_progress" });
+    harness.emit({ requestId: "request-1", sessionId: "session-1", sequence: 2,
+      event: { type: "voice.session.ended", sessionId: "session-1", turnId: null, timestamp: 3 } });
+    await expect(harness.capture.start()).resolves.toMatchObject({ sessionId: "session-2", requestId: expect.any(String) });
+    harness.emit({ requestId: "request-1", sessionId: "session-1", sequence: 3,
+      event: { type: "voice.session.ended", sessionId: "session-1", turnId: null, timestamp: 4 } });
     await expect(harness.capture.start()).rejects.toMatchObject({ code: "capture_in_progress" });
     await harness.capture.cancel();
   });

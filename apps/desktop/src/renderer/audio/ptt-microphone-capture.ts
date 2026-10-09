@@ -221,6 +221,7 @@ export class PttMicrophoneCapture {
   private readonly maxDurationSeconds: number;
   private current: CaptureState | null = null;
   private pendingMainCancellation: PendingMainCancellation | null = null;
+  private lastVoiceSequence = 0;
   private generation = 0;
 
   constructor(voice: VoiceDesktopApi, dependencies: PttCaptureDependencies = {}) {
@@ -236,7 +237,7 @@ export class PttMicrophoneCapture {
       || this.maxDurationSeconds > PTT_MAX_DURATION_SECONDS) throw new RangeError("invalid_ptt_capture_duration");
   }
 
-  async start(): Promise<{ sessionId: string }> {
+  async start(): Promise<{ sessionId: string; requestId: string }> {
     if (this.pendingMainCancellation) throw new PttCaptureError("session_cleanup_required");
     if (this.current) throw new PttCaptureError("capture_in_progress");
     const state = this.createState();
@@ -273,7 +274,7 @@ export class PttMicrophoneCapture {
         state.maxDurationReached = true;
         void this.stopCaptureGraph(state);
       }, this.maxDurationSeconds * 1000);
-      return { sessionId: state.sessionId };
+      return { sessionId: state.sessionId, requestId: state.startRequestId! };
     } catch (error) {
       await this.releaseResources(state);
       if (state.sessionId && !state.cancelled) {
@@ -497,7 +498,12 @@ export class PttMicrophoneCapture {
 
   private subscribeToSession(state: CaptureState): void {
     state.unsubscribe = this.voice.onEvent((envelope: VoiceEventEnvelope) => {
-      if (envelope.sessionId !== state.sessionId || envelope.event.type !== "voice.session.ended") return;
+      if (!Number.isSafeInteger(envelope.sequence) || envelope.sequence <= this.lastVoiceSequence
+        || envelope.event.sessionId !== envelope.sessionId) return;
+      this.lastVoiceSequence = envelope.sequence;
+      const expectedRequestId = state.finishRequestId ?? state.startRequestId;
+      if (envelope.sessionId !== state.sessionId || envelope.event.type !== "voice.session.ended"
+        || !expectedRequestId || envelope.requestId !== expectedRequestId) return;
       state.phase = "ended";
       state.chunks.forEach((chunk) => chunk.fill(0));
       state.chunks = [];
