@@ -13,7 +13,8 @@ const SENSITIVITIES = new Set(['none', 'health', 'finance', 'precise_location', 
 const REASONS = new Set(['planner_review', 'replace_target_confirmation', 'sensitive_information', 'third_party',
     'project_identity', 'scope_restriction', 'shared_memory', 'conflict', 'other']);
 const PROPOSAL_STATUSES = new Set(['pending', 'confirmed_hypothetically', 'rejected', 'needs_clarification', 'expired', 'revoked']);
-const INTENTS = new Set(['affirm', 'reject', 'correct', 'restrict_scope', 'request_share', 'ambiguous', 'unrelated', 'revoke', 'cancel']);
+const INTENTS = new Set(['affirm', 'reject', 'correct', 'restrict_scope', 'request_share', 'request_clarification',
+    'ambiguous', 'unrelated', 'revoke', 'cancel']);
 
 function exactRecord(value, keys) {
     if (!value || typeof value !== 'object' || Array.isArray(value)
@@ -33,6 +34,16 @@ function plainDataRecord(value) {
         const descriptor = Object.getOwnPropertyDescriptor(value, key);
         return typeof key === 'string' && descriptor && Object.hasOwn(descriptor, 'value') && descriptor.enumerable;
     });
+}
+
+function denseDataArray(value, maximumLength) {
+    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype
+        || value.length > maximumLength || Reflect.ownKeys(value).length !== value.length + 1) return false;
+    for (let index = 0; index < value.length; index++) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (!descriptor || !Object.hasOwn(descriptor, 'value') || !descriptor.enumerable) return false;
+    }
+    return true;
 }
 
 function validDate(value) { return typeof value === 'string' && Number.isFinite(Date.parse(value)); }
@@ -242,6 +253,9 @@ export function evaluateSimulatedMemoryConfirmation(input) {
             case 'ambiguous':
                 return decisionResult(proposal, 'needs_clarification', 'response_ambiguous',
                     { status: 'needs_clarification', incrementRevision: true });
+            case 'request_clarification':
+                return decisionResult(proposal, 'needs_clarification', 'clarification_requested',
+                    { status: 'needs_clarification', incrementRevision: true });
             case 'unrelated':
                 return decisionResult(proposal, 'needs_clarification', 'response_unrelated',
                     { status: 'needs_clarification', incrementRevision: true });
@@ -249,4 +263,150 @@ export function evaluateSimulatedMemoryConfirmation(input) {
                 return decisionResult(proposal, 'denied', 'confirmation_response_invalid');
         }
     } catch { return noAuthorityFailure('confirmation_evaluation_invalid'); }
+}
+
+function batchFailure(code) {
+    return Object.freeze({ ...noAuthorityFailure(code), decisions: Object.freeze([]), issues: Object.freeze([code]) });
+}
+
+function batchDecision(proposal, result) {
+    return Object.freeze({ proposalId: proposal.proposalId, responseOutcome: result.responseOutcome,
+        reasonCodes: result.reasonCodes, proposal: result.proposal,
+        authorization: Object.freeze({ granted: false, executable: false }), writeReady: false,
+        persistence: Object.freeze({ performed: false }) });
+}
+
+function unresolvedBatchDecision(proposal) {
+    const result = decisionResult(proposal, 'pending', 'no_response_for_proposal');
+    return batchDecision(proposal, result);
+}
+
+function resolveBatchReference(reference, ordered, byId) {
+    if (!plainDataRecord(reference)) return null;
+    if (reference.kind === 'proposal_id' && exactRecord(reference, ['kind', 'proposalId'])
+        && typeof reference.proposalId === 'string' && UUID.test(reference.proposalId))
+        return byId.get(reference.proposalId) ?? null;
+    if (reference.kind === 'ordinal' && exactRecord(reference, ['kind', 'ordinal'])
+        && Number.isSafeInteger(reference.ordinal) && reference.ordinal >= 1 && reference.ordinal <= ordered.length)
+        return ordered[reference.ordinal - 1];
+    return null;
+}
+
+/**
+ * Evaluate a batch of synthetic proposal responses against an explicit synthetic
+ * revision snapshot. Ordinals use deterministic order (createdAt, then proposalId).
+ * This function has no state or persistence and can never issue write authority.
+ */
+export function evaluateSimulatedMemoryConfirmationBatch(input) {
+    try {
+        const keys = ['proposals', 'responses', 'currentRevisions', 'evaluatedAt', 'optOut', 'consentRevoked',
+            'cancelBatch', 'executionRequested', 'presentedProposalIds'];
+        if (!exactRecord(input, keys) || !denseDataArray(input.proposals, 64) || input.proposals.length === 0
+            || !denseDataArray(input.responses, 64) || !denseDataArray(input.currentRevisions, 64)
+            || !validDate(input.evaluatedAt) || typeof input.optOut !== 'boolean'
+            || typeof input.consentRevoked !== 'boolean' || typeof input.cancelBatch !== 'boolean'
+            || typeof input.executionRequested !== 'boolean') return batchFailure('confirmation_batch_invalid');
+        if (input.executionRequested) return batchFailure('confirmation_batch_execution_not_supported');
+
+        const proposals = [...input.proposals];
+        if (!proposals.every(validProposal)) return batchFailure('confirmation_batch_proposal_invalid');
+        const byId = new Map();
+        const candidateKeys = new Set();
+        for (const proposal of proposals) {
+            if (byId.has(proposal.proposalId)) return batchFailure('confirmation_batch_duplicate_proposal_id');
+            const candidateKey = `${proposal.candidateReference.assessmentId}:${proposal.candidateReference.candidateIndex}:${proposal.candidateReference.fingerprint}`;
+            if (candidateKeys.has(candidateKey)) return batchFailure('confirmation_batch_duplicate_candidate_reference');
+            candidateKeys.add(candidateKey);
+            byId.set(proposal.proposalId, proposal);
+        }
+
+        const context = proposal => JSON.stringify([proposal.linkage.principalId,
+            proposal.linkage.sessionId, proposal.linkage.installationId]);
+        if (!proposals.every(proposal => context(proposal) === context(proposals[0])))
+            return batchFailure('confirmation_batch_identity_context_mismatch');
+
+        const revisions = new Map();
+        if (input.currentRevisions.length !== proposals.length) return batchFailure('confirmation_batch_revision_snapshot_incomplete');
+        for (const entry of input.currentRevisions) {
+            if (!exactRecord(entry, ['proposalId', 'revision']) || typeof entry.proposalId !== 'string'
+                || !byId.has(entry.proposalId) || !Number.isSafeInteger(entry.revision) || entry.revision < 0
+                || revisions.has(entry.proposalId)) return batchFailure('confirmation_batch_revision_snapshot_invalid');
+            revisions.set(entry.proposalId, entry.revision);
+        }
+        if (revisions.size !== proposals.length) return batchFailure('confirmation_batch_revision_snapshot_incomplete');
+
+        const ordered = [...proposals].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt)
+            || left.proposalId.localeCompare(right.proposalId));
+        const orderedProposalIds = ordered.map(proposal => proposal.proposalId);
+        if (input.presentedProposalIds === null) {
+            if (input.responses.length !== 0) return batchFailure('confirmation_batch_presentation_snapshot_required');
+        } else if (!denseDataArray(input.presentedProposalIds, 64)
+            || input.presentedProposalIds.length !== orderedProposalIds.length
+            || input.presentedProposalIds.some((proposalId, index) => proposalId !== orderedProposalIds[index])) {
+            return batchFailure('confirmation_batch_presentation_snapshot_mismatch');
+        }
+        const responseKeys = ['reference', 'assessmentId', 'candidateIndex', 'candidateFingerprint', 'operation',
+            'targetReference', 'intent', 'sourceLabel', 'principalId', 'sessionId', 'installationId',
+            'responseTurnId', 'requestedScope'];
+        const targets = new Map();
+        const issues = [];
+        for (let index = 0; index < input.responses.length; index++) {
+            const answer = input.responses[index];
+            if (!exactRecord(answer, responseKeys)) { issues.push('confirmation_batch_response_invalid'); continue; }
+            const proposal = resolveBatchReference(answer.reference, ordered, byId);
+            if (!proposal) { issues.push('confirmation_batch_reference_invalid_or_ambiguous'); continue; }
+            const list = targets.get(proposal.proposalId) ?? [];
+            list.push({ answer, index });
+            targets.set(proposal.proposalId, list);
+        }
+
+        const decisions = ordered.map(proposal => {
+            const revision = revisions.get(proposal.proposalId);
+            if (input.optOut || input.consentRevoked) {
+                const reason = input.optOut ? 'automatic_memory_opt_out' : 'analysis_consent_revoked';
+                return batchDecision(proposal, decisionResult(proposal, 'revoked', reason,
+                    { status: 'revoked', incrementRevision: true }));
+            }
+            if (Date.parse(proposal.expiresAt) <= Date.parse(input.evaluatedAt))
+                return batchDecision(proposal, decisionResult(proposal, 'expired', 'confirmation_proposal_expired',
+                    { status: 'expired', incrementRevision: true }));
+            if (revision !== proposal.revision)
+                return batchDecision(proposal, decisionResult(proposal, 'denied', 'confirmation_proposal_revision_stale'));
+            if (input.cancelBatch && (proposal.status === 'pending' || proposal.status === 'needs_clarification'))
+                return batchDecision(proposal, decisionResult(proposal, 'rejected', 'confirmation_batch_cancelled',
+                    { status: 'rejected', incrementRevision: true }));
+            const answers = targets.get(proposal.proposalId) ?? [];
+            if (answers.length === 0) {
+                if (proposal.status !== 'pending' && proposal.status !== 'needs_clarification')
+                    return batchDecision(proposal, decisionResult(proposal, 'denied', 'confirmation_proposal_already_resolved'));
+                return unresolvedBatchDecision(proposal);
+            }
+            if (answers.length > 1)
+                return batchDecision(proposal, decisionResult(proposal, 'denied', 'confirmation_batch_duplicate_reference'));
+            const answer = answers[0].answer;
+            const singleResponse = {
+                proposalId: proposal.proposalId,
+                assessmentId: answer.assessmentId,
+                candidateIndex: answer.candidateIndex,
+                candidateFingerprint: answer.candidateFingerprint,
+                operation: answer.operation,
+                targetReference: answer.targetReference,
+                intent: answer.intent,
+                sourceLabel: answer.sourceLabel,
+                principalId: answer.principalId,
+                sessionId: answer.sessionId,
+                installationId: answer.installationId,
+                responseTurnId: answer.responseTurnId,
+                requestedScope: answer.requestedScope,
+            };
+            return batchDecision(proposal, evaluateSimulatedMemoryConfirmation({ proposal, response: singleResponse,
+                evaluatedAt: input.evaluatedAt, currentRevision: revision, optOut: false, consentRevoked: false }));
+        });
+
+        return Object.freeze({ success: true, simulationOnly: true,
+            orderedProposalIds: Object.freeze(orderedProposalIds),
+            decisions: Object.freeze(decisions), issues: Object.freeze(issues),
+            authorization: Object.freeze({ granted: false, executable: false }), writeReady: false,
+            persistence: Object.freeze({ performed: false }) });
+    } catch { return batchFailure('confirmation_batch_invalid'); }
 }
