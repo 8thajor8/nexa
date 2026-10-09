@@ -7,6 +7,15 @@ export interface SecureWebPreferences {
   allowRunningInsecureContent: false;
 }
 
+export const FRAMELESS_WINDOW_OPTIONS = {
+  frame: false,
+  autoHideMenuBar: true,
+  resizable: true,
+  minimizable: true,
+  maximizable: true,
+  closable: true,
+} as const;
+
 export function createSecureWebPreferences(preload: string): SecureWebPreferences {
   return {
     preload, nodeIntegration: false, contextIsolation: true, sandbox: true,

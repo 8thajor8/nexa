@@ -1,14 +1,22 @@
-import { app, BrowserWindow, ipcMain } from "electron";
+import { app, BrowserWindow, ipcMain, Menu } from "electron";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { registerIpcHandlers } from "./ipc.js";
 import { isAllowedNavigation } from "../shared/ipc-security.js";
-import { PING_CHANNEL } from "../shared/ipc-contract.js";
 import {
+  GET_WALLPAPER_CHANNEL,
+  PING_CHANNEL,
+  WINDOW_CLOSE_CHANNEL,
+  WINDOW_MINIMIZE_CHANNEL,
+  WINDOW_TOGGLE_MAXIMIZE_CHANNEL,
+} from "../shared/ipc-contract.js";
+import {
+  FRAMELESS_WINDOW_OPTIONS,
   createSecureWebPreferences,
   loadRendererEntryPoint,
   selectRendererEntryPoint,
 } from "./security.js";
+import { getWindowsWallpaper } from "./wallpaper.js";
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const rendererFile = resolve(appRoot, "dist", "index.html");
@@ -25,7 +33,7 @@ let mainWindow: BrowserWindow | null = null;
 function createMainWindow(): BrowserWindow {
   const window = new BrowserWindow({
     width: 1280, height: 800, minWidth: 840, minHeight: 600,
-    title: "Nexa Desktop", show: false,
+    title: "Nexa Desktop", show: false, ...FRAMELESS_WINDOW_OPTIONS,
     webPreferences: createSecureWebPreferences(
       resolve(appRoot, "dist-electron", "preload.cjs"),
     ),
@@ -59,8 +67,12 @@ function installWebContentsGuards(): void {
 }
 
 app.whenReady().then(() => {
+  Menu.setApplicationMenu(null);
   installWebContentsGuards();
-  registerIpcHandlers(() => mainWindow);
+  registerIpcHandlers(
+    () => mainWindow,
+    () => getWindowsWallpaper(app.getPath("appData")),
+  );
   createMainWindow();
 });
 app.on("window-all-closed", () => {
@@ -69,4 +81,10 @@ app.on("window-all-closed", () => {
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0 && app.isReady()) createMainWindow();
 });
-app.on("before-quit", () => ipcMain.removeHandler(PING_CHANNEL));
+app.on("before-quit", () => {
+  ipcMain.removeHandler(PING_CHANNEL);
+  ipcMain.removeHandler(GET_WALLPAPER_CHANNEL);
+  ipcMain.removeHandler(WINDOW_TOGGLE_MAXIMIZE_CHANNEL);
+  ipcMain.removeAllListeners(WINDOW_MINIMIZE_CHANNEL);
+  ipcMain.removeAllListeners(WINDOW_CLOSE_CHANNEL);
+});

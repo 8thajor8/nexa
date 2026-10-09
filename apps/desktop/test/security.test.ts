@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
+  FRAMELESS_WINDOW_OPTIONS,
   createContentSecurityPolicy,
   createSecureWebPreferences,
   isExpectedViteDevServerUrl,
@@ -9,6 +10,17 @@ import {
 import { isAllowedNavigation } from "../src/shared/ipc-security";
 
 describe("Electron security configuration", () => {
+  it("uses a frameless resizable window with native window controls still enabled", () => {
+    expect(FRAMELESS_WINDOW_OPTIONS).toEqual({
+      frame: false,
+      autoHideMenuBar: true,
+      resizable: true,
+      minimizable: true,
+      maximizable: true,
+      closable: true,
+    });
+  });
+
   it("keeps renderer privileges disabled and sandboxed", () => {
     expect(createSecureWebPreferences("preload.cjs")).toEqual({
       preload: "preload.cjs", nodeIntegration: false, contextIsolation: true,

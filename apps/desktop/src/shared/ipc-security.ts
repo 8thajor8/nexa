@@ -12,6 +12,15 @@ export function isTrustedIpcSender(
   );
 }
 
+export function runForTrustedIpcSender<T>(
+  event: IpcSenderContext,
+  mainWindow: MainWindowContext | null,
+  operation: () => T,
+): T {
+  if (!isTrustedIpcSender(event, mainWindow)) throw new Error("untrusted_ipc_sender");
+  return operation();
+}
+
 export function isAllowedNavigation(targetUrl: string, entryPointUrl: string): boolean {
   return targetUrl === entryPointUrl;
 }
