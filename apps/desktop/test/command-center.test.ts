@@ -7,6 +7,7 @@ import { PresencePanel } from "../src/renderer/components/PresencePanel";
 import { Sidebar } from "../src/renderer/components/Sidebar";
 import { WindowChrome } from "../src/renderer/components/WindowChrome";
 import { HolographicFrame } from "../src/renderer/components/HolographicFrame";
+import { DashboardModules } from "../src/renderer/components/DashboardModules";
 import App from "../src/renderer/App";
 
 describe("Command Center visual structure", () => {
@@ -17,6 +18,85 @@ describe("Command Center visual structure", () => {
     expect(markup).toContain('aria-label="Actualizar el wallpaper de Windows"');
     expect(markup).toContain('aria-labelledby="conversation-title"');
     expect(markup).toContain('data-renderer-slot="presence"');
+  });
+
+  it("removes the redundant title while keeping the compact top controls", () => {
+    const markup = renderToStaticMarkup(createElement(App));
+
+    expect(markup).not.toContain("<h1");
+    expect(markup).toContain('aria-label="Controles del Command Center"');
+    expect(markup).toContain("Estado simulado");
+    expect(markup).toContain('aria-label="Comprobar el puente IPC local"');
+    expect(markup).toContain('aria-label="Fondo de Windows activado"');
+    expect(markup).toContain('aria-label="Actualizar el wallpaper de Windows"');
+  });
+
+  it("renders the three lower dashboard modules with clearly labeled mock and future data", () => {
+    const markup = renderToStaticMarkup(createElement(DashboardModules, { assistantState: "En espera" }));
+
+    expect(markup).toContain("Actividad reciente");
+    expect(markup).toContain("DEMO · MOCK");
+    expect(markup).toContain("Herramientas disponibles");
+    expect(markup).toContain("Capacidades futuras, aún no conectadas");
+    expect(markup).toContain("Estado del sistema");
+    expect(markup).toContain("Sin métricas de rendimiento ni monitorización real.");
+    expect(markup).toContain("Sin conexión");
+  });
+
+  it("cleans panel and navigation labels while preserving their useful titles and the composer", () => {
+    const conversation = renderToStaticMarkup(createElement(ConversationPanel));
+    const presence = renderToStaticMarkup(createElement(PresencePanel));
+    const sidebar = renderToStaticMarkup(createElement(Sidebar));
+
+    expect(conversation).toContain("Conversación");
+    expect(conversation).not.toContain("ESPACIO DE TRABAJO");
+    expect(conversation).not.toContain("INTERFAZ INACTIVA");
+    expect(conversation).toContain("Entrada no habilitada");
+    expect(conversation).toContain('id="message-composer"');
+    expect(presence).toContain("Nexa Presence");
+    expect(presence).not.toContain("PRESENCE · C-4");
+    expect(presence).not.toContain("Contenedor independiente");
+    expect(presence).toContain("Sin visualización");
+    expect(sidebar).not.toContain("ESPACIO DE TRABAJO");
+    expect(sidebar).not.toContain("ENTORNO LOCAL");
+    expect(sidebar).not.toContain("Interfaz de demostración");
+    expect(sidebar).toContain("NEXA");
+    expect(sidebar).toContain("COMMAND CENTER");
+    expect(sidebar).toContain('tabindex="0"');
+  });
+
+  it("keeps the dashboard modules inside the fixed viewport with only localized compact scrolling", () => {
+    const styles = readFileSync(new URL("../src/renderer/styles.css", import.meta.url), "utf8");
+    const markup = renderToStaticMarkup(createElement(App));
+
+    expect(styles).toMatch(/html\s*\{[^}]*overflow:\s*hidden/s);
+    expect(styles).toMatch(/body\s*\{[^}]*overflow:\s*hidden/s);
+    expect(styles).toMatch(/\.app-shell\s*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\) 184px/s);
+    expect(styles).toMatch(/\.workspace-grid\s*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\)/s);
+    expect(styles).toMatch(/\.dashboard-modules\s*\{[^}]*grid-column:\s*1 \/ -1[^}]*grid-row:\s*2[^}]*padding:/s);
+    expect(styles).toMatch(/@media \(max-width:\s*760px\)[\s\S]*?\.dashboard-modules\s*\{[^}]*overflow-x:\s*auto/);
+    expect(styles).toMatch(/\.tool-list\s*\{[^}]*grid-template-columns:\s*repeat\(4, minmax\(0, 1fr\)\)/s);
+    expect(styles).toMatch(/@container \(max-width:\s*300px\)[\s\S]*?\.tool-list\s*\{[^}]*repeat\(3, minmax\(0, 1fr\)\)/);
+    expect(markup).toContain('id="message-composer"');
+    expect(markup).toContain('aria-current="page"');
+    expect(markup).toContain('aria-label="Mostrar controles de ventana"');
+  });
+
+  it("uses one horizontal gap token and hides only the conversation history scrollbar", () => {
+    const styles = readFileSync(new URL("../src/renderer/styles.css", import.meta.url), "utf8");
+    const conversation = renderToStaticMarkup(createElement(ConversationPanel));
+
+    expect(styles).toMatch(/--nexa-layout-column-gap:\s*18px/);
+    expect(styles).toMatch(/\.app-shell\s*\{[^}]*column-gap:\s*var\(--nexa-layout-column-gap\)/s);
+    expect(styles).toMatch(/\.workspace-grid\s*\{[^}]*column-gap:\s*var\(--nexa-layout-column-gap\)/s);
+    expect(styles).toMatch(/\.dashboard-modules\s*\{[^}]*column-gap:\s*var\(--nexa-layout-column-gap\)/s);
+    expect(styles).toMatch(/\.message-list\s*\{[^}]*overflow:\s*auto[^}]*scrollbar-width:\s*none/s);
+    expect(styles).toMatch(/\.message-list::-webkit-scrollbar\s*\{[^}]*display:\s*none/s);
+    expect(styles).toMatch(/\.composer-wrap\s*\{[^}]*flex:\s*0 0 auto/s);
+    expect(styles).toMatch(/html\s*\{[^}]*overflow:\s*hidden/s);
+    expect(styles).toMatch(/body\s*\{[^}]*overflow:\s*hidden/s);
+    expect(conversation).toContain('class="message-list"');
+    expect(conversation).toContain('tabindex="0"');
   });
 
   it("renders accessible controls for frameless window operations", () => {
@@ -138,7 +218,7 @@ describe("Command Center visual structure", () => {
     expect(markup).toContain("Mensajes de ejemplo");
     expect(markup).toContain("no se han enviado a un modelo ni se han guardado");
     expect(markup).toContain('id="message-composer"');
-    expect(markup).toContain('placeholder="La entrada de mensajes estará disponible en UI-02.2"');
+    expect(markup).toContain('placeholder="La entrada de mensajes no está activa"');
     expect(markup).toContain('aria-label="Enviar mensaje, no disponible en esta versión"');
   });
 

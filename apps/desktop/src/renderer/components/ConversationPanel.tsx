@@ -6,10 +6,7 @@ export function ConversationPanel() {
     <section className="conversation-panel surface-panel" aria-labelledby="conversation-title">
       <HolographicFrame />
       <header className="panel-heading conversation-heading">
-        <div className="panel-heading-copy">
-          <span className="section-kicker"><span className="kicker-mark" /> ESPACIO DE TRABAJO</span>
-          <h2 id="conversation-title">Conversación</h2>
-        </div>
+        <h2 id="conversation-title">Conversación</h2>
         <span className="mock-tag"><span /> DEMO · MOCK</span>
       </header>
 
@@ -19,7 +16,7 @@ export function ConversationPanel() {
         <span className="context-lock" aria-label="Los mensajes no se envían">LOCAL</span>
       </div>
 
-      <div className="message-list" aria-label="Mensajes de ejemplo">
+      <div className="message-list" aria-label="Mensajes de ejemplo, historial desplazable" tabIndex={0}>
         {mockConversation.map((message) => (
           <article className={`message message--${message.speaker === "Tú" ? "user" : "nexa"}`} key={message.id}>
             <div className="message-meta">
@@ -39,12 +36,12 @@ export function ConversationPanel() {
         <label className="sr-only" htmlFor="message-composer">Entrada de mensaje de demostración</label>
         <div className="composer-field">
           <span className="composer-prompt" aria-hidden="true">›</span>
-          <input id="message-composer" type="text" placeholder="La entrada de mensajes estará disponible en UI-02.2" disabled />
+          <input id="message-composer" type="text" placeholder="La entrada de mensajes no está activa" disabled />
           <button className="composer-send" type="button" disabled aria-label="Enviar mensaje, no disponible en esta versión">
             <svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="M3 10h13M10 4l6 6-6 6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
           </button>
         </div>
-        <div className="composer-hint"><span>INTERFAZ INACTIVA</span><span>Los mensajes de demostración no se envían</span></div>
+        <div className="composer-hint"><span>Entrada no habilitada · los mensajes de demostración no se envían</span></div>
       </div>
     </section>
   );

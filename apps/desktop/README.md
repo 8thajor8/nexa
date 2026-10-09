@@ -45,6 +45,8 @@ Command Center muestra conversaciones de ejemplo identificadas como mock y una e
 
 El layout usa una columna de navegación, el espacio central y un panel Presence en pantallas amplias. Al reducir el ancho, la navegación se contrae a iconos y Presence pasa debajo de la conversación; en ventanas estrechas, la navegación pasa a una barra superior y el contenido se apila sin exigir un ancho mínimo al documento.
 
+El Command Center mantiene una fila compacta para los controles superiores. Conversación y Presence ocupan la zona principal, con una franja inferior de Actividad reciente (eventos mock), Herramientas disponibles (capacidades futuras deshabilitadas) y Estado del sistema (indicadores de demostración, sin métricas reales). La grilla conserva el viewport fijo; en ventanas estrechas la franja inferior tiene desplazamiento horizontal localizado.
+
 La ventana de Windows es frameless y conserva los límites de redimensionamiento, minimizar, maximizar/restaurar y cerrar. Una franja superior dedicada se puede arrastrar; sus tres botones están marcados `no-drag`. Los controles usan canales IPC explícitos validados contra el frame principal. No hay menú nativo ni transparencia real de la ventana.
 
 ## Seguridad

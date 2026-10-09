@@ -7,10 +7,7 @@ export function PresencePanel() {
     <aside className="presence-panel surface-panel" aria-labelledby="presence-title" data-renderer-slot="presence">
       <HolographicFrame />
       <header className="panel-heading presence-heading">
-        <div className="panel-heading-copy">
-          <span className="section-kicker"><span className="kicker-mark kicker-mark--violet" /> PRESENCE · C-4</span>
-          <h2 id="presence-title">Nexa Presence</h2>
-        </div>
+        <h2 id="presence-title">Nexa Presence</h2>
         <span className="presence-state"><span /> RESERVADO</span>
       </header>
 
@@ -35,7 +32,6 @@ export function PresencePanel() {
         <ul>{futureModes.map((mode) => <li key={mode}><span className="mode-marker" aria-hidden="true" />{mode}</li>)}</ul>
       </section>
 
-      <p className="presence-note">Contenedor independiente. No hay avatar ni renderizador activo.</p>
     </aside>
   );
 }

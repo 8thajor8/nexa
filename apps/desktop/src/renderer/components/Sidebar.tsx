@@ -31,11 +31,9 @@ export function Sidebar() {
   return (
     <aside className="sidebar" aria-label="Navegación principal">
       <div className="brand-lockup">
-        <span className="brand-mark" aria-hidden="true"><span>N</span></span>
-        <span className="brand-copy"><strong>NEXA</strong><small>COMMAND SYSTEM</small></span>
+        <span className="brand-copy"><strong>NEXA</strong><small>COMMAND CENTER</small></span>
       </div>
 
-      <div className="sidebar-section-label">ESPACIO DE TRABAJO</div>
       <nav className="primary-nav" aria-label="Secciones, lista desplazable" tabIndex={0}>
         {navigation.map((item) => {
           const contents = <><NavIcon name={item.icon} /><span className="nav-label">{item.label}</span>{!item.active && <span className="nav-soon">PRONTO</span>}<HolographicFrame variant="navigation" /></>;
@@ -59,12 +57,6 @@ export function Sidebar() {
       </nav>
 
       <div className="sidebar-spacer" />
-
-      <section className="connection-card" aria-label="Conexión local">
-        <div className="connection-card-top"><span className="connection-signal" /><span>ENTORNO LOCAL</span></div>
-        <p>Interfaz de demostración</p>
-        <small>El motor Nexa aún no está conectado.</small>
-      </section>
 
       <div className="sidebar-bottom"><span className="sidebar-version">NEXA DESKTOP <span>·</span> 0.1</span><span className="sidebar-build-dot" aria-hidden="true" /></div>
     </aside>

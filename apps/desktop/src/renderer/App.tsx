@@ -5,6 +5,7 @@ import { PresencePanel } from "./components/PresencePanel";
 import { Sidebar } from "./components/Sidebar";
 import { WindowChrome } from "./components/WindowChrome";
 import { HolographicFrame } from "./components/HolographicFrame";
+import { DashboardModules } from "./components/DashboardModules";
 
 export default function App() {
   const stateProvider = useMemo(() => createMockAssistantStateProvider(), []);
@@ -76,12 +77,7 @@ export default function App() {
       <WindowChrome />
       <Sidebar />
       <main className="workspace-shell">
-        <header className="workspace-header">
-          <div className="workspace-heading">
-            <p className="eyebrow"><span className="eyebrow-line" /> CENTRO DE CONTROL <span className="eyebrow-divider">/</span> UI-02.1</p>
-            <h1>Command Center</h1>
-            <p className="workspace-subtitle">Un espacio de trabajo para Nexa. Las conversaciones y Presence siguen en modo demostración.</p>
-          </div>
+        <header className="workspace-header" aria-label="Controles del Command Center">
           <div className="workspace-controls">
             <div className="assistant-status" aria-live="polite" data-testid="assistant-state">
               <span className={`status-indicator status-indicator--${assistantState}`} />
@@ -136,9 +132,10 @@ export default function App() {
         <footer className="workspace-footer">
           <span><span className="footer-dot" /> SESIÓN LOCAL</span>
           <span>Sin conexión a Core, OpenAI o herramientas</span>
-          <span>BUILD UI-02.1</span>
+          <span>BUILD UI-02.2</span>
         </footer>
       </main>
+      <DashboardModules assistantState={ASSISTANT_STATE_LABELS[assistantState]} />
     </div>
   );
 }
