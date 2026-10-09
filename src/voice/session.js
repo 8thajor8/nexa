@@ -8,6 +8,10 @@ export const VOICE_EVENTS = Object.freeze([
     'voice.cancelled',
     'voice.error',
     'voice.session.ended',
+    'voice.speaking',
+    'voice.speech.completed',
+    'voice.speech.cancelled',
+    'voice.speech.error',
 ]);
 
 const validEvents = new Set(VOICE_EVENTS);

@@ -10,6 +10,10 @@ const messages = Object.freeze({
     voice_response_invalid: 'El proveedor devolvió una respuesta de transcripción no válida.',
     voice_cancelled: 'La transcripción fue cancelada.',
     voice_session_invalid_state: 'La sesión de voz no está activa.',
+    voice_speech_invalid_input: 'La solicitud de voz hablada no tiene un formato válido.',
+    voice_speech_service_invalid: 'El servicio de síntesis de voz no está disponible.',
+    voice_speech_generation_failed: 'No pude generar el audio hablado.',
+    voice_speech_playback_failed: 'No pude reproducir el audio hablado.',
 });
 
 export class VoiceError extends Error {
