@@ -7,7 +7,7 @@ const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const node = process.execPath;
 const tsconfig = resolve(appRoot, "node_modules", "typescript", "bin", "tsc");
 const vite = resolve(appRoot, "node_modules", "vite", "bin", "vite.js");
-const esbuild = resolve(appRoot, "node_modules", "esbuild", "bin", "esbuild");
+const electronBuild = resolve(appRoot, "scripts", "build-electron.mjs");
 const electron = resolve(appRoot, "node_modules", "electron", "cli.js");
 const rendererUrl = "http://127.0.0.1:5173";
 
@@ -47,10 +47,8 @@ process.once("SIGINT", () => { stopChildren(); process.exit(130); });
 process.once("SIGTERM", () => { stopChildren(); process.exit(143); });
 
 try {
-  await run(node, [tsconfig, "-p", resolve(appRoot, "tsconfig.electron.json")]);
-  await run(node, [esbuild, "src/preload.ts", "--bundle", "--platform=node",
-    "--format=cjs", "--external:electron", "--outfile=dist-electron/preload.cjs",
-    "--target=node22"]);
+  await run(node, [tsconfig, "--noEmit", "-p", resolve(appRoot, "tsconfig.electron.json")]);
+  await run(node, [electronBuild]);
   renderer = start(node, [vite, "--host", "127.0.0.1", "--strictPort"]);
   await waitForRenderer(renderer);
   desktop = start(node, [electron, "."], {

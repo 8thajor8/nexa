@@ -35,7 +35,7 @@ const rendererEntryPoint = selectRendererEntryPoint(
 const rendererEntryPointUrl = rendererEntryPoint.kind === "url"
   ? rendererEntryPoint.url
   : pathToFileURL(rendererEntryPoint.filePath).href;
-const publicVoiceApiUrl = pathToFileURL(resolve(appRoot, "..", "..", "src", "voice", "index.js")).href;
+const publicVoiceApiUrl = pathToFileURL(resolve(appRoot, "dist-electron", "voice", "index.js")).href;
 let mainWindow: BrowserWindow | null = null;
 
 function createMainWindow(): BrowserWindow {
