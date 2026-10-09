@@ -69,6 +69,8 @@ interface ActiveVoiceSession {
 type LoadPublicVoiceApi = () => Promise<PublicVoiceApi>;
 
 const activeSessions = new WeakMap<VoiceIpcWindow, ActiveVoiceSession>();
+const navigatingWindows = new WeakSet<VoiceIpcWindow>();
+const navigationHooks = new WeakSet<VoiceIpcWindow>();
 const perWindowSequence = new WeakMap<VoiceIpcWindow, number>();
 let cachedVoiceApi: Promise<PublicVoiceApi> | null = null;
 
@@ -93,7 +95,8 @@ function isTrustedVoiceSender(
   window: VoiceIpcWindow | null,
   expectedRendererUrl: string,
 ): window is VoiceIpcWindow {
-  return Boolean(window && !window.isDestroyed() && isTrustedIpcSender(event, window)
+  return Boolean(window && !window.isDestroyed() && !navigatingWindows.has(window)
+    && isTrustedIpcSender(event, window)
     && event.senderFrame && isTrustedRendererUrl(event.senderFrame.url, expectedRendererUrl));
 }
 
@@ -158,6 +161,27 @@ function getPublicVoiceApi(loadVoiceApi: LoadPublicVoiceApi): Promise<PublicVoic
   return cachedVoiceApi;
 }
 
+
+/** Installs one per-window barrier around top-level document replacement. */
+export function registerVoiceWindowNavigation(
+  window: VoiceIpcWindow,
+  expectedRendererUrl: string,
+): void {
+  if (navigationHooks.has(window)) return;
+  navigationHooks.add(window);
+
+  window.webContents.on("did-start-navigation", (details) => {
+    if (!details.isMainFrame || details.isSameDocument || window.isDestroyed()) return;
+    navigatingWindows.add(window);
+    cleanupVoiceWindow(window);
+  });
+
+  window.webContents.on("did-navigate", (_event, url) => {
+    if (window.isDestroyed() || !isTrustedRendererUrl(url, expectedRendererUrl)) return;
+    navigatingWindows.delete(window);
+  });
+}
+
 export function registerVoiceIpcHandlers(
   getMainWindow: () => VoiceIpcWindow | null,
   expectedRendererUrl: string,
@@ -179,7 +203,8 @@ export function registerVoiceIpcHandlers(
     let state: ActiveVoiceSession | null = null;
     try {
       const voice = await getPublicVoiceApi(loadVoiceApi);
-      if (window.isDestroyed() || getMainWindow() !== window || activeSessions.has(window)) {
+      if (window.isDestroyed() || navigatingWindows.has(window)
+        || getMainWindow() !== window || activeSessions.has(window)) {
         return errorResponse(request.requestId, "session_unavailable", "The window is no longer available.");
       }
       const controller = voice.createPttVoiceController({

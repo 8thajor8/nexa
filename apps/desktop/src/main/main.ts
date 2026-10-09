@@ -19,6 +19,7 @@ import {
 import { getWindowsWallpaper } from "./wallpaper.js";
 import {
   cleanupVoiceWindow,
+  registerVoiceWindowNavigation,
   registerVoiceIpcHandlers,
   registerVoiceMicrophonePermissions,
   removeVoiceIpcHandlers,
@@ -55,6 +56,7 @@ function createMainWindow(): BrowserWindow {
     if (mainWindow === window) mainWindow = null;
   });
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  registerVoiceWindowNavigation(window as never, rendererEntryPointUrl);
   window.webContents.on("will-navigate", (event, targetUrl) => {
     if (!isAllowedNavigation(targetUrl, rendererEntryPointUrl)) event.preventDefault();
   });

@@ -16,6 +16,7 @@ vi.mock("electron", () => ({ ipcMain: ipcMock }));
 
 import {
   cleanupVoiceWindow,
+  registerVoiceWindowNavigation,
   registerVoiceIpcHandlers,
   registerVoiceMicrophonePermissions,
   removeVoiceIpcHandlers,
@@ -23,15 +24,26 @@ import {
 
 const RENDERER_URL = "http://127.0.0.1:5173";
 
-function createWindow(id: string, url = `${RENDERER_URL}/`) {
+function createWindow(id: string, url = RENDERER_URL + "/") {
   const mainFrame = { url };
-  const webContents = { mainFrame, send: vi.fn(), isDestroyed: vi.fn(() => false) };
+  const listeners = new Map<string, Array<(...args: any[]) => void>>();
+  const webContents = {
+    mainFrame, send: vi.fn(), isDestroyed: vi.fn(() => false),
+    on: vi.fn((event: string, listener: (...args: any[]) => void) => {
+      const handlers = listeners.get(event) ?? [];
+      handlers.push(listener);
+      listeners.set(event, handlers);
+      return webContents;
+    }),
+  };
   return {
     id, webContents, isDestroyed: vi.fn(() => false),
     minimize: vi.fn(), close: vi.fn(),
+    emitWebContents(event: string, ...args: unknown[]) {
+      for (const listener of [...(listeners.get(event) ?? [])]) listener(...args);
+    },
   };
 }
-
 function trustedEvent(window: ReturnType<typeof createWindow>) {
   return { sender: window.webContents, senderFrame: window.webContents.mainFrame };
 }
@@ -335,6 +347,129 @@ describe("Electron Main Voice IPC", () => {
     expect(finish(window, sessionId!, "finish-after-close")).toMatchObject({
       ok: false, error: { code: "session_unavailable" },
     });
+  });
+
+  it("retires and blocks a replaced renderer, then unlocks only after the trusted document commits", async () => {
+    const window = createWindow("one"); const voice = register(window);
+    registerVoiceWindowNavigation(window as never, RENDERER_URL);
+    registerVoiceWindowNavigation(window as never, RENDERER_URL);
+    expect(window.webContents.on.mock.calls.filter(([name]) =>
+      name === "did-start-navigation" || name === "did-navigate")).toHaveLength(2);
+
+    const started = await startSession(window, "start-before-reload");
+    finish(window, started.sessionId!, "finish-before-reload");
+    window.emitWebContents("did-start-navigation", {
+      url: RENDERER_URL, isMainFrame: true, isSameDocument: false,
+    });
+    expect(voice.controllers[0].end).toHaveBeenCalledOnce();
+    expect(voice.controllers[0].unsubscribe).toHaveBeenCalledOnce();
+    await expect(invoke(VOICE_PTT_START_CHANNEL, trustedEvent(window), { requestId: "stale-start" }))
+      .rejects.toThrow("untrusted_voice_ipc_sender");
+
+    window.emitWebContents("did-navigate", {}, RENDERER_URL + "/unexpected");
+    await expect(invoke(VOICE_PTT_START_CHANNEL, trustedEvent(window), { requestId: "still-blocked" }))
+      .rejects.toThrow("untrusted_voice_ipc_sender");
+
+    window.emitWebContents("did-navigate", {}, RENDERER_URL + "/");
+    const replacement = await startSession(window, "start-after-reload");
+    expect(replacement.ok).toBe(true);
+    expect(replacement.sessionId).not.toBe(started.sessionId);
+  });
+
+  it("does not retire a session for in-page navigation or a subframe navigation", async () => {
+    const window = createWindow("one"); const voice = register(window);
+    registerVoiceWindowNavigation(window as never, RENDERER_URL);
+    const started = await startSession(window);
+    window.emitWebContents("did-start-navigation", {
+      url: RENDERER_URL + "/#section", isMainFrame: true, isSameDocument: true,
+    });
+    window.emitWebContents("did-start-navigation", {
+      url: "http://127.0.0.1:5173/child", isMainFrame: false, isSameDocument: false,
+    });
+
+    expect(voice.controllers[0].end).not.toHaveBeenCalled();
+    expect(await startSession(window, "duplicate")).toMatchObject({
+      ok: false, error: { code: "request_conflict" },
+    });
+    expect(started.ok).toBe(true);
+  });
+
+  it("aborts STT on reload and suppresses late completion without affecting another window", async () => {
+    const firstWindow = createWindow("first");
+    const secondWindow = createWindow("second");
+    const voice = makeVoiceFactory();
+    let currentWindow = firstWindow;
+    registerVoiceIpcHandlers(() => currentWindow as never, RENDERER_URL, async () => voice as never);
+    registerVoiceWindowNavigation(firstWindow as never, RENDERER_URL);
+    registerVoiceWindowNavigation(secondWindow as never, RENDERER_URL);
+
+    const first = await startSession(firstWindow, "start-first");
+    finish(firstWindow, first.sessionId!, "finish-first");
+    currentWindow = secondWindow;
+    const second = await startSession(secondWindow, "start-second");
+    finish(secondWindow, second.sessionId!, "finish-second");
+
+    firstWindow.emitWebContents("did-start-navigation", {
+      url: RENDERER_URL, isMainFrame: true, isSameDocument: false,
+    });
+    expect(voice.controllers[0].end).toHaveBeenCalledOnce();
+    expect(voice.controllers[0].cancel).toHaveBeenCalledWith("session_ended");
+    expect(voice.controllers[1].end).not.toHaveBeenCalled();
+    const firstEventCount = firstWindow.webContents.send.mock.calls.length;
+    voice.controllers[0].resolvePending({ sessionId: first.sessionId, turnId: "turn-1", text: "late", language: "es" });
+    await Promise.resolve(); await Promise.resolve();
+    expect(firstWindow.webContents.send).toHaveBeenCalledTimes(firstEventCount);
+
+    secondWindow.emitWebContents("did-start-navigation", {
+      url: RENDERER_URL, isMainFrame: true, isSameDocument: false,
+    });
+    expect(voice.controllers[1].end).toHaveBeenCalledOnce();
+  });
+
+  it("blocks a start whose Voice API load resolves after navigation begins", async () => {
+    const window = createWindow("one");
+    const voice = makeVoiceFactory();
+    let resolveVoice!: (value: typeof voice) => void;
+    const voiceApi = new Promise<typeof voice>((resolve) => { resolveVoice = resolve; });
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, () => voiceApi as never);
+    registerVoiceWindowNavigation(window as never, RENDERER_URL);
+
+    const pendingStart = invoke(VOICE_PTT_START_CHANNEL, trustedEvent(window), { requestId: "start-racing" });
+    window.emitWebContents("did-start-navigation", {
+      url: RENDERER_URL, isMainFrame: true, isSameDocument: false,
+    });
+    resolveVoice(voice);
+    await expect(pendingStart).resolves.toMatchObject({
+      ok: false, requestId: "start-racing", error: { code: "session_unavailable" },
+    });
+    expect(voice.createPttVoiceController).not.toHaveBeenCalled();
+
+    window.emitWebContents("did-navigate", {}, RENDERER_URL + "/");
+    expect(await startSession(window, "start-after-race")).toMatchObject({ ok: true });
+  });
+
+  it("handles cancellation and navigation in either order without retiring twice", async () => {
+    const window = createWindow("one"); const voice = register(window);
+    registerVoiceWindowNavigation(window as never, RENDERER_URL);
+    const first = await startSession(window, "start-cancel-first");
+    const cancelResult = invoke(VOICE_PTT_CANCEL_CHANNEL, trustedEvent(window), {
+      requestId: "cancel-first", sessionId: first.sessionId, targetRequestId: "start-cancel-first",
+    });
+    window.emitWebContents("did-start-navigation", {
+      url: RENDERER_URL, isMainFrame: true, isSameDocument: false,
+    });
+    expect(cancelResult).toMatchObject({ ok: true });
+    expect(voice.controllers[0].end).toHaveBeenCalledOnce();
+
+    window.emitWebContents("did-navigate", {}, RENDERER_URL + "/");
+    const second = await startSession(window, "start-navigation-first");
+    window.emitWebContents("did-start-navigation", {
+      url: RENDERER_URL, isMainFrame: true, isSameDocument: false,
+    });
+    await expect(Promise.resolve().then(() => invoke(VOICE_PTT_CANCEL_CHANNEL, trustedEvent(window), {
+      requestId: "cancel-too-late", sessionId: second.sessionId, targetRequestId: "start-navigation-first",
+    }))).rejects.toThrow("untrusted_voice_ipc_sender");
+    expect(voice.controllers[1].end).toHaveBeenCalledOnce();
   });
 
   it("grants microphone permission only to the trusted main frame and denies video or other origins", () => {
