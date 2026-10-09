@@ -18,7 +18,9 @@ function normalizeOptions(options) {
 }
 
 function defaultServiceLoader() {
-    return import('../speech/service.js').then(({ generateSpeech, playAudio, removeTemporarySpeech }) => ({ generate: generateSpeech, play: playAudio, removeTemporary: removeTemporarySpeech }));
+    return import('../speech/service.js').then(({ generateSpeech, playAudio, stopSpeechPlayback, getSpeechPlaybackStatus, removeTemporarySpeech }) => ({
+        generate: generateSpeech, play: playAudio, stopPlayback: stopSpeechPlayback, getPlaybackStatus: getSpeechPlaybackStatus, removeTemporary: removeTemporarySpeech,
+    }));
 }
 
 export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), idFactory = randomUUID, now = Date.now, playbackTimeoutMs = defaultPlaybackTimeoutMs } = {}) {
@@ -50,7 +52,8 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
 
     const listeners = new Map(['voice.speaking', 'voice.speech.completed', 'voice.speech.cancelled', 'voice.speech.error'].map(type => [type, new Set()]));
     function emit(type, operation, details = {}) {
-        const event = Object.freeze({ type, sessionId, turnId: operation?.turnId ?? null, timestamp: now(), ...details });
+        const event = Object.freeze({ type, sessionId, turnId: operation?.turnId ?? null,
+            playbackId: operation?.playbackId ?? null, timestamp: now(), ...details });
         for (const listener of [...listeners.get(type)]) { try { listener(event); } catch { /* Listener failures do not affect playback. */ } }
     }
     function on(type, listener) {
@@ -64,6 +67,15 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
         const cancellation = new Promise(resolve => { resolveCancellation = resolve; });
         return { turnId: idFactory(), text, options, phase: 'synthesizing', cancelled: false, cancellation, resolveCancellation };
     }
+    function discardGenerated(operation) {
+        if (operation.options.persist || !operation.generatedAudioId || typeof operation.service?.removeTemporary !== 'function') return Promise.resolve(false);
+        if (!operation.cleanupPromise) {
+            cleanupInFlight = true;
+            operation.cleanupPromise = Promise.resolve().then(() => operation.service.removeTemporary(operation.generatedAudioId))
+                .catch(() => false).finally(() => { cleanupInFlight = false; });
+        }
+        return operation.cleanupPromise;
+    }
     function failFast(operation, code) {
         const error = new VoiceError(code);
         emit('voice.speech.error', operation, { phase: 'queued', error: Object.freeze({ code: error.code, message: error.message }) });
@@ -73,10 +85,57 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
         if (!validCancelReasons.has(reason)) throw new TypeError('voice_cancel_reason_invalid');
         if (!active) return false;
         const operation = active;
-        active = null;
         operation.cancelled = true;
+        operation.cancelReason = reason;
         operation.resolveCancellation(null);
-        emit('voice.speech.cancelled', operation, { reason, phase: operation.phase, playbackInterrupted: false });
+        if (operation.phase !== 'speaking') {
+            active = null;
+            emit('voice.speech.cancelled', operation, { reason, phase: operation.phase, playbackInterrupted: false, interruptionStatus: 'not_playing' });
+            operation.cancelEventEmitted = true;
+            return true;
+        }
+        if (!operation.playStarted) {
+            active = null;
+            playbackState = 'idle';
+            void discardGenerated(operation);
+            emit('voice.speech.cancelled', operation, { reason, phase: operation.phase, playbackInterrupted: false, interruptionStatus: 'not_started' });
+            operation.cancelEventEmitted = true;
+            return true;
+        }
+        if (typeof operation.service?.stopPlayback !== 'function') {
+            active = null;
+            emit('voice.speech.cancelled', operation, { reason, phase: operation.phase, playbackInterrupted: false, interruptionStatus: 'unavailable' });
+            operation.cancelEventEmitted = true;
+            return true;
+        }
+        operation.stopPromise = Promise.resolve().then(() => operation.service.stopPlayback(operation.playbackId)).then(result => {
+            const interrupted = result?.status === 'stopped' && result?.interrupted === true
+                && result?.confirmed === true && result?.released === true;
+            if (result?.released === true) playbackState = 'idle';
+            else playbackState = 'degraded';
+            if (active === operation) active = null;
+            if (!operation.cancelEventEmitted) {
+                const nativeCode = result?.error?.code;
+                const interruptionErrorCode = nativeCode === 'audio_stop_timeout' || nativeCode === 'audio_status_timeout'
+                    ? 'voice_speech_stop_timeout' : 'voice_speech_stop_failed';
+                emit('voice.speech.cancelled', operation, { reason, phase: operation.phase, playbackInterrupted: interrupted,
+                    interruptionStatus: interrupted ? 'confirmed' : result?.status === 'already_finished' ? 'already_finished' : 'unconfirmed',
+                    ...(!interrupted && result?.status !== 'already_finished'
+                        ? { interruptionError: Object.freeze({ code: interruptionErrorCode, backendCode: String(nativeCode ?? 'audio_stop_unconfirmed') }) }
+                        : {}) });
+                operation.cancelEventEmitted = true;
+            }
+            return result;
+        }).catch(() => {
+            playbackState = 'degraded';
+            if (active === operation) active = null;
+            if (!operation.cancelEventEmitted) {
+                emit('voice.speech.cancelled', operation, { reason, phase: operation.phase, playbackInterrupted: false, interruptionStatus: 'unconfirmed',
+                    interruptionError: Object.freeze({ code: 'voice_speech_stop_failed' }) });
+                operation.cancelEventEmitted = true;
+            }
+            return null;
+        });
         return true;
     }
 
@@ -90,20 +149,24 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
             try { generated = await service.generate({ text: operation.text, ...operation.options }); }
             finally { synthesisInFlight = false; }
             if (active !== operation) {
-                if (generated?.success && typeof generated.audioId === 'string' && !operation.options.persist) {
-                    cleanupInFlight = true;
-                    try { await service.removeTemporary(generated.audioId); }
-                    catch { /* Speech startup/shutdown expiry cleanup is the fallback. */ }
-                    finally { cleanupInFlight = false; }
-                }
+                operation.service = service;
+                operation.generatedAudioId = generated?.audioId;
+                if (generated?.success) await discardGenerated(operation);
                 return null;
             }
             if (!generated?.success || typeof generated.audioId !== 'string') throw new VoiceError('voice_speech_generation_failed');
 
             operation.phase = 'speaking';
+            operation.service = service;
+            operation.generatedAudioId = generated.audioId;
+            operation.playbackId = randomUUID();
             playbackState = 'playing';
             emit('voice.speaking', operation);
-            const observedPlay = Promise.resolve().then(() => service.play(generated.audioId)).then(
+            const observedPlay = Promise.resolve().then(() => {
+                if (operation.cancelled || active !== operation) return { success: false, status: 'stopped', released: true };
+                operation.playStarted = true;
+                return service.play(generated.audioId, { playbackId: operation.playbackId });
+            }).then(
                 value => ({ kind: 'result', value }),
                 () => ({ kind: 'error' }),
             );
@@ -115,14 +178,31 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
                 playbackState = 'degraded';
                 throw new VoiceError('voice_speech_playback_timeout');
             }
-            playbackState = 'idle';
+            playbackState = outcome.kind === 'error' || outcome.value?.released === false ? 'degraded' : 'idle';
+            if (operation.cancelled) {
+                if (!operation.stopPromise) {
+                    if (active === operation) active = null;
+                    if (!operation.cancelEventEmitted) {
+                        emit('voice.speech.cancelled', operation, { reason: operation.cancelReason ?? 'user', phase: operation.phase, playbackInterrupted: false, interruptionStatus: 'already_finished' });
+                        operation.cancelEventEmitted = true;
+                    }
+                }
+                return null;
+            }
             if (active !== operation) return null;
-            if (outcome.kind === 'error' || !outcome.value?.success) throw new VoiceError('voice_speech_playback_failed');
+            if (outcome.kind === 'error' || !outcome.value?.success) {
+                const backendCode = outcome.value?.error?.code;
+                const code = backendCode === 'audio_start_timeout' ? 'voice_speech_start_timeout'
+                    : backendCode === 'audio_completion_timeout' || backendCode === 'audio_status_timeout' ? 'voice_speech_playback_timeout'
+                        : backendCode === 'audio_player_degraded' ? 'voice_speech_degraded'
+                            : backendCode === 'audio_player_busy' ? 'voice_speech_busy' : 'voice_speech_playback_failed';
+                throw new VoiceError(code);
+            }
             active = null;
             emit('voice.speech.completed', operation);
             return Object.freeze({ sessionId, turnId: operation.turnId, completed: true });
         } catch (error) {
-            if (active !== operation) return null;
+            if (active !== operation || operation.cancelled) return null;
             active = null;
             const safeError = error instanceof VoiceError ? error : new VoiceError(operation.phase === 'speaking' ? 'voice_speech_playback_failed' : 'voice_speech_generation_failed');
             emit('voice.speech.error', operation, { phase: operation.phase, error: Object.freeze({ code: safeError.code, message: safeError.message }) });

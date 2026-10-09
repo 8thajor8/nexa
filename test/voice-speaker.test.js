@@ -229,3 +229,64 @@ test('never-resolving play times out, degrades the speaker, and rejects later pl
     assert.equal(plays, 1);
     assert.deepEqual(events.map(event => [event.turnId, event.error.code]), [[events[0].turnId, 'voice_speech_playback_timeout'], [events[1].turnId, 'voice_speech_degraded']]);
 });
+
+test('confirmed physical interruption is correlated once and suppresses the late playback completion', async () => {
+    const playback = deferred();
+    let playbackId;
+    let started = false;
+    const speaker = createVoiceSpeaker({ speechService: {
+        async generate() { return { success: true, audioId: 'audio_interrupt' }; },
+        play(_audioId, options) { playbackId = options.playbackId; started = true; return playback.promise; },
+        async stopPlayback(id) {
+            assert.equal(id, playbackId);
+            return { playbackId: id, status: 'stopped', confirmed: true, released: true, interrupted: true };
+        },
+        async removeTemporary() { return true; },
+    }, sessionId: 'interrupt-session', idFactory: () => 'interrupt-turn' });
+    const events = [];
+    speaker.on('voice.speech.cancelled', event => events.push(event));
+    speaker.on('voice.speech.completed', event => events.push(event));
+    const task = speaker.speak('Deteneme');
+    await untilSpeaker(() => started);
+    assert.equal(speaker.cancel('user'), true);
+    assert.equal(await task, null);
+    await untilSpeaker(() => events.length > 0);
+    assert.deepEqual(events, [{
+        type: 'voice.speech.cancelled', sessionId: 'interrupt-session', turnId: 'interrupt-turn', playbackId,
+        timestamp: events[0].timestamp, reason: 'user', phase: 'speaking', playbackInterrupted: true,
+        interruptionStatus: 'confirmed',
+    }]);
+    playback.resolve({ success: false, status: 'stopped', released: true });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(events.length, 1);
+    assert.equal(speaker.getPlaybackState(), 'idle');
+});
+
+test('cancelling from the speaking event before playback starts discards its temporary WAV', async () => {
+    let plays = 0;
+    const removed = [];
+    let speaker;
+    speaker = createVoiceSpeaker({ speechService: {
+        async generate() { return { success: true, audioId: 'audio_before_start' }; },
+        async play() { plays++; return { success: true, released: true }; },
+        async removeTemporary(id) { removed.push(id); return true; },
+    } });
+    const events = [];
+    speaker.on('voice.speech.cancelled', event => events.push(event));
+    speaker.on('voice.speaking', () => speaker.cancel('user'));
+    assert.equal(await speaker.speak('todavía no empieza'), null);
+    await untilSpeaker(() => removed.length === 1);
+    assert.equal(plays, 0);
+    assert.deepEqual(removed, ['audio_before_start']);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].playbackInterrupted, false);
+    assert.equal(events[0].interruptionStatus, 'not_started');
+});
+
+async function untilSpeaker(predicate) {
+    const deadline = Date.now() + 1000;
+    while (!predicate()) {
+        if (Date.now() > deadline) throw new Error('speaker_test_condition_timeout');
+        await new Promise(resolve => setImmediate(resolve));
+    }
+}

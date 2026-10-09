@@ -5,6 +5,7 @@ import { createWindowsAudioPlayer } from './windows-player.js';
 import { createVoiceFxProcessor } from './voice-fx.js';
 import { createVoiceIdentityProcessor, nexaVoiceIdentity } from './voice-identity.js';
 import { performance } from 'node:perf_hooks';
+import { randomUUID } from 'node:crypto';
 
 const maxAudioBytes = 50 * 1024 * 1024;
 
@@ -69,25 +70,47 @@ export function createSpeechService({
         }
     }
 
-    async function play(audioId) {
+    async function play(audioId, { playbackId = randomUUID() } = {}) {
         const initialized = await initialize();
         if (!initialized.success) return initialized;
         const reference = store.get(audioId);
         if (!reference || !await store.isAvailable(audioId)) return failure('audio_not_found', 'No existe un audio disponible con ese identificador.');
         let result;
-        try { result = await player(reference.filePath); }
+        let playerSettled = false;
+        try {
+            result = typeof player === 'function'
+                ? await player(reference.filePath)
+                : await player.play(reference.filePath, { playbackId });
+            playerSettled = true;
+        }
         catch { result = failure('audio_playback_failed', 'Windows no pudo reproducir el audio.'); }
         finally {
-            // A temporary file is one-shot: an explicit playback attempt ends
-            // its lifecycle whether playback succeeded or failed. The store
-            // verifies the ID, directory and file type before deleting it.
-            if (reference.temporary) {
+            // A controlled player marks release only after terminal state and
+            // MCI close are confirmed. Legacy injected functions retain their
+            // historical settled-promise cleanup semantics.
+            const safelyReleased = (typeof player === 'function' && playerSettled) || result?.released === true;
+            if (reference.temporary && safelyReleased) {
                 try { await store.removeTemporary(audioId); }
                 catch { /* Startup/shutdown cleanup remains a second safeguard. */ }
             }
         }
-        if (!result?.success) return result?.error ? result : failure('audio_playback_failed', 'Windows no pudo reproducir el audio.');
-        return { success: true, audioId, played: true, temporary: reference.temporary };
+        if (!result?.success) return result?.error ? { ...result, audioId, playbackId } : failure('audio_playback_failed', 'Windows no pudo reproducir el audio.');
+        return { success: true, audioId, playbackId, played: true, temporary: reference.temporary,
+            status: result.status ?? 'completed', released: result.released ?? true };
+    }
+
+    async function stopPlayback(playbackId) {
+        if (typeof player?.stop !== 'function') return { playbackId, status: 'unconfirmed', confirmed: false, released: false, interrupted: false,
+            error: { code: 'audio_stop_unavailable', message: 'El reproductor no permite confirmar una interrupción.' } };
+        try { return await player.stop(playbackId); }
+        catch { return { playbackId, status: 'unknown', confirmed: false, released: false, interrupted: false,
+            error: { code: 'audio_stop_failed', message: 'Windows no pudo confirmar la interrupción.' } }; }
+    }
+
+    function getPlaybackStatus(playbackId) {
+        if (typeof player?.getStatus !== 'function') return Object.freeze({ playbackId, status: 'unknown', released: false });
+        try { return player.getStatus(playbackId); }
+        catch { return Object.freeze({ playbackId, status: 'unknown', released: false }); }
     }
 
     async function removeTemporary(audioId) {
@@ -99,19 +122,27 @@ export function createSpeechService({
     }
 
     async function close() {
-        try { return await store.cleanupCurrentTemporaries(); }
+        try {
+            if (typeof player?.dispose === 'function') {
+                const disposed = await player.dispose();
+                if (!disposed?.success) return { success: false, removed: 0, playback: disposed };
+            }
+            return await store.cleanupCurrentTemporaries();
+        }
         catch { return { success: false, removed: 0 }; }
     }
 
     function getLastMetrics() { return lastMetrics ? { ...lastMetrics } : null; }
 
-    return { initialize, generate, play, removeTemporary, close, getLastMetrics };
+    return { initialize, generate, play, stopPlayback, getPlaybackStatus, removeTemporary, close, getLastMetrics };
 }
 
 const speechService = createSpeechService();
 export const initializeSpeechService = speechService.initialize;
 export const generateSpeech = speechService.generate;
 export const playAudio = speechService.play;
+export const stopSpeechPlayback = speechService.stopPlayback;
+export const getSpeechPlaybackStatus = speechService.getPlaybackStatus;
 export const removeTemporarySpeech = speechService.removeTemporary;
 export const closeSpeechService = speechService.close;
 export const getSpeechMetrics = speechService.getLastMetrics;

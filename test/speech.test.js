@@ -92,7 +92,7 @@ test('persisted audio survives playback and service shutdown cleanup', async t =
     assert(reopenedStore.get(second.audioId));
 });
 
-test('failed or thrown playback attempts remove temporary audio but preserve persistent audio', async t => {
+test('thrown playback without a release confirmation preserves temporary and persistent audio', async t => {
     const f = await fixture(t);
     const service = createSpeechService({
         provider: f.provider,
@@ -104,8 +104,10 @@ test('failed or thrown playback attempts remove temporary audio but preserve per
     const temporaryPath = f.store.get(temporary.audioId).filePath;
     const failedTemporary = await service.play(temporary.audioId);
     assert.equal(failedTemporary.error.code, 'audio_playback_failed');
+    await access(temporaryPath);
+    assert.equal(f.store.get(temporary.audioId).temporary, true);
+    await service.close();
     await assert.rejects(access(temporaryPath));
-    assert.equal(f.store.get(temporary.audioId), null);
 
     const persistent = await service.generate({ text: 'Conservar', persist: true });
     const persistentPath = f.store.get(persistent.audioId).filePath;
@@ -128,6 +130,37 @@ test('SpeechService exposes safe temporary removal and refuses persistent or unk
     assert.equal(await service.removeTemporary('audio_persistent'), false);
     assert.equal(await service.removeTemporary('audio_unknown'), false);
     assert.deepEqual(removed, ['audio_temporary']);
+});
+
+test('SpeechService preserves play(audioId) while correlating controlled playback and cleaning only released temporaries', async () => {
+    const references = new Map([
+        ['audio_temporary', { audioId: 'audio_temporary', filePath: 'memory://temp', temporary: true }],
+        ['audio_persistent', { audioId: 'audio_persistent', filePath: 'memory://persistent', temporary: false }],
+    ]);
+    const calls = [];
+    const store = {
+        async initialize() {},
+        get(id) { return references.get(id) ?? null; },
+        async isAvailable(id) { return references.has(id); },
+        async removeTemporary(id) { calls.push(['remove', id]); references.delete(id); return true; },
+        async cleanupCurrentTemporaries() { return { success: true, removed: 0 }; },
+    };
+    const player = {
+        async play(filePath, options) { calls.push(['play', filePath, options.playbackId]); return { success: true, status: 'completed', released: true }; },
+        async stop(playbackId) { calls.push(['stop', playbackId]); return { playbackId, status: 'stopped', confirmed: true, released: true, interrupted: true }; },
+        getStatus(playbackId) { return { playbackId, status: 'playing', released: false }; },
+        async dispose() { calls.push(['dispose']); return { success: true }; },
+    };
+    const service = createSpeechService({ store, player });
+    assert.equal((await service.play('audio_temporary', { playbackId: 'turn-temp' })).played, true);
+    assert.deepEqual(await service.stopPlayback('turn-temp'), { playbackId: 'turn-temp', status: 'stopped', confirmed: true, released: true, interrupted: true });
+    assert.equal(service.getPlaybackStatus('turn-persist').status, 'playing');
+    assert.equal((await service.play('audio_persistent')).temporary, false);
+    assert.equal(references.has('audio_temporary'), false);
+    assert.equal(references.has('audio_persistent'), true);
+    assert.deepEqual(calls.filter(call => call[0] === 'remove'), [['remove', 'audio_temporary']]);
+    assert.equal((await service.close()).success, true);
+    assert.deepEqual(calls.at(-1), ['dispose']);
 });
 
 test('supports every fixed style while keeping a shared voice identity', async t => {
@@ -402,20 +435,29 @@ test('SpeechService integrates VoiceFX with off as the unchanged default', async
     assert.notDeepEqual(await readFile(f.store.get(fxGenerated.audioId).filePath), source);
 });
 
-test('Windows playback opens WAV through MCI, waits for completion, closes it, and rejects other platforms', async () => {
+test('Windows playback opens WAV through nonblocking MCI, polls completion, closes it, and rejects other platforms', async () => {
     const commands = [];
-    const windowsPlayer = createWindowsAudioPlayer({ platform: 'win32', sendCommand: async command => { commands.push(command); return 0; } });
-    assert.deepEqual(await windowsPlayer('internal-controlled-audio.wav'), { success: true });
+    let mode = 'playing';
+    const windowsPlayer = createWindowsAudioPlayer({ platform: 'win32', pollIntervalMs: 1, sendCommand: async command => {
+        commands.push(command);
+        if (command.startsWith('status ')) { mode = 'stopped'; return { code: 0, output: mode }; }
+        return 0;
+    } });
+    assert.deepEqual(await windowsPlayer.play('internal-controlled-audio.wav', { playbackId: 'test-playback' }), {
+        success: true, status: 'completed', released: true, interrupted: false,
+    });
     assert.match(commands[0], /^open "internal-controlled-audio\.wav" type waveaudio alias NexaAudio/u);
-    assert.match(commands[1], /^play NexaAudio[0-9a-f]{12} wait$/u);
-    assert.match(commands[2], /^close NexaAudio[0-9a-f]{12}$/u);
-    assert.equal(commands[1].split(' ')[1], commands[2].split(' ')[1]);
-    const failed = await createWindowsAudioPlayer({ platform: 'win32', sendCommand: async command => command.startsWith('play ') ? 263 : 0 })('internal-controlled-audio.wav');
-    assert.equal(failed.error.code, 'audio_playback_failed');
-    assert.equal(commands.length, 3);
-    const unsupported = await createWindowsAudioPlayer({ platform: 'linux' })('ignored.wav');
+    assert.match(commands[1], /^play NexaAudio[0-9a-f]{12}$/u);
+    assert.doesNotMatch(commands[1], /wait/u);
+    assert.match(commands[2], /^status NexaAudio[0-9a-f]{12} mode$/u);
+    assert.match(commands[3], /^close NexaAudio[0-9a-f]{12}$/u);
+    assert.equal(commands[1].split(' ')[1], commands[3].split(' ')[1]);
+    const failed = await createWindowsAudioPlayer({ platform: 'win32', sendCommand: async command => command.startsWith('open ') ? 0 : command.startsWith('play ') ? 263 : command.startsWith('close ') ? 0 : { code: 0, output: 'stopped' } }).play('internal-controlled-audio.wav', { playbackId: 'failed-start' });
+    assert.equal(failed.status, 'unknown');
+    assert.equal(failed.released, false);
+    const unsupported = await createWindowsAudioPlayer({ platform: 'linux' }).play('ignored.wav', { playbackId: 'linux' });
     assert.equal(unsupported.error.code, 'unsupported_platform');
-    const invalidPath = await createWindowsAudioPlayer({ platform: 'win32', sendCommand: async () => 0 })('bad" path.wav');
+    const invalidPath = await createWindowsAudioPlayer({ platform: 'win32', sendCommand: async () => 0 }).play('bad" path.wav', { playbackId: 'invalid' });
     assert.equal(invalidPath.error.code, 'invalid_audio_reference');
 });
 

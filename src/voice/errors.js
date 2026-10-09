@@ -17,6 +17,9 @@ const messages = Object.freeze({
     voice_speech_playback_timeout: 'La reproducción no respondió dentro del tiempo permitido; la salida de voz quedó degradada.',
     voice_speech_busy: 'Hay una operación de voz todavía activa.',
     voice_speech_degraded: 'La reproducción de voz está degradada y no puede aceptar nuevas solicitudes.',
+    voice_speech_stop_failed: 'No pude confirmar la interrupción de la reproducción.',
+    voice_speech_start_timeout: 'Windows no confirmó el inicio de la reproducción.',
+    voice_speech_stop_timeout: 'Windows no confirmó la detención de la reproducción.',
 });
 
 export class VoiceError extends Error {
