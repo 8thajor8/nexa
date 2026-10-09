@@ -71,7 +71,13 @@ test('generates temporary audio with opaque ID, never returns a path, then plays
     assert.equal((await readFile(audioPath)).toString(), 'RIFF-mock-wav');
 
     const played = await f.service.play(generated.audioId);
-    assert.deepEqual(played, { success: true, audioId: generated.audioId, played: true, temporary: true });
+    assert.equal(played.success, true);
+    assert.equal(played.audioId, generated.audioId);
+    assert.match(played.playbackId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu);
+    assert.equal(played.played, true);
+    assert.equal(played.temporary, true);
+    assert.equal(played.status, 'completed');
+    assert.equal(played.released, true);
     assert.equal(f.calls.played[0], audioPath);
     await assert.rejects(access(audioPath));
     assert.equal(f.store.get(generated.audioId), null);
