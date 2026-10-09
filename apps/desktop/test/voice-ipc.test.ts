@@ -184,6 +184,99 @@ describe("Electron Main Voice IPC", () => {
     expect(cancelEvent.requestId).toBe("cancel-1");
   });
 
+  it("cancels a started capture by its start request, retires it once, and permits a new session", async () => {
+    const window = createWindow("one"); const voice = register(window);
+    const first = await startSession(window, "start-capture-1");
+    const response = invoke(VOICE_PTT_CANCEL_CHANNEL, trustedEvent(window), {
+      requestId: "cancel-capture-1", sessionId: first.sessionId, targetRequestId: "start-capture-1",
+    });
+
+    expect(response).toEqual({
+      ok: true, requestId: "cancel-capture-1", sessionId: first.sessionId,
+      targetRequestId: "start-capture-1", cancelled: true,
+    });
+    expect(voice.controllers[0].cancel).toHaveBeenCalledOnce();
+    expect(voice.controllers[0].cancel).toHaveBeenCalledWith("user");
+    expect(voice.controllers[0].end).toHaveBeenCalledOnce();
+    expect(voice.controllers[0].unsubscribe).toHaveBeenCalledOnce();
+    const events = window.webContents.send.mock.calls.map(([, envelope]) =>
+      (envelope as { event?: { type?: string } }).event?.type);
+    expect(events.filter((type) => type === "voice.cancelled")).toHaveLength(0);
+    expect(events.filter((type) => type === "voice.session.ended")).toHaveLength(1);
+
+    const second = await startSession(window, "start-capture-2");
+    expect(second.ok).toBe(true);
+    expect(second.sessionId).not.toBe(first.sessionId);
+    expect(voice.controllers).toHaveLength(2);
+  });
+
+  it("rejects incorrect and repeated pre-finish cancellations without affecting the active session", async () => {
+    const window = createWindow("one"); const voice = register(window);
+    const started = await startSession(window, "start-active");
+    const invalid = invoke(VOICE_PTT_CANCEL_CHANNEL, trustedEvent(window), {
+      requestId: "cancel-wrong", sessionId: started.sessionId, targetRequestId: "not-the-start",
+    });
+    expect(invalid).toMatchObject({ ok: false, error: { code: "request_not_found" } });
+    expect(voice.controllers[0].end).not.toHaveBeenCalled();
+
+    const validRequest = {
+      requestId: "cancel-active", sessionId: started.sessionId, targetRequestId: "start-active",
+    };
+    expect(invoke(VOICE_PTT_CANCEL_CHANNEL, trustedEvent(window), validRequest)).toMatchObject({
+      ok: true, cancelled: true,
+    });
+    expect(invoke(VOICE_PTT_CANCEL_CHANNEL, trustedEvent(window), {
+      ...validRequest, requestId: "cancel-active-again",
+    })).toMatchObject({ ok: false, error: { code: "session_unavailable" } });
+    expect(voice.controllers[0].cancel).toHaveBeenCalledOnce();
+    expect(voice.controllers[0].end).toHaveBeenCalledOnce();
+  });
+
+  it("does not let an old session cancellation affect a newer session or forward late events", async () => {
+    const window = createWindow("one"); const voice = register(window);
+    const oldSession = await startSession(window, "start-old");
+    expect(invoke(VOICE_PTT_CANCEL_CHANNEL, trustedEvent(window), {
+      requestId: "cancel-old", sessionId: oldSession.sessionId, targetRequestId: "start-old",
+    })).toMatchObject({ ok: true });
+    const current = await startSession(window, "start-current");
+
+    const countBeforeStaleCancel = window.webContents.send.mock.calls.length;
+    expect(invoke(VOICE_PTT_CANCEL_CHANNEL, trustedEvent(window), {
+      requestId: "cancel-old-again", sessionId: oldSession.sessionId, targetRequestId: "start-old",
+    })).toMatchObject({ ok: false, error: { code: "session_unavailable" } });
+    voice.controllers[0].emit({
+      type: "voice.transcript.final", sessionId: oldSession.sessionId, turnId: "late-turn",
+      timestamp: 104, text: "late", language: null,
+    });
+    expect(window.webContents.send).toHaveBeenCalledTimes(countBeforeStaleCancel);
+    expect(voice.controllers[1].end).not.toHaveBeenCalled();
+    expect(finish(window, current.sessionId!, "finish-current")).toMatchObject({ accepted: true });
+  });
+
+  it("retires an idle session and frees the window even if Voice cancellation throws", async () => {
+    const window = createWindow("one"); const voice = register(window);
+    const started = await startSession(window, "start-cancel-failure");
+    voice.controllers[0].cancel.mockImplementation(() => { throw new Error("cancel failed"); });
+
+    expect(invoke(VOICE_PTT_CANCEL_CHANNEL, trustedEvent(window), {
+      requestId: "cancel-failure", sessionId: started.sessionId, targetRequestId: "start-cancel-failure",
+    })).toMatchObject({ ok: false, error: { code: "operation_failed" } });
+    expect(voice.controllers[0].end).toHaveBeenCalledOnce();
+    expect(voice.controllers[0].unsubscribe).toHaveBeenCalledOnce();
+    expect((await startSession(window, "start-after-failure")).ok).toBe(true);
+  });
+
+  it("cleans up a started capture when its window is destroyed", async () => {
+    const window = createWindow("one"); const voice = register(window);
+    await startSession(window, "start-before-close");
+    cleanupVoiceWindow(window as never);
+    expect(voice.controllers[0].end).toHaveBeenCalledOnce();
+    expect(voice.controllers[0].unsubscribe).toHaveBeenCalledOnce();
+    expect(await startSession(window, "start-after-close")).toMatchObject({
+      ok: true, sessionId: "session-2",
+    });
+  });
+
   it("suppresses late results after cancel and allows a new consecutive session", async () => {
     const window = createWindow("one"); const voice = register(window);
     const first = await startSession(window);

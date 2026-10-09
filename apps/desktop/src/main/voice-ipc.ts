@@ -140,9 +140,14 @@ function retireSession(state: ActiveVoiceSession, requestId: string | null): voi
   state.eventRequestIdOverride = requestId;
   try { state.controller.end(); }
   catch { /* Cleanup is best-effort; no session should survive its window. */ }
-  state.retired = true;
-  state.unsubscribe();
-  if (activeSessions.get(state.window) === state) activeSessions.delete(state.window);
+  finally {
+    state.retired = true;
+    try { state.unsubscribe(); }
+    catch { /* A faulty listener cleanup must not retain the window session. */ }
+    finally {
+      if (activeSessions.get(state.window) === state) activeSessions.delete(state.window);
+    }
+  }
 }
 
 function getPublicVoiceApi(loadVoiceApi: LoadPublicVoiceApi): Promise<PublicVoiceApi> {
@@ -243,22 +248,28 @@ export function registerVoiceIpcHandlers(
     if (!state || state.retired || state.sessionId !== request.sessionId) {
       return errorResponse(request.requestId, "session_unavailable", "The PTT session is not active.");
     }
-    if (!state.finishRequestId || state.finishRequestId !== request.targetRequestId) {
-      return errorResponse(request.requestId, "request_not_found", "The target transcription is not pending.");
+    const pendingTranscription = state.finishRequestId !== null;
+    const expectedTargetRequestId = state.finishRequestId ?? state.startRequestId;
+    if (request.targetRequestId !== expectedTargetRequestId) {
+      return errorResponse(request.requestId, "request_not_found", "The target PTT operation is not active.");
     }
 
+    // Invalidate synchronously before Voice callbacks or any future async work can deliver stale events.
     state.cancelled = true;
     state.eventRequestIdOverride = request.requestId;
     let cancelled = false;
+    let cancelFailed = false;
     try { cancelled = state.controller.cancel("user"); }
-    catch {
+    catch { cancelFailed = true; }
+    finally {
       retireSession(state, request.requestId);
+    }
+    if (cancelFailed) {
       return errorResponse(request.requestId, "operation_failed", "Voice could not cancel the transcription.");
     }
-    retireSession(state, request.requestId);
     return {
       ok: true as const, requestId: request.requestId, sessionId: request.sessionId,
-      targetRequestId: request.targetRequestId, cancelled,
+      targetRequestId: request.targetRequestId, cancelled: pendingTranscription ? cancelled : true,
     };
   });
 }
