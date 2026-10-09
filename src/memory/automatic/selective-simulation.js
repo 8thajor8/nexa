@@ -1,8 +1,10 @@
+import { createHash } from 'node:crypto';
 import { screenAutomaticMemoryTurn } from './privacy.js';
 import { getAutomaticMemorySourcePolicy } from './source-registry.js';
 import { normalizeAutomaticMemoryProposal, validateAutomaticMemoryCandidates } from './schema.js';
 import { evaluateAutomaticMemoryPolicy } from './policy.js';
 import { planAutomaticMemoryPersistence } from './planner.js';
+import { evaluateHypotheticalAutomaticMemoryGate } from './authorization-gate.js';
 
 const CONSENT_SCENARIOS = new Set(['granted', 'missing', 'revoked']);
 const POLICY_CLASS = Object.freeze({
@@ -46,6 +48,31 @@ function candidateViews(policy, plan, validated, sameTurnConflicts) {
         const classification = collision ? 'ask' : POLICY_CLASS[item.disposition] ?? 'ignore';
         const finalOperation = collision || plannerWrite ? 'ASK' : (operation?.operation ?? 'ASK');
         if (plannerWrite) reasons.push('simulation_never_executes_writes');
+        const sourceCandidate = candidate?.proposal;
+        const evidenceSha256 = sourceCandidate
+            ? createHash('sha256').update(sourceCandidate.evidence_quote).digest('hex') : '0'.repeat(64);
+        const gateDecision = evaluateHypotheticalAutomaticMemoryGate({
+            mode: 'hypothetical',
+            candidate: {
+                classification,
+                operation: finalOperation,
+                sensitivity: item.sensitivity,
+                conflict: collision,
+                candidateType: sourceCandidate?.candidate_type ?? 'unknown',
+                updateIntent: sourceCandidate?.update_intent ?? 'unknown',
+                subjectPersonId: null,
+                mentionedPersonText: sourceCandidate?.mentioned_person_text ?? null,
+                turnId: validated.runtime.turnId,
+                sourceTextSha256: validated.runtime.sourceTextSha256,
+                evidenceSha256,
+            },
+            provenance: { status: 'untrusted_synthetic_input', sourceKind: 'direct_user',
+                turnId: validated.runtime.turnId, sourceTextSha256: validated.runtime.sourceTextSha256,
+                evidenceSha256, sessionId: null, principalId: null, fixtureOnly: true },
+            identity: null, consent: null, scope: null, authorizationInput: null,
+            deviceSnapshot: null, sessionId: null, evaluatedAt: new Date().toISOString(),
+            expectedRevisions: null, optOut: false, executionRequested: false,
+        });
         return Object.freeze({
             candidateIndex: item.candidateIndex,
             candidateType: candidate?.proposal?.candidate_type ?? null,
@@ -60,6 +87,7 @@ function candidateViews(policy, plan, validated, sameTurnConflicts) {
             ]),
             confirmationRequired: collision || plannerWrite || operation?.confirmationRequired === true,
             writeReady: false,
+            authorizationGate: gateDecision,
         });
     });
 }
