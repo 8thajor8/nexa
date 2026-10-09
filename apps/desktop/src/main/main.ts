@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Menu } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, session } from "electron";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { registerIpcHandlers } from "./ipc.js";
@@ -17,6 +17,13 @@ import {
   selectRendererEntryPoint,
 } from "./security.js";
 import { getWindowsWallpaper } from "./wallpaper.js";
+import {
+  cleanupVoiceWindow,
+  registerVoiceIpcHandlers,
+  registerVoiceMicrophonePermissions,
+  removeVoiceIpcHandlers,
+  type PublicVoiceApi,
+} from "./voice-ipc.js";
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const rendererFile = resolve(appRoot, "dist", "index.html");
@@ -28,6 +35,7 @@ const rendererEntryPoint = selectRendererEntryPoint(
 const rendererEntryPointUrl = rendererEntryPoint.kind === "url"
   ? rendererEntryPoint.url
   : pathToFileURL(rendererEntryPoint.filePath).href;
+const publicVoiceApiUrl = pathToFileURL(resolve(appRoot, "..", "..", "src", "voice", "index.js")).href;
 let mainWindow: BrowserWindow | null = null;
 
 function createMainWindow(): BrowserWindow {
@@ -42,7 +50,10 @@ function createMainWindow(): BrowserWindow {
     window.show();
     console.info("[nexa-desktop] window ready");
   });
-  window.on("closed", () => { mainWindow = null; });
+  window.on("closed", () => {
+    cleanupVoiceWindow(window);
+    if (mainWindow === window) mainWindow = null;
+  });
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   window.webContents.on("will-navigate", (event, targetUrl) => {
     if (!isAllowedNavigation(targetUrl, rendererEntryPointUrl)) event.preventDefault();
@@ -73,6 +84,12 @@ app.whenReady().then(() => {
     () => mainWindow,
     () => getWindowsWallpaper(app.getPath("appData")),
   );
+  registerVoiceIpcHandlers(
+    () => mainWindow,
+    rendererEntryPointUrl,
+    () => import(publicVoiceApiUrl) as Promise<PublicVoiceApi>,
+  );
+  registerVoiceMicrophonePermissions(session.defaultSession, () => mainWindow, rendererEntryPointUrl);
   createMainWindow();
 });
 app.on("window-all-closed", () => {
@@ -82,6 +99,7 @@ app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0 && app.isReady()) createMainWindow();
 });
 app.on("before-quit", () => {
+  removeVoiceIpcHandlers();
   ipcMain.removeHandler(PING_CHANNEL);
   ipcMain.removeHandler(GET_WALLPAPER_CHANNEL);
   ipcMain.removeHandler(WINDOW_TOGGLE_MAXIMIZE_CHANNEL);
