@@ -64,6 +64,17 @@ export function validateValidTime(value) {
     return value;
 }
 
+/** Compares precision-aware temporal intervals without inventing a finer date. */
+export function compareTemporal(a, b) {
+    if (a === null || b === null) throw new TypeError('memory_temporal_comparison_invalid');
+    const left = interval(a);
+    const right = interval(b);
+    if (left.high < right.low) return 'before';
+    if (left.low > right.high) return 'after';
+    if (left.low === right.low && left.high === right.high) return 'equal';
+    return 'overlap';
+}
+
 export function validateNow(value) {
     const instant = { value, precision: 'instant' };
     validateTemporal(instant, 'now');
