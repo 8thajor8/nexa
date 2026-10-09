@@ -15,6 +15,7 @@ test('speaker delegates synthesis and playback and correlates speaking/completed
     const service = {
         async generate(input) { calls.push(['generate', input]); return { success: true, audioId: 'audio_test' }; },
         async play(audioId) { calls.push(['play', audioId]); return { success: true, played: true }; },
+        async removeTemporary() { return true; },
     };
     const speaker = createVoiceSpeaker({
         speechService: service,
@@ -40,6 +41,7 @@ test('speaker emits sanitized generation and playback errors', async () => {
     const generationSpeaker = createVoiceSpeaker({ speechService: {
         async generate() { return { success: false, error: { code: 'provider_error', message: 'api_key=secret' } }; },
         async play() { throw new Error('must not play'); },
+        async removeTemporary() { return true; },
     } });
     const generationEvents = [];
     generationSpeaker.on('voice.speech.error', event => generationEvents.push(event));
@@ -50,6 +52,7 @@ test('speaker emits sanitized generation and playback errors', async () => {
     const playbackSpeaker = createVoiceSpeaker({ speechService: {
         async generate() { return { success: true, audioId: 'audio_test' }; },
         async play() { return { success: false }; },
+        async removeTemporary() { return true; },
     } });
     const playbackEvents = [];
     playbackSpeaker.on('voice.speech.error', event => playbackEvents.push(event));
@@ -60,9 +63,11 @@ test('speaker emits sanitized generation and playback errors', async () => {
 test('cancellation during synthesis returns promptly and ignores late output', async () => {
     const pendingGeneration = deferred();
     let playCalls = 0;
+    const removed = [];
     const speaker = createVoiceSpeaker({ speechService: {
         generate() { return pendingGeneration.promise; },
         async play() { playCalls++; return { success: true }; },
+        async removeTemporary(id) { removed.push(id); return true; },
     }, idFactory: () => 'turn-cancel' });
     const events = [];
     speaker.on('voice.speech.cancelled', event => events.push(event));
@@ -75,6 +80,7 @@ test('cancellation during synthesis returns promptly and ignores late output', a
     pendingGeneration.resolve({ success: true, audioId: 'audio_late' });
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(playCalls, 0);
+    assert.deepEqual(removed, ['audio_late']);
     assert.deepEqual(events.map(event => event.type), ['voice.speech.cancelled']);
     assert.equal(events[0].phase, 'synthesizing');
     assert.equal(events[0].playbackInterrupted, false);
@@ -86,6 +92,7 @@ test('cancellation during playback is logical and reports that playback was not 
     const speaker = createVoiceSpeaker({ speechService: {
         async generate() { return { success: true, audioId: 'audio_playing' }; },
         play() { playbackStarted = true; return pendingPlayback.promise; },
+        async removeTemporary() { return true; },
     }, idFactory: () => 'turn-playing' });
     const events = [];
     speaker.on('voice.speech.cancelled', event => events.push(event));
@@ -101,7 +108,7 @@ test('cancellation during playback is logical and reports that playback was not 
     assert.deepEqual(events.map(event => event.type), ['voice.speech.cancelled']);
 });
 
-test('replacement suppresses stale synthesis and serializes behind active physical playback', async () => {
+test('active playback rejects new turns promptly and accepts them after physical playback settles', async () => {
     const pendingPlayback = deferred();
     const calls = [];
     let id = 0;
@@ -113,6 +120,7 @@ test('replacement suppresses stale synthesis and serializes behind active physic
                 calls.push(`play:${audioId}`);
                 return audioId === 'first' ? pendingPlayback.promise : Promise.resolve({ success: true });
             },
+            async removeTemporary() { return true; },
         },
     });
     const events = [];
@@ -120,17 +128,20 @@ test('replacement suppresses stale synthesis and serializes behind active physic
     speaker.on('voice.speech.completed', event => events.push(event));
     const first = speaker.speak('first');
     while (!calls.includes('play:first')) await new Promise(resolve => setImmediate(resolve));
-    const second = speaker.speak('second');
+    assert.equal(speaker.cancel('user'), true);
+    await assert.rejects(speaker.speak('second'), error => error.code === 'voice_speech_busy');
     assert.equal(await first, null);
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(calls.includes('play:second'), false);
     pendingPlayback.resolve({ success: true });
+    await new Promise(resolve => setImmediate(resolve));
+    const second = speaker.speak('second');
     const secondResult = await second;
-    assert.deepEqual(secondResult, { sessionId: speaker.sessionId, turnId: 'turn-2', completed: true });
+    assert.deepEqual(secondResult, { sessionId: speaker.sessionId, turnId: 'turn-3', completed: true });
     assert.deepEqual(calls, ['generate:first', 'play:first', 'generate:second', 'play:second']);
     assert.deepEqual(events.map(event => [event.type, event.turnId]), [
         ['voice.speech.cancelled', 'turn-1'],
-        ['voice.speech.completed', 'turn-2'],
+        ['voice.speech.completed', 'turn-3'],
     ]);
 });
 
@@ -139,6 +150,7 @@ test('injected Speech service keeps the Voice speaker usable without loading Cor
     const speaker = createVoiceSpeaker({ speechService: {
         async generate() { generated = true; return { success: true, audioId: 'audio_injected' }; },
         async play() { return { success: true }; },
+        async removeTemporary() { return true; },
     } });
     assert.equal((await speaker.speak('Solo servicio inyectado')).completed, true);
     assert.equal(generated, true);
@@ -177,4 +189,43 @@ test('speaker composes with the real SpeechService using simulated TTS, storage,
         ['play', 'memory://audio'],
     ]);
     assert.equal(references.size, 0, 'the existing SpeechService removes temporary audio after playback');
+});
+
+test('late cancelled synthesis removes only temporary output and preserves persistent output', async () => {
+    for (const persist of [false, true]) {
+        const pending = deferred();
+        const removed = [];
+        let played = 0;
+        const speaker = createVoiceSpeaker({ speechService: {
+            generate() { return pending.promise; },
+            async play() { played++; return { success: true }; },
+            async removeTemporary(id) { removed.push(id); return true; },
+        } });
+        const task = speaker.speak('late', { persist });
+        await new Promise(resolve => setImmediate(resolve));
+        speaker.cancel();
+        assert.equal(await task, null);
+        pending.resolve({ success: true, audioId: `audio_${persist}` });
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(removed, persist ? [] : ['audio_false']);
+        assert.equal(played, 0);
+    }
+});
+
+test('never-resolving play times out, degrades the speaker, and rejects later playback without overlap', async () => {
+    let plays = 0;
+    let generates = 0;
+    const speaker = createVoiceSpeaker({ playbackTimeoutMs: 10, speechService: {
+        async generate() { generates++; return { success: true, audioId: `audio_${generates}` }; },
+        play() { plays++; return new Promise(() => {}); },
+        async removeTemporary() { return true; },
+    } });
+    const events = [];
+    speaker.on('voice.speech.error', event => events.push(event));
+    await assert.rejects(speaker.speak('bloqueado'), error => error.code === 'voice_speech_playback_timeout');
+    assert.equal(speaker.getPlaybackState(), 'degraded');
+    await assert.rejects(speaker.speak('siguiente'), error => error.code === 'voice_speech_degraded');
+    assert.equal(generates, 1);
+    assert.equal(plays, 1);
+    assert.deepEqual(events.map(event => [event.turnId, event.error.code]), [[events[0].turnId, 'voice_speech_playback_timeout'], [events[1].turnId, 'voice_speech_degraded']]);
 });

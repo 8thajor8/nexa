@@ -114,6 +114,22 @@ test('failed or thrown playback attempts remove temporary audio but preserve per
     await access(persistentPath);
 });
 
+test('SpeechService exposes safe temporary removal and refuses persistent or unknown audio IDs', async () => {
+    const references = new Map([
+        ['audio_temporary', { audioId: 'audio_temporary', temporary: true }],
+        ['audio_persistent', { audioId: 'audio_persistent', temporary: false }],
+    ]);
+    const removed = [];
+    const service = createSpeechService({ store: {
+        get(id) { return references.get(id) ?? null; },
+        async removeTemporary(id) { removed.push(id); references.delete(id); return true; },
+    } });
+    assert.equal(await service.removeTemporary('audio_temporary'), true);
+    assert.equal(await service.removeTemporary('audio_persistent'), false);
+    assert.equal(await service.removeTemporary('audio_unknown'), false);
+    assert.deepEqual(removed, ['audio_temporary']);
+});
+
 test('supports every fixed style while keeping a shared voice identity', async t => {
     const f = await fixture(t);
     for (const style of Object.keys(speechStyles)) {

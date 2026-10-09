@@ -3,16 +3,14 @@ import { VoiceError } from './errors.js';
 
 const validCancelReasons = new Set(['user', 'superseded', 'session_ended']);
 const validOptions = new Set(['style', 'persist']);
+export const defaultPlaybackTimeoutMs = 300_000;
 
 function normalizeOptions(options) {
     if (!options || typeof options !== 'object' || Array.isArray(options)
-        || (Object.getPrototypeOf(options) !== Object.prototype && Object.getPrototypeOf(options) !== null)) {
-        throw new VoiceError('voice_speech_invalid_input');
-    }
+        || (Object.getPrototypeOf(options) !== Object.prototype && Object.getPrototypeOf(options) !== null)) throw new VoiceError('voice_speech_invalid_input');
     const descriptors = Object.getOwnPropertyDescriptors(options);
     const keys = Reflect.ownKeys(descriptors);
-    if (keys.some(key => typeof key !== 'string' || !validOptions.has(key)
-        || !Object.hasOwn(descriptors[key], 'value'))) throw new VoiceError('voice_speech_invalid_input');
+    if (keys.some(key => typeof key !== 'string' || !validOptions.has(key) || !Object.hasOwn(descriptors[key], 'value'))) throw new VoiceError('voice_speech_invalid_input');
     const values = Object.fromEntries(keys.map(key => [key, descriptors[key].value]));
     if (values.style !== undefined && typeof values.style !== 'string') throw new VoiceError('voice_speech_invalid_input');
     if (values.persist !== undefined && typeof values.persist !== 'boolean') throw new VoiceError('voice_speech_invalid_input');
@@ -20,65 +18,57 @@ function normalizeOptions(options) {
 }
 
 function defaultServiceLoader() {
-    return import('../speech/service.js').then(({ generateSpeech, playAudio }) => ({ generate: generateSpeech, play: playAudio }));
+    return import('../speech/service.js').then(({ generateSpeech, playAudio, removeTemporarySpeech }) => ({ generate: generateSpeech, play: playAudio, removeTemporary: removeTemporarySpeech }));
 }
 
-export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), idFactory = randomUUID, now = Date.now } = {}) {
-    if (speechService !== undefined && (typeof speechService?.generate !== 'function' || typeof speechService?.play !== 'function')) {
-        throw new VoiceError('voice_speech_service_invalid');
-    }
-    if (typeof sessionId !== 'string' || !sessionId || typeof idFactory !== 'function' || typeof now !== 'function') {
-        throw new VoiceError('voice_session_invalid_state');
-    }
+export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), idFactory = randomUUID, now = Date.now, playbackTimeoutMs = defaultPlaybackTimeoutMs } = {}) {
+    if (speechService !== undefined && (typeof speechService?.generate !== 'function' || typeof speechService?.play !== 'function'
+        || typeof speechService?.removeTemporary !== 'function')) throw new VoiceError('voice_speech_service_invalid');
+    if (typeof sessionId !== 'string' || !sessionId || typeof idFactory !== 'function' || typeof now !== 'function'
+        || !Number.isSafeInteger(playbackTimeoutMs) || playbackTimeoutMs < 1) throw new VoiceError('voice_session_invalid_state');
 
     let selectedService = speechService;
     let servicePromise;
     let active = null;
-    let speechQueue = Promise.resolve();
+    let synthesisInFlight = false;
+    let cleanupInFlight = false;
+    let playbackState = 'idle';
 
     function resolveService() {
         if (selectedService) return Promise.resolve(selectedService);
-        if (!servicePromise) {
-            servicePromise = defaultServiceLoader().then(service => {
-                if (typeof service?.generate !== 'function' || typeof service?.play !== 'function') {
-                    throw new VoiceError('voice_speech_service_invalid');
-                }
-                selectedService = service;
-                return service;
-            }).catch(error => {
-                servicePromise = undefined;
-                if (error instanceof VoiceError) throw error;
-                throw new VoiceError('voice_speech_service_invalid');
-            });
-        }
+        if (!servicePromise) servicePromise = defaultServiceLoader().then(service => {
+            if (typeof service?.generate !== 'function' || typeof service?.play !== 'function' || typeof service?.removeTemporary !== 'function') throw new VoiceError('voice_speech_service_invalid');
+            selectedService = service;
+            return service;
+        }).catch(error => {
+            servicePromise = undefined;
+            if (error instanceof VoiceError) throw error;
+            throw new VoiceError('voice_speech_service_invalid');
+        });
         return servicePromise;
     }
 
-    const listeners = new Map([
-        'voice.speaking', 'voice.speech.completed', 'voice.speech.cancelled', 'voice.speech.error',
-    ].map(type => [type, new Set()]));
-
+    const listeners = new Map(['voice.speaking', 'voice.speech.completed', 'voice.speech.cancelled', 'voice.speech.error'].map(type => [type, new Set()]));
     function emit(type, operation, details = {}) {
         const event = Object.freeze({ type, sessionId, turnId: operation?.turnId ?? null, timestamp: now(), ...details });
-        for (const listener of [...listeners.get(type)]) {
-            try { listener(event); }
-            catch { /* Consumer callbacks cannot break speech output. */ }
-        }
+        for (const listener of [...listeners.get(type)]) { try { listener(event); } catch { /* Listener failures do not affect playback. */ } }
     }
-
     function on(type, listener) {
         const bucket = listeners.get(type);
         if (!bucket || typeof listener !== 'function') throw new TypeError('voice_listener_invalid');
         bucket.add(listener);
         return () => bucket.delete(listener);
     }
-
-    /**
-     * Cancellation suppresses future Voice events and steps. SpeechService has
-     * no cancellation API: an in-flight MCI playback continues until it ends,
-     * and audio generated after a synthesis cancellation remains subject to the
-     * existing temporary-audio cleanup lifecycle.
-     */
+    function makeOperation(text, options) {
+        let resolveCancellation;
+        const cancellation = new Promise(resolve => { resolveCancellation = resolve; });
+        return { turnId: idFactory(), text, options, phase: 'synthesizing', cancelled: false, cancellation, resolveCancellation };
+    }
+    function failFast(operation, code) {
+        const error = new VoiceError(code);
+        emit('voice.speech.error', operation, { phase: 'queued', error: Object.freeze({ code: error.code, message: error.message }) });
+        return Promise.reject(error);
+    }
     function cancel(reason = 'user') {
         if (!validCancelReasons.has(reason)) throw new TypeError('voice_cancel_reason_invalid');
         if (!active) return false;
@@ -86,49 +76,56 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
         active = null;
         operation.cancelled = true;
         operation.resolveCancellation(null);
-        emit('voice.speech.cancelled', operation, {
-            reason,
-            phase: operation.phase,
-            playbackInterrupted: false,
-        });
+        emit('voice.speech.cancelled', operation, { reason, phase: operation.phase, playbackInterrupted: false });
         return true;
     }
 
     async function run(operation) {
-        if (active !== operation) return null;
         let service;
+        let generated;
         try {
             service = await resolveService();
             if (active !== operation) return null;
-
-            operation.phase = 'synthesizing';
-            const generated = await service.generate({ text: operation.text, ...operation.options });
-            if (active !== operation) return null;
-            if (!generated?.success || typeof generated.audioId !== 'string') {
-                throw new VoiceError('voice_speech_generation_failed');
+            synthesisInFlight = true;
+            try { generated = await service.generate({ text: operation.text, ...operation.options }); }
+            finally { synthesisInFlight = false; }
+            if (active !== operation) {
+                if (generated?.success && typeof generated.audioId === 'string' && !operation.options.persist) {
+                    cleanupInFlight = true;
+                    try { await service.removeTemporary(generated.audioId); }
+                    catch { /* Speech startup/shutdown expiry cleanup is the fallback. */ }
+                    finally { cleanupInFlight = false; }
+                }
+                return null;
             }
+            if (!generated?.success || typeof generated.audioId !== 'string') throw new VoiceError('voice_speech_generation_failed');
 
             operation.phase = 'speaking';
+            playbackState = 'playing';
             emit('voice.speaking', operation);
+            const observedPlay = Promise.resolve().then(() => service.play(generated.audioId)).then(
+                value => ({ kind: 'result', value }),
+                () => ({ kind: 'error' }),
+            );
+            let timer;
+            const timeout = new Promise(resolve => { timer = setTimeout(() => resolve({ kind: 'timeout' }), playbackTimeoutMs); });
+            const outcome = await Promise.race([observedPlay, timeout]);
+            clearTimeout(timer);
+            if (outcome.kind === 'timeout') {
+                playbackState = 'degraded';
+                throw new VoiceError('voice_speech_playback_timeout');
+            }
+            playbackState = 'idle';
             if (active !== operation) return null;
-            const played = await service.play(generated.audioId);
-            if (active !== operation) return null;
-            if (!played?.success) throw new VoiceError('voice_speech_playback_failed');
-
+            if (outcome.kind === 'error' || !outcome.value?.success) throw new VoiceError('voice_speech_playback_failed');
             active = null;
-            const result = Object.freeze({ sessionId, turnId: operation.turnId, completed: true });
             emit('voice.speech.completed', operation);
-            return result;
+            return Object.freeze({ sessionId, turnId: operation.turnId, completed: true });
         } catch (error) {
             if (active !== operation) return null;
             active = null;
-            const safeError = error instanceof VoiceError
-                ? error
-                : new VoiceError(operation.phase === 'speaking' ? 'voice_speech_playback_failed' : 'voice_speech_generation_failed');
-            emit('voice.speech.error', operation, {
-                phase: operation.phase,
-                error: Object.freeze({ code: safeError.code, message: safeError.message }),
-            });
+            const safeError = error instanceof VoiceError ? error : new VoiceError(operation.phase === 'speaking' ? 'voice_speech_playback_failed' : 'voice_speech_generation_failed');
+            emit('voice.speech.error', operation, { phase: operation.phase, error: Object.freeze({ code: safeError.code, message: safeError.message }) });
             throw safeError;
         }
     }
@@ -136,24 +133,13 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
     function speak(text, options = {}) {
         if (typeof text !== 'string' || !text.trim()) throw new VoiceError('voice_speech_invalid_input');
         const normalizedOptions = normalizeOptions(options);
-        if (active) cancel('superseded');
-
-        let resolveCancellation;
-        const operation = {
-            turnId: idFactory(),
-            text,
-            options: normalizedOptions,
-            phase: 'queued',
-            cancelled: false,
-            cancellation: new Promise(resolve => { resolveCancellation = resolve; }),
-            resolveCancellation: value => resolveCancellation(value),
-        };
+        const operation = makeOperation(text, normalizedOptions);
+        if (playbackState === 'degraded') return failFast(operation, 'voice_speech_degraded');
+        if (active || synthesisInFlight || cleanupInFlight || playbackState === 'playing') return failFast(operation, 'voice_speech_busy');
         active = operation;
-
-        const work = speechQueue.then(() => run(operation));
-        speechQueue = work.then(() => undefined, () => undefined);
+        const work = run(operation);
         return Promise.race([work, operation.cancellation]);
     }
 
-    return Object.freeze({ sessionId, on, speak, cancel });
+    return Object.freeze({ sessionId, on, speak, cancel, getPlaybackState: () => playbackState });
 }

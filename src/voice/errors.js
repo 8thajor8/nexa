@@ -14,6 +14,9 @@ const messages = Object.freeze({
     voice_speech_service_invalid: 'El servicio de síntesis de voz no está disponible.',
     voice_speech_generation_failed: 'No pude generar el audio hablado.',
     voice_speech_playback_failed: 'No pude reproducir el audio hablado.',
+    voice_speech_playback_timeout: 'La reproducción no respondió dentro del tiempo permitido; la salida de voz quedó degradada.',
+    voice_speech_busy: 'Hay una operación de voz todavía activa.',
+    voice_speech_degraded: 'La reproducción de voz está degradada y no puede aceptar nuevas solicitudes.',
 });
 
 export class VoiceError extends Error {

@@ -90,6 +90,14 @@ export function createSpeechService({
         return { success: true, audioId, played: true, temporary: reference.temporary };
     }
 
+    async function removeTemporary(audioId) {
+        try {
+            const reference = store.get(audioId);
+            if (!reference?.temporary) return false;
+            return await store.removeTemporary(audioId);
+        } catch { return false; }
+    }
+
     async function close() {
         try { return await store.cleanupCurrentTemporaries(); }
         catch { return { success: false, removed: 0 }; }
@@ -97,12 +105,13 @@ export function createSpeechService({
 
     function getLastMetrics() { return lastMetrics ? { ...lastMetrics } : null; }
 
-    return { initialize, generate, play, close, getLastMetrics };
+    return { initialize, generate, play, removeTemporary, close, getLastMetrics };
 }
 
 const speechService = createSpeechService();
 export const initializeSpeechService = speechService.initialize;
 export const generateSpeech = speechService.generate;
 export const playAudio = speechService.play;
+export const removeTemporarySpeech = speechService.removeTemporary;
 export const closeSpeechService = speechService.close;
 export const getSpeechMetrics = speechService.getLastMetrics;
