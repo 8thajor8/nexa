@@ -91,8 +91,36 @@ test('OpenAI adapter uses the shared client, in-memory upload, configured model,
     assert.equal(Buffer.from(await request.file.arrayBuffer()).toString('hex'), '0102');
     assert.equal(request.model, 'gpt-transcribe');
     assert.equal(request.response_format, 'json');
+    assert.equal(Object.hasOwn(request, 'language'), false);
+    assert.equal(Object.hasOwn(request, 'languages'), false);
     assert.equal(requestOptions.signal, signal);
     assert.equal(toFile instanceof Function, true);
+});
+
+test('OpenAI adapter maps gpt-transcribe language hints to languages and preserves singular hints for other models', async () => {
+    async function captureRequest(model, language) {
+        let request;
+        const provider = createOpenAITranscriptionProvider({
+            config: { model },
+            clientFactory: () => ({ audio: { transcriptions: { async create(body) {
+                request = body;
+                return { text: 'hola' };
+            } } } }),
+        });
+        await provider.transcribe({ audio: Buffer.from([1]), format: 'wav', language });
+        return request;
+    }
+
+    const defaultRequest = await captureRequest(DEFAULT_TRANSCRIPTION_MODEL, 'es');
+    assert.deepEqual(defaultRequest.languages, ['es']);
+    assert.equal(Object.hasOwn(defaultRequest, 'language'), false);
+
+    for (const model of ['whisper-1', 'gpt-4o-transcribe', 'gpt-4o-mini-transcribe']) {
+        const request = await captureRequest(model, 'es');
+        assert.equal(request.model, model);
+        assert.equal(request.language, 'es');
+        assert.equal(Object.hasOwn(request, 'languages'), false);
+    }
 });
 
 test('the public Voice module has no Electron or Core imports', async () => {

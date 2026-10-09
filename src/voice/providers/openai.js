@@ -1,6 +1,6 @@
 import { getOpenAIClient } from '../../brain/openai.js';
 import { toFile } from 'openai/uploads';
-import { AUDIO_FORMATS, voiceConfig } from '../config.js';
+import { AUDIO_FORMATS, DEFAULT_TRANSCRIPTION_MODEL, voiceConfig } from '../config.js';
 import { VoiceError } from '../errors.js';
 
 export function createOpenAITranscriptionProvider({ clientFactory = getOpenAIClient, config = voiceConfig } = {}) {
@@ -9,11 +9,14 @@ export function createOpenAITranscriptionProvider({ clientFactory = getOpenAICli
             if (signal?.aborted) throw new VoiceError('voice_cancelled');
             try {
                 const file = await toFile(audio, `voice-audio.${format}`, { type: AUDIO_FORMATS[format] });
+                const languageHint = language
+                    ? (model === DEFAULT_TRANSCRIPTION_MODEL ? { languages: [language] } : { language })
+                    : {};
                 const response = await clientFactory().audio.transcriptions.create({
                     file,
                     model,
                     response_format: 'json',
-                    ...(language ? { language } : {}),
+                    ...languageHint,
                 }, signal ? { signal } : undefined);
                 if (signal?.aborted) throw new VoiceError('voice_cancelled');
                 if (!response || typeof response.text !== 'string') throw new VoiceError('voice_response_invalid');
