@@ -3,3 +3,4 @@ export { VoiceError } from './errors.js';
 export { createSpeechRecognizer } from './recognizer.js';
 export { VOICE_EVENTS, createVoiceSession } from './session.js';
 export { createVoiceSpeaker } from './speaker.js';
+export { createPttVoiceController } from './ptt-controller.js';
