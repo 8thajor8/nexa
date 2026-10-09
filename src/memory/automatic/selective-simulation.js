@@ -55,7 +55,10 @@ function candidateViews(policy, plan, validated, sameTurnConflicts) {
             mode: 'hypothetical',
             candidate: {
                 classification,
-                operation: finalOperation,
+                // Evaluate the planner proposal as proposed. The externally
+                // surfaced operation remains downgraded below and is never
+                // executable in this simulation.
+                operation: operation?.operation ?? 'ASK',
                 sensitivity: item.sensitivity,
                 conflict: collision,
                 candidateType: sourceCandidate?.candidate_type ?? 'unknown',
@@ -76,8 +79,12 @@ function candidateViews(policy, plan, validated, sameTurnConflicts) {
         return Object.freeze({
             candidateIndex: item.candidateIndex,
             candidateType: candidate?.proposal?.candidate_type ?? null,
+            policyClassification: POLICY_CLASS[item.disposition] ?? 'ignore',
             classification,
             policyDisposition: item.disposition,
+            policyReasonCodes: Object.freeze([...item.reasonCodes]),
+            plannerOperation: operation?.operation ?? null,
+            plannerReasonCodes: Object.freeze([...(operation?.reasonCodes ?? [])]),
             operation: finalOperation,
             reasonCodes: Object.freeze([
                 ...new Set([
@@ -88,6 +95,7 @@ function candidateViews(policy, plan, validated, sameTurnConflicts) {
             confirmationRequired: collision || plannerWrite || operation?.confirmationRequired === true,
             writeReady: false,
             authorizationGate: gateDecision,
+            finalDecision: gateDecision.decision,
         });
     });
 }
