@@ -111,36 +111,137 @@ test('a denied tool returns a structured result without executing or saving', as
     );
 
     assert.equal(result.success, false);
-    assert.equal(result.error.code, 'permission_denied');
+    assert.equal(result.error.code, 'memory1_write_disabled');
     assert.equal(result.permission, 'write');
     assert.deepEqual(memory.facts, []);
     assert.equal(saveCount, 0);
 });
 
-test('the default policy still lets read and write tools execute', async () => {
+test('legacy Memory1 writes stay blocked even when invoked directly through the dispatcher', async () => {
     const memory = { facts: [], preferences: {} };
     let saveCount = 0;
     const context = {
         memory,
         saveMemory: async () => { saveCount += 1; },
+        permissionPolicy: defaultPermissionPolicy,
     };
 
     assert((await executeTool('get_current_time', {}, context)).iso);
-    await executeTool(
-        'remember',
-        { category: 'fact', key: 'permission_test', value: 'allowed' },
-        context
-    );
-    assert.equal(
-        (await executeTool('recall', { query: 'permission_test' }, context)).results.length,
-        1
-    );
-    assert.equal(
-        (await executeTool('forget', { category: 'fact', key: 'permission_test' }, context)).success,
-        true
-    );
-    assert.deepEqual(memory.facts, []);
-    assert.equal(saveCount, 2);
+    for (const [name, args] of [
+        ['remember', { category: 'fact', key: 'permission_test', value: 'must not be saved' }],
+        ['forget', { category: 'fact', key: 'permission_test' }],
+    ]) {
+        const result = await executeTool(name, args, context);
+        assert.equal(result.success, false);
+        assert.equal(result.error.code, 'memory1_write_disabled');
+        assert.match(result.error.message, /no se modificó ningún recuerdo/u);
+    }
+    assert.deepEqual(memory, { facts: [], preferences: {} });
+    assert.equal(saveCount, 0);
+});
+
+test('legacy write tools are omitted from model tool definitions while recall remains available', async () => {
+    const offered = getToolsForModel(defaultPermissionPolicy).map(tool => tool.name);
+    assert(!offered.includes('remember'));
+    assert(!offered.includes('forget'));
+    assert(offered.includes('recall'));
+
+    const memory = { user: {}, preferences: {}, facts: [{ key: 'permission_test', value: 'synthetic value' }] };
+    const result = await executeTool('recall', { query: 'permission_test' }, { memory });
+    assert.equal(result.success, true);
+    assert.equal(result.results.length, 1);
+    assert.equal(result.results[0].value, 'synthetic value');
+});
+
+test('disabled Memory1 writes do not call a persistence callback that targets a synthetic file', async () => {
+    const fs = await import('node:fs/promises');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'nexa-m0-memory-'));
+    const filePath = path.join(directory, 'memory.json');
+    const original = '{"facts":[],"preferences":{}}\n';
+    await fs.writeFile(filePath, original, 'utf8');
+    let saveCount = 0;
+    try {
+        const memory = { facts: [], preferences: {} };
+        const saveMemory = async value => {
+            saveCount += 1;
+            await fs.writeFile(filePath, JSON.stringify(value), 'utf8');
+        };
+        for (const [name, args] of [
+            ['remember', { category: 'fact', key: 'synthetic', value: 'synthetic' }],
+            ['forget', { category: 'fact', key: 'synthetic' }],
+        ]) await executeTool(name, args, { memory, saveMemory });
+        assert.equal(await fs.readFile(filePath, 'utf8'), original);
+        assert.equal(saveCount, 0);
+    } finally {
+        await fs.rm(directory, { recursive: true, force: true });
+    }
+});
+
+test('Spotify, Windows and general tool definitions remain available', () => {
+    const offered = new Set(getToolsForModel(defaultPermissionPolicy).map(tool => tool.name));
+    for (const name of ['spotify_search', 'open_app', 'get_current_time', 'recall']) assert(offered.has(name));
+});
+
+test('legacy write registrations keep their declared permission but the dispatcher still denies them', async () => {
+    for (const name of ['remember', 'forget']) {
+        assert.equal(localToolRegistry.get(name).permission, 'write');
+        const result = await executeTool(name, {}, { permissionPolicy: { write: true } });
+        assert.equal(result.success, false);
+        assert.equal(result.error.code, 'memory1_write_disabled');
+    }
+});
+
+test('the Memory1 write block does not change the selected backend or automatic-memory defaults', async () => {
+    const { config } = await import('../src/config.js');
+    assert.equal(config.memoryBackend, 'memory1');
+
+    const { createAgent } = await import('../src/core/agent.js');
+    const agent = await createAgent({
+        ask: async () => ({ output: [], output_text: '' }),
+        load: async () => ({ user: {}, preferences: {}, facts: [] }),
+    });
+    try {
+        assert.equal(agent.memoryBackend, 'memory1');
+        assert.equal(agent.automaticMemoryControls.automaticAnalysisEnabled, false);
+        assert.equal(agent.automaticMemoryControls.automaticSavingEnabled, false);
+    } finally {
+        await agent.close();
+    }
+});
+
+test('an unsolicited model write call is denied even though the model tool list omits it', async () => {
+    const requests = [];
+    let saveCount = 0;
+    const responses = [
+        { output: [{ type: 'function_call', name: 'remember', call_id: 'remember-1',
+            arguments: JSON.stringify({ category: 'fact', key: 'synthetic', value: 'synthetic' }) }], output_text: '' },
+        { output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Entendido.' }] }], output_text: 'Entendido.' },
+    ];
+    const { createAgent } = await import('../src/core/agent.js');
+    const agent = await createAgent({
+        ask: async request => { requests.push(request); return responses.shift(); },
+        load: async () => ({ user: {}, preferences: {}, facts: [] }),
+        save: async () => { saveCount += 1; },
+    });
+    try {
+        const answer = await agent.run('Una solicitud sintética.');
+        assert.equal(answer, 'Entendido.');
+        assert(!requests[0].tools.some(tool => ['remember', 'forget'].includes(tool.name)));
+        assert(requests[1].input.some(item => item.type === 'function_call_output'
+            && JSON.parse(item.output).error?.code === 'memory1_write_disabled'));
+        assert.equal(saveCount, 0);
+        assert.deepEqual(agent.memory.facts, []);
+    } finally {
+        await agent.close();
+    }
+});
+
+test('read and non-memory tools remain callable under the default policy', async () => {
+    const context = { permissionPolicy: defaultPermissionPolicy };
+    assert((await executeTool('get_current_time', {}, context)).iso);
+    assert.equal((await executeTool('recall', { query: 'missing' }, { memory: { facts: [] } })).success, true);
 });
 
 test('a denied external tool does not make an HTTP request', async () => {

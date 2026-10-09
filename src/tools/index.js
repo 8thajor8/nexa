@@ -101,13 +101,19 @@ export const hostedTools = hostedToolRegistry.map(
     registration => registration.definition
 );
 
+// Memory1's legacy write tools are retired at the dispatcher boundary. Keep
+// their registrations for compatibility, but never offer or execute them.
+const disabledLegacyMemoryWriteTools = new Set(['remember', 'forget']);
+
 export function getToolsForModel(policy = defaultPermissionPolicy) {
+    const permittedLocalTools = localTools
+        .filter(tool => !disabledLegacyMemoryWriteTools.has(tool.name));
     const permittedHostedTools = hostedToolRegistry
         .filter(registration => checkToolPermission(registration, policy).allowed)
         .map(registration => registration.definition);
 
     return [
-        ...localTools,
+        ...permittedLocalTools,
         ...permittedHostedTools,
     ];
 }
@@ -119,6 +125,17 @@ export async function executeTool(name, args, context) {
 
     if (!registration) {
         throw new Error(`Herramienta desconocida: ${name}`);
+    }
+
+    if (disabledLegacyMemoryWriteTools.has(name)) {
+        return {
+            success: false,
+            error: {
+                code: 'memory1_write_disabled',
+                message: 'Las escrituras heredadas de Memory1 están deshabilitadas; no se modificó ningún recuerdo.',
+            },
+            permission: registration.permission,
+        };
     }
 
     const permission = checkToolPermission(registration, context?.permissionPolicy);
