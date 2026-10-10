@@ -10,7 +10,7 @@ const dana = 'person_00000000-0000-4000-8000-000000000002';
 const daria = 'person_00000000-0000-4000-8000-000000000003';
 const id = (prefix, n) => `${prefix}_${n.toString(16).padStart(8, '0')}-1111-4111-8111-111111111111`;
 
-function fixture() {
+function fixture({ includeNotes = false } = {}) {
     const store = { schema_version: 5, store_id: id('store', 2), self_person_id: self, revision: 1,
         created_at: now, updated_at: now,
         entities: [self, dana, daria].map(entityId => ({ id: entityId, type: 'person', created_at: now })),
@@ -39,6 +39,11 @@ function fixture() {
         validFrom: { value: '2025-04-18', precision: 'day' } });
     add('danaDinnerCost', { predicate: 'user.dinner_cost', value: 'La cena de Dana costó 60 euros.', entityId: dana });
     add('hobby', { predicate: 'user.hobby', value: 'Practica guitarra acústica los fines de semana.' });
+    if (includeNotes) {
+        add('selfNote', { predicate: 'user.note', value: 'Nota sintética sobre el calendario del proyecto.',
+            validFrom: { value: '2025', precision: 'year' } });
+        add('danaNote', { entityId: dana, predicate: 'user.note', value: 'Nota sintética privada de Dana.' });
+    }
     validateMemoryStore(store);
     const snapshot = { snapshot: store, revision: 1, digest: 'b'.repeat(64) };
     const repository = { readSnapshot: async () => snapshot };
@@ -159,4 +164,36 @@ test('lexical equivalents do not override direct identity, temporal filters, or 
     assert.ok(historical);
     assert.equal(historical.temporal.mode, 'valid_at');
     assert.ok(historical.assertions.every(item => item.temporalStatus === 'valid' || item.temporalStatus === 'indeterminate'));
+});
+
+test('nota and note equivalence supports precise direct and conversational retrieval', async () => {
+    const data = fixture({ includeNotes: true });
+    const directInput = { message: '¿Qué contiene mi nota?' };
+    const direct = await resultFor(data.provider, directInput);
+    const directIds = selectedIds(direct);
+    assert.deepEqual(directIds, [data.ids.selfNote]);
+    assert.equal(direct.authority, 'data_only');
+    assert.equal(direct.trust.authority, 'data_only');
+    assert.deepEqual(selectedIds(await resultFor(data.provider, directInput)), directIds,
+        'the same query must produce stable results');
+
+    const followUp = await resultFor(data.provider, {
+        message: '¿Cuál era?', recentUserMessages: ['¿Qué contiene mi nota?'],
+    });
+    assert.deepEqual(selectedIds(followUp), [data.ids.selfNote]);
+    assert.equal(followUp.authority, 'data_only');
+
+    const changedTopic = await resultFor(data.provider, {
+        message: '¿Cuánto costaba el viaje de invierno?', recentUserMessages: ['¿Qué contiene mi nota?'],
+    });
+    assert.ok(selectedIds(changedTopic).includes(data.ids.travelCost));
+    assert.equal(selectedIds(changedTopic).includes(data.ids.selfNote), false,
+        'a direct query on a competing topic must not retain the prior note');
+
+    const historical = await resultFor(data.provider, {
+        message: '¿Qué contenía mi nota en 2024?',
+    });
+    assert.equal(historical.temporal.mode, 'valid_at');
+    assert.equal(selectedIds(historical).includes(data.ids.selfNote), false,
+        'the note is not valid in the requested historical period');
 });

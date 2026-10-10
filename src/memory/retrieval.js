@@ -21,6 +21,7 @@ const QUERY_EQUIVALENCE_GROUPS = Object.freeze([
     Object.freeze(['choice', 'chosen', 'choose', 'chose', 'decision', 'elegi', 'elegida', 'elegido', 'elegimos', 'elegir', 'eligio', 'eleccion', 'pick', 'picked', 'seleccionado', 'seleccionar', 'selection', 'selected']),
     Object.freeze(['cuando', 'date', 'dated', 'fecha', 'moment', 'momento', 'time', 'when', 'year']),
     Object.freeze(['arquitectura', 'architectural', 'architecture']),
+    Object.freeze(['note', 'nota']),
 ]);
 const QUERY_EQUIVALENTS = new Map(QUERY_EQUIVALENCE_GROUPS.flatMap(group => group.map(token => [token, group])));
 const TEMPORAL_QUERY_TOKEN = '__memory_temporal_query__';
