@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { createMemoryRetriever, resolveEntityMentions } from './retrieval.js';
+import { createMemoryRetriever, resolveEntityMentions, scoreMemoryRecordRelevance } from './retrieval.js';
 import { RELATION_PREDICATES } from './relation-predicates.js';
 import { isEntityName } from './entities.js';
 
@@ -73,25 +73,30 @@ function recordConfidence(item) {
     return values.length ? Math.max(...values) : -1;
 }
 
-function rankedRows(result, seedIds) {
+function rankedRows(result, seedIds, relevanceText) {
     const seeds = new Set(seedIds);
     const ordinaryAssertions = items => items.filter(item => !isEntityName(item.record.predicate));
     const rows = [
         ...ordinaryAssertions(result.assertions).map(item => ({ type: 'assertion', item,
             category: seeds.has(item.entityId) ? 0 : 2, entityId: item.entityId, predicate: item.record.predicate,
-            id: item.record.id, status: item.temporalStatus, confidence: recordConfidence(item), recordedAt: item.record.recorded_at })),
+            id: item.record.id, status: item.temporalStatus, confidence: recordConfidence(item),
+            textRelevance: scoreMemoryRecordRelevance(item.record, relevanceText), recordedAt: item.record.recorded_at })),
         ...ordinaryAssertions(result.indeterminateAssertions).map(item => ({ type: 'assertion', item,
             category: seeds.has(item.entityId) ? 0 : 2, entityId: item.entityId, predicate: item.record.predicate,
-            id: item.record.id, status: item.temporalStatus, confidence: recordConfidence(item), recordedAt: item.record.recorded_at })),
+            id: item.record.id, status: item.temporalStatus, confidence: recordConfidence(item),
+            textRelevance: scoreMemoryRecordRelevance(item.record, relevanceText), recordedAt: item.record.recorded_at })),
         ...result.relations.map(item => ({ type: 'relation', item, category: 1,
             entityId: item.fromEntityId, predicate: item.assertion.predicate, id: item.assertion.id,
-            status: item.temporalStatus, confidence: recordConfidence(item), recordedAt: item.assertion.recorded_at })),
+            status: item.temporalStatus, confidence: recordConfidence(item),
+            textRelevance: scoreMemoryRecordRelevance(item.assertion, relevanceText), recordedAt: item.assertion.recorded_at })),
         ...result.indeterminateRelations.map(item => ({ type: 'relation', item, category: 1,
             entityId: item.fromEntityId, predicate: item.assertion.predicate, id: item.assertion.id,
-            status: item.temporalStatus, confidence: recordConfidence(item), recordedAt: item.assertion.recorded_at })),
+            status: item.temporalStatus, confidence: recordConfidence(item),
+            textRelevance: scoreMemoryRecordRelevance(item.assertion, relevanceText), recordedAt: item.assertion.recorded_at })),
     ];
     rows.sort((a, b) => a.category - b.category
         || (a.status === 'valid' ? 0 : 1) - (b.status === 'valid' ? 0 : 1)
+        || b.textRelevance - a.textRelevance
         || b.confidence - a.confidence
         || compareText(a.entityId, b.entityId)
         || compareText(a.predicate, b.predicate)
@@ -126,6 +131,27 @@ function compactRelation(item, relevance) {
         evidence: compactEvidence(item) };
 }
 
+function stableJson(value) {
+    if (Array.isArray(value)) return '[' + value.map(stableJson).join(',') + ']';
+    if (value && typeof value === 'object') return '{' + Object.keys(value).sort(compareText)
+        .map(key => JSON.stringify(key) + ':' + stableJson(value[key])).join(',') + '}';
+    return JSON.stringify(value);
+}
+
+function semanticRowKey(row) {
+    const record = row.type === 'assertion' ? row.item.record : row.item.assertion;
+    return stableJson({ type: row.type, entityId: row.type === 'assertion' ? row.entityId : null,
+        kind: record.kind, subject: record.subject, predicate: record.predicate, object: record.object,
+        compatibility: record.compatibility, supersedes: record.supersedes, status: record.status,
+        validFrom: record.valid_from, validTo: record.valid_to, temporalStatus: row.status });
+}
+
+function mergeCompactEvidence(existing, incoming) {
+    const combined = [...existing.items, ...incoming.items];
+    const items = combined.slice(0, 3);
+    return { items, truncated: existing.truncated || incoming.truncated || combined.length > items.length };
+}
+
 function assertOptions({ repository, maxAssertions, maxRelations, maxCharacters, maxPerEntityPredicate, maxRelationsPerEntity, now }) {
     if (!repository || typeof repository.readSnapshot !== 'function'
         || !Number.isInteger(maxAssertions) || maxAssertions < 1 || maxAssertions > 20
@@ -158,6 +184,11 @@ export function createMemoryContextProvider({ repository, maxRecords = 20, maxAs
                 predicates: [...new Set(current.snapshot.assertions.map(item => item.predicate)
                     .filter(predicate => !isEntityName(predicate)))].sort(compareText),
                 relationPredicates: Object.keys(RELATION_PREDICATES),
+                relevanceText: orientation.mode === 'continuity'
+                    ? (Array.isArray(recentUserMessages)
+                        ? (recentUserMessages.filter(text => typeof text === 'string' && text.length <= MAX_CONTINUITY_CHARS).at(-1) ?? '')
+                        : '')
+                    : (typeof message === 'string' ? message : ''),
                 limits: { maxSeedEntities: 5, maxRelationDepth: 1, maxNeighborsPerEntity: 8,
                     maxRelations, maxAssertions, maxPerEntityPredicate } };
             const validTime = temporalIntent(message);
@@ -165,7 +196,7 @@ export function createMemoryContextProvider({ repository, maxRecords = 20, maxAs
                 ? await retriever.knowledgeValidAt(query, validTime)
                 : await retriever.currentKnowledge(query);
             const seedIds = selected.seedEntityIds;
-            const rows = rankedRows(selected, seedIds);
+            const rows = rankedRows(selected, seedIds, query.relevanceText);
             const entityById = new Map(selected.entities.map(entity => [entity.id, entity]));
             const payload = { authority: 'data_only', trust: { authority: 'data_only' },
                 snapshot: { storeId: selected.metadata.storeId, revision: selected.metadata.revision, digest: selected.metadata.digest },
@@ -173,7 +204,7 @@ export function createMemoryContextProvider({ repository, maxRecords = 20, maxAs
                     selfIncluded: orientation.includeSelf },
                 temporal: validTime ? { mode: 'valid_at', validTime } : { mode: 'current' },
                 rankingSignals: ['direct_entity_or_self', 'direct_relation', 'related_entity',
-                    'temporal_certainty', 'evidence_confidence', 'same_slot_recency', 'stable_id'],
+                    'temporal_certainty', 'query_term_overlap', 'evidence_confidence', 'same_slot_recency', 'stable_id'],
                 entities: [], assertions: [], relations: [],
                 truncated: { assertions: selected.metadata.truncated.assertions, relations: selected.metadata.truncated.relations,
                     budget: false,
@@ -181,6 +212,7 @@ export function createMemoryContextProvider({ repository, maxRecords = 20, maxAs
             const selectedAssertionCounts = new Map();
             const selectedRelationCounts = new Map();
             const assertionIds = new Set(), relationIds = new Set();
+            const semanticRows = new Map();
             for (const row of rows) {
                 if (row.type === 'assertion' && payload.assertions.length >= maxAssertions) {
                     payload.truncated.assertions = true; continue;
@@ -202,6 +234,21 @@ export function createMemoryContextProvider({ repository, maxRecords = 20, maxAs
                 const relevance = row.category === 0 ? 'direct_entity_or_self'
                     : row.category === 1 ? 'direct_relation' : 'related_entity';
                 const item = row.type === 'assertion' ? compactAssertion(row.item, relevance) : compactRelation(row.item, relevance);
+                const semanticKey = semanticRowKey(row);
+                const existingSemantic = semanticRows.get(semanticKey);
+                if (existingSemantic) {
+                    const candidate = structuredClone(payload);
+                    const targetItems = candidate[existingSemantic.type === 'assertion' ? 'assertions' : 'relations'];
+                    const target = targetItems.find(value => value.id === existingSemantic.id);
+                    target.evidence = mergeCompactEvidence(target.evidence, item.evidence);
+                    if (JSON.stringify(candidate).length <= maxCharacters) {
+                        payload.assertions = candidate.assertions;
+                        payload.relations = candidate.relations;
+                    } else {
+                        payload.truncated.budget = true;
+                    }
+                    continue;
+                }
                 const projectionIds = row.type === 'assertion' ? [row.entityId]
                     : [row.item.assertion.subject.id, row.item.assertion.object.id];
                 const projections = projectionIds.map(id => entityById.get(id)).filter(Boolean);
@@ -218,10 +265,12 @@ export function createMemoryContextProvider({ repository, maxRecords = 20, maxAs
                 payload[row.type === 'assertion' ? 'assertions' : 'relations'] = candidate[row.type === 'assertion' ? 'assertions' : 'relations'];
                 if (row.type === 'assertion') {
                     assertionIds.add(row.id);
+                    semanticRows.set(semanticKey, { type: row.type, id: row.id });
                     const slot = row.entityId + '\u0000' + row.predicate;
                     selectedAssertionCounts.set(slot, (selectedAssertionCounts.get(slot) ?? 0) + 1);
                 } else {
                     relationIds.add(row.id);
+                    semanticRows.set(semanticKey, { type: row.type, id: row.id });
                     selectedRelationCounts.set(row.entityId, (selectedRelationCounts.get(row.entityId) ?? 0) + 1);
                 }
             }

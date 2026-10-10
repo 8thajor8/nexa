@@ -1,8 +1,8 @@
 import 'dotenv/config';
 import { closeDirectUserInput } from './core/direct-user-input.js';
 
-import { createAgent } from './core/agent.js';
-import { createAutomaticMemoryDetector } from './memory/automatic/detector.js';
+import { createCliAgent } from './core/cli-agent.js';
+import { config } from './config.js';
 import { formatAutomaticMemoryAssessment } from './memory/automatic/assessment-presentation.js';
 import { closeWhatsAppBrowser } from './integrations/whatsapp/bridge/session.js';
 import { closeSpeechService, initializeSpeechService } from './speech/service.js';
@@ -10,11 +10,8 @@ import { closeSpeechService, initializeSpeechService } from './speech/service.js
 let nexa;
 try {
     await initializeSpeechService();
-    // Compose the production detector behind a hard-off CLI gate. This stage
-    // validates the complete path with mocks; real assessment remains disabled.
-    nexa = await createAgent({ automaticMemoryDetector: createAutomaticMemoryDetector(),
-        enableAutomaticMemoryAssessment: false });
-    console.log(`Nexa memory backend: ${nexa.memoryBackend}`);
+    nexa = await createCliAgent();
+    console.log(`Nexa memory backend: ${config.cliMemoryMode ?? nexa.memoryBackend}`);
     console.log('');
     console.log('╔══════════════════════════════════╗');
     console.log('║          NEXA ONLINE             ║');

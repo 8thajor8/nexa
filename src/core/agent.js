@@ -2,7 +2,8 @@ import { readDirectUserTurn, releaseDirectUserTurn, finalizeTrustedLocalTurnCont
 import { createMemoryService } from '../memory/service.js';
 import { authorizeMemoryRemember, authorizeMemoryForget, authorizePersonCreation, authorizeRelationCreation,
     authorizeRelationCorrection, authorizeRelationForget } from '../memory/authorization.js';
-import { createMemoryContextProvider, MEMORY_CONTEXT_POLICY } from '../memory/context-provider.js';
+import { createMemory2ReadOnly } from '../memory/read-only.js';
+import { MEMORY_CONTEXT_POLICY } from '../memory/context-provider.js';
 import { openMemoryBackend } from '../memory/backend.js';
 import { randomUUID } from 'node:crypto';
 import { askOpenAI, isAutomaticMemoryLiveDetector } from '../brain/openai.js';
@@ -54,11 +55,21 @@ function writeAgentDiagnostic(event, details) {
     console.debug(`[agent] ${JSON.stringify({ event, ...details })}`);
 }
 
+function throwIfAborted(signal) {
+    if (!signal?.aborted) return;
+    const error = new Error('The request was cancelled.');
+    error.name = 'AbortError';
+    error.code = 'request_cancelled';
+    throw error;
+}
+
 export async function createAgent({
     permissionPolicy,
     memoryBackend = config.memoryBackend,
     memory2StorePath = config.memory2StorePath,
     memory2Repository = null, // Explicit host composition only; the personal CLI never sets this.
+    memory2ReadOnlyReader = null, // Experimental composition with an existing-store reader only.
+    memory2ReadOnlyAllowExternalTools = false,
     ask = askOpenAI,
     load = loadMemory,
     save = saveMemory,
@@ -77,6 +88,7 @@ export async function createAgent({
         || (automaticMemoryDetector !== null && typeof automaticMemoryDetector?.detect !== 'function')
         || (enableAutomaticMemoryAssessment && automaticMemoryDetector === null)
         || (enableAutomaticMemoryAssessment && isAutomaticMemoryLiveDetector(automaticMemoryDetector))
+        || typeof memory2ReadOnlyAllowExternalTools !== 'boolean'
         || !Number.isSafeInteger(automaticMemoryAssessmentTimeoutMs) || automaticMemoryAssessmentTimeoutMs < 1
         || automaticMemoryAssessmentTimeoutMs > AUTOMATIC_MEMORY_ASSESSMENT_TIMEOUT_MS
         || typeof automaticMemoryConsentStore?.load !== 'function' || typeof automaticMemoryConsentStore?.grant !== 'function'
@@ -90,12 +102,34 @@ export async function createAgent({
         throw new TypeError('automatic_memory_assessment_configuration_invalid');
     }
     let selectedBackend;
-    if (memory2Repository) {
+    const readOnlyMemory2 = memory2ReadOnlyReader !== null;
+    if (memory2ReadOnlyAllowExternalTools && !readOnlyMemory2) {
+        throw new Error('External tools in read-only Memory 2 require an explicit reader.');
+    }
+    if (readOnlyMemory2) {
+        if (typeof memory2ReadOnlyReader?.readContext !== 'function'
+            || typeof memory2ReadOnlyReader?.close !== 'function'
+            || memory2Repository !== null || enableAutomaticMemoryAssessment) {
+            throw new Error('Read-only Memory 2 requires an explicit reader and disabled automatic assessment.');
+        }
+        selectedBackend = { backend: 'memory2',
+            memory: { user: {}, preferences: {}, facts: [] },
+            contextProvider: { read: options => memory2ReadOnlyReader.readContext(options), invalidate() {} },
+            close: () => memory2ReadOnlyReader.close() };
+    } else if (memory2Repository) {
         if (memoryBackend !== 'memory2') throw new Error('Injected Memory 2 repository requires memoryBackend=memory2.');
+        const memory2ReadOnly = createMemory2ReadOnly({ repository: memory2Repository });
         selectedBackend = { backend: 'memory2', repository: memory2Repository,
             memory: { user: {}, preferences: {}, facts: [] },
             service: createMemoryService({ repository: memory2Repository }),
-            contextProvider: createMemoryContextProvider({ repository: memory2Repository }), close: async () => {} };
+            contextProvider: {
+                read: options => memory2ReadOnly.readContext(options),
+                // Successful writes clear the agent's digest and conversation below.
+                // The read-only facade intentionally has no invalidation or mutation API.
+                invalidate() {},
+            },
+            // The repository remains owned by the explicit composition caller.
+            close: () => memory2ReadOnly.close() };
     } else {
         selectedBackend = await openMemoryBackend({ backend: memoryBackend, storePath: memory2StorePath, loadLegacy: load });
     }
@@ -278,7 +312,7 @@ export async function createAgent({
     }
 
     function getInstructions() {
-        if (memory2) return NEXA_INSTRUCTIONS + MEMORY_CONTEXT_POLICY;
+        if (memory2 || readOnlyMemory2) return NEXA_INSTRUCTIONS + MEMORY_CONTEXT_POLICY;
         return `
 ${NEXA_INSTRUCTIONS}
 
@@ -289,9 +323,11 @@ ${memoryToPrompt(memory)}
 
     const conversation = [];
 
-    async function getModelResponse(tools, iteration, finalOnly = false) {
+    async function getModelResponse(tools, iteration, finalOnly = false, signal) {
+        throwIfAborted(signal);
         const memoryContext = contextProvider && memoryRetrievalEnabled ? await contextProvider.read({ message: currentMessage,
             recentUserMessages: currentRecentUserMessages }) : null;
+        throwIfAborted(signal);
         if (memoryContext) recordTrustedExposure('retrieved_memory', getAutomaticMemorySourcePolicy('memory'));
         if (memoryContext && contextDigest !== null && contextDigest !== memoryContext.digest) {
             // Discard all derived history, including possible assistant echoes of deleted facts.
@@ -304,8 +340,12 @@ ${memoryToPrompt(memory)}
         const response = await ask({
             instructions: getInstructions(),
             input: memoryContext ? [...memoryContext.items, ...structuredClone(conversation)] : conversation,
-            tools: memory2 ? tools.filter(tool => !memoryToolNames.has(tool.name)) : tools,
+            tools: readOnlyMemory2
+                ? (memory2ReadOnlyAllowExternalTools ? tools.filter(tool => !memoryToolNames.has(tool.name)) : [])
+                : memory2 ? tools.filter(tool => !memoryToolNames.has(tool.name)) : tools,
+            ...(signal ? { signal } : {}),
         });
+        throwIfAborted(signal);
         if (response?.status !== 'completed') lastRunAssessmentEligible = false;
         conversation.push(...(response.output ?? []));
         const toolCalls = (response.output ?? []).filter(item => item.type === 'function_call');
@@ -318,9 +358,9 @@ ${memoryToPrompt(memory)}
         return { response, toolCalls };
     }
 
-    async function finalAnswer(spotifyMessages, iteration, reason) {
+    async function finalAnswer(spotifyMessages, iteration, reason, signal) {
         diagnostic('final_turn', { iteration, reason, toolsDisabled: true });
-        const { response, toolCalls } = await getModelResponse([], iteration, true);
+        const { response, toolCalls } = await getModelResponse([], iteration, true, signal);
         if (toolCalls.length > 0) {
             diagnostic('tool_loop_prevented', { iteration, reason: 'tools_returned_when_disabled', count: toolCalls.length });
             return [...spotifyMessages, 'El ciclo de herramientas terminó, pero no pude generar una respuesta final segura.'].filter(Boolean).join('\n\n');
@@ -329,8 +369,15 @@ ${memoryToPrompt(memory)}
             || [...spotifyMessages, 'El ciclo de herramientas terminó, pero no pude generar una respuesta final.'].filter(Boolean).join('\n\n');
     }
 
-    async function run(userMessage, source = 'untrusted') {
+    async function run(userMessage, source = 'untrusted', options = {}) {
         if (typeof userMessage !== 'string') throw new TypeError('user_message_must_be_text');
+        const signal = options?.signal;
+        if (signal !== undefined && !(signal instanceof AbortSignal)) throw new TypeError('request_signal_invalid');
+        const conversationLength = conversation.length;
+        const priorRecentUserTurns = recentUserTurns;
+        const priorContextDigest = contextDigest;
+        try {
+        throwIfAborted(signal);
         if (!activeDirectTurn || source !== 'direct_user') automaticAssessmentContextTainted = true;
         lastRunAssessmentEligible = true;
         currentMessage = userMessage; currentSource = source;
@@ -342,13 +389,16 @@ ${memoryToPrompt(memory)}
         conversation.push({ role: 'user', content: userMessage });
 
         for (let iteration = 1; iteration <= maxToolIterations; iteration++) {
-            const { response, toolCalls } = await getModelResponse(getTools(permissionPolicy), iteration);
+            throwIfAborted(signal);
+            const availableTools = readOnlyMemory2 && !memory2ReadOnlyAllowExternalTools ? [] : getTools(permissionPolicy);
+            const { response, toolCalls } = await getModelResponse(availableTools, iteration, false, signal);
             if (toolCalls.length === 0) {
                 return [response.output_text, ...spotifyMessages].filter(Boolean).join('\n\n');
             }
 
             let repeatedSuccessfulCall = false;
             for (const toolCall of toolCalls) {
+                throwIfAborted(signal);
                 let args;
                 try {
                     args = JSON.parse(toolCall.arguments);
@@ -379,16 +429,21 @@ ${memoryToPrompt(memory)}
                 diagnostic('tool_call', { iteration, tool: toolCall.name, arguments: safeArgumentSummary(args) });
                 let result;
                 try {
-                    if (memory2 && memoryToolNames.has(toolCall.name)) {
+                    if (readOnlyMemory2 && memoryToolNames.has(toolCall.name)) {
+                        result = { success: false, error: { code: 'memory_write_not_authorized', message: 'Memory operations are disabled in this read-only session.' } };
+                    } else if (readOnlyMemory2 && !memory2ReadOnlyAllowExternalTools) {
+                        result = { success: false, error: { code: 'tool_execution_disabled', message: 'Tool execution is disabled in this read-only session.' } };
+                    } else if (memory2 && memoryToolNames.has(toolCall.name)) {
                         result = { success: false, error: { code: 'memory_write_not_authorized', message: 'Memory commands require direct terminal input.' } };
                     } else {
-                        result = await execute(toolCall.name, args, { memory, saveMemory: memory2 ? undefined : save,
+                        result = await execute(toolCall.name, args, { memory, saveMemory: memory2 || readOnlyMemory2 ? undefined : save,
                             permissionPolicy, sessionId, userMessage,
                             userMessageSource: currentSource });
                     }
                 } catch (error) {
                     result = { success: false, error: { code: 'tool_execution_failed', message: error.message } };
                 }
+                throwIfAborted(signal);
                 const succeeded = result?.success === true;
                 if (succeeded && ['set_ui_value', 'invoke_ui_element'].includes(toolCall.name)) {
                     result = { ...result, completed: true };
@@ -408,12 +463,21 @@ ${memoryToPrompt(memory)}
             }
 
             if (repeatedSuccessfulCall) {
-                return finalAnswer(spotifyMessages, iteration, 'repeated_successful_tool_call');
+                return finalAnswer(spotifyMessages, iteration, 'repeated_successful_tool_call', signal);
             }
         }
 
         // Tool rounds are capped; give the model one response-only turn to summarize their outcomes.
-        return finalAnswer(spotifyMessages, maxToolIterations, 'max_tool_iterations');
+        return finalAnswer(spotifyMessages, maxToolIterations, 'max_tool_iterations', signal);
+        } catch (error) {
+            if (signal?.aborted) {
+                conversation.length = conversationLength;
+                recentUserTurns = priorRecentUserTurns;
+                contextDigest = priorContextDigest;
+                throwIfAborted(signal);
+            }
+            throw error;
+        }
     }
 
     // No method accepting a caller string can assert trusted Memory 2 provenance.
@@ -434,6 +498,9 @@ ${memoryToPrompt(memory)}
                 await refreshPersistentAutomaticMemoryConsent();
                 const { message, command, capability } = turn;
                 const operation = command?.operation;
+                if (readOnlyMemory2 && command) {
+                    return { done: false, response: 'Los comandos de memoria están deshabilitados en esta sesión de solo lectura.' };
+                }
                 if (pendingConsentChallenge) {
                     const expected = pendingConsentChallenge;
                     pendingConsentChallenge = null;
@@ -575,7 +642,7 @@ ${memoryToPrompt(memory)}
             } finally { releaseDirectUserTurn(turn.capability); }
         });
     }
-    const agent = { run: message => enqueue(() => run(message)), readAndRun,
+    const agent = { run: (message, source, options) => enqueue(() => run(message, source, options)), readAndRun,
         // The CLI calls this only after presenting readAndRun()'s response. It takes no
         // caller text or proof and is deliberately not exposed as a model tool.
         completePresentedTurn: () => enqueue(completePendingAutomaticMemoryAssessment),
