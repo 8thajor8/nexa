@@ -369,8 +369,21 @@ ${memoryToPrompt(memory)}
             || [...spotifyMessages, 'El ciclo de herramientas terminó, pero no pude generar una respuesta final.'].filter(Boolean).join('\n\n');
     }
 
-    async function run(userMessage, source = 'untrusted', options = {}) {
+    const directUserSourceCapability = Symbol('direct_user_source');
+    async function run(userMessage, source = 'untrusted', options = {}, sourceCapability = null) {
         if (typeof userMessage !== 'string') throw new TypeError('user_message_must_be_text');
+        const isInternalDirectUserSource = sourceCapability === directUserSourceCapability;
+        if (isInternalDirectUserSource) {
+            if (source !== 'direct_user' || !activeDirectTurn) {
+                const error = new TypeError('agent_source_invalid');
+                error.code = 'agent_source_invalid';
+                throw error;
+            }
+        } else if (!['untrusted', 'typed', 'voice'].includes(source)) {
+            const error = new TypeError('agent_source_invalid');
+            error.code = 'agent_source_invalid';
+            throw error;
+        }
         const signal = options?.signal;
         if (signal !== undefined && !(signal instanceof AbortSignal)) throw new TypeError('request_signal_invalid');
         const conversationLength = conversation.length;
@@ -630,7 +643,7 @@ ${memoryToPrompt(memory)}
                 const preflight = mayAssess ? screenAutomaticMemoryTurn(message) : null;
                 if (preflight && !preflight.eligible)
                     diagnostic('automatic_memory_assessment_skipped', { code: preflight.reason });
-                const response = await run(message, 'direct_user');
+                const response = await run(message, 'direct_user', {}, directUserSourceCapability);
                 if (enableAutomaticMemoryAssessment && !command && message.trim()
                     && mayAssess && preflight?.eligible && lastRunAssessmentEligible
                     && !activeDirectTurn.exposed && !activeDirectTurn.exposureRecordingFailed
