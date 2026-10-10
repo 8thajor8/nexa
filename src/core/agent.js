@@ -60,6 +60,7 @@ export async function createAgent({
     memoryBackend = config.memoryBackend,
     memory2StorePath = config.memory2StorePath,
     memory2Repository = null, // Explicit host composition only; the personal CLI never sets this.
+    memory2ReadOnlyReader = null, // Experimental composition with an existing-store reader only.
     ask = askOpenAI,
     load = loadMemory,
     save = saveMemory,
@@ -91,7 +92,18 @@ export async function createAgent({
         throw new TypeError('automatic_memory_assessment_configuration_invalid');
     }
     let selectedBackend;
-    if (memory2Repository) {
+    const readOnlyMemory2 = memory2ReadOnlyReader !== null;
+    if (readOnlyMemory2) {
+        if (typeof memory2ReadOnlyReader?.readContext !== 'function'
+            || typeof memory2ReadOnlyReader?.close !== 'function'
+            || memory2Repository !== null || enableAutomaticMemoryAssessment) {
+            throw new Error('Read-only Memory 2 requires an explicit reader and disabled automatic assessment.');
+        }
+        selectedBackend = { backend: 'memory2',
+            memory: { user: {}, preferences: {}, facts: [] },
+            contextProvider: { read: options => memory2ReadOnlyReader.readContext(options), invalidate() {} },
+            close: () => memory2ReadOnlyReader.close() };
+    } else if (memory2Repository) {
         if (memoryBackend !== 'memory2') throw new Error('Injected Memory 2 repository requires memoryBackend=memory2.');
         const memory2ReadOnly = createMemory2ReadOnly({ repository: memory2Repository });
         selectedBackend = { backend: 'memory2', repository: memory2Repository,
@@ -287,7 +299,7 @@ export async function createAgent({
     }
 
     function getInstructions() {
-        if (memory2) return NEXA_INSTRUCTIONS + MEMORY_CONTEXT_POLICY;
+        if (memory2 || readOnlyMemory2) return NEXA_INSTRUCTIONS + MEMORY_CONTEXT_POLICY;
         return `
 ${NEXA_INSTRUCTIONS}
 
@@ -313,7 +325,7 @@ ${memoryToPrompt(memory)}
         const response = await ask({
             instructions: getInstructions(),
             input: memoryContext ? [...memoryContext.items, ...structuredClone(conversation)] : conversation,
-            tools: memory2 ? tools.filter(tool => !memoryToolNames.has(tool.name)) : tools,
+            tools: memory2 || readOnlyMemory2 ? tools.filter(tool => !memoryToolNames.has(tool.name)) : tools,
         });
         if (response?.status !== 'completed') lastRunAssessmentEligible = false;
         conversation.push(...(response.output ?? []));
@@ -388,7 +400,9 @@ ${memoryToPrompt(memory)}
                 diagnostic('tool_call', { iteration, tool: toolCall.name, arguments: safeArgumentSummary(args) });
                 let result;
                 try {
-                    if (memory2 && memoryToolNames.has(toolCall.name)) {
+                    if (readOnlyMemory2 && memoryToolNames.has(toolCall.name)) {
+                        result = { success: false, error: { code: 'memory_read_only', message: 'Memory commands are disabled in this read-only session.' } };
+                    } else if (memory2 && memoryToolNames.has(toolCall.name)) {
                         result = { success: false, error: { code: 'memory_write_not_authorized', message: 'Memory commands require direct terminal input.' } };
                     } else {
                         result = await execute(toolCall.name, args, { memory, saveMemory: memory2 ? undefined : save,
@@ -443,6 +457,9 @@ ${memoryToPrompt(memory)}
                 await refreshPersistentAutomaticMemoryConsent();
                 const { message, command, capability } = turn;
                 const operation = command?.operation;
+                if (readOnlyMemory2 && command) {
+                    return { done: false, response: 'Los comandos de memoria están deshabilitados en esta sesión de solo lectura.' };
+                }
                 if (pendingConsentChallenge) {
                     const expected = pendingConsentChallenge;
                     pendingConsentChallenge = null;
