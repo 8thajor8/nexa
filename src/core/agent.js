@@ -55,6 +55,14 @@ function writeAgentDiagnostic(event, details) {
     console.debug(`[agent] ${JSON.stringify({ event, ...details })}`);
 }
 
+function throwIfAborted(signal) {
+    if (!signal?.aborted) return;
+    const error = new Error('The request was cancelled.');
+    error.name = 'AbortError';
+    error.code = 'request_cancelled';
+    throw error;
+}
+
 export async function createAgent({
     permissionPolicy,
     memoryBackend = config.memoryBackend,
@@ -315,9 +323,11 @@ ${memoryToPrompt(memory)}
 
     const conversation = [];
 
-    async function getModelResponse(tools, iteration, finalOnly = false) {
+    async function getModelResponse(tools, iteration, finalOnly = false, signal) {
+        throwIfAborted(signal);
         const memoryContext = contextProvider && memoryRetrievalEnabled ? await contextProvider.read({ message: currentMessage,
             recentUserMessages: currentRecentUserMessages }) : null;
+        throwIfAborted(signal);
         if (memoryContext) recordTrustedExposure('retrieved_memory', getAutomaticMemorySourcePolicy('memory'));
         if (memoryContext && contextDigest !== null && contextDigest !== memoryContext.digest) {
             // Discard all derived history, including possible assistant echoes of deleted facts.
@@ -333,7 +343,9 @@ ${memoryToPrompt(memory)}
             tools: readOnlyMemory2
                 ? (memory2ReadOnlyAllowExternalTools ? tools.filter(tool => !memoryToolNames.has(tool.name)) : [])
                 : memory2 ? tools.filter(tool => !memoryToolNames.has(tool.name)) : tools,
+            ...(signal ? { signal } : {}),
         });
+        throwIfAborted(signal);
         if (response?.status !== 'completed') lastRunAssessmentEligible = false;
         conversation.push(...(response.output ?? []));
         const toolCalls = (response.output ?? []).filter(item => item.type === 'function_call');
@@ -346,9 +358,9 @@ ${memoryToPrompt(memory)}
         return { response, toolCalls };
     }
 
-    async function finalAnswer(spotifyMessages, iteration, reason) {
+    async function finalAnswer(spotifyMessages, iteration, reason, signal) {
         diagnostic('final_turn', { iteration, reason, toolsDisabled: true });
-        const { response, toolCalls } = await getModelResponse([], iteration, true);
+        const { response, toolCalls } = await getModelResponse([], iteration, true, signal);
         if (toolCalls.length > 0) {
             diagnostic('tool_loop_prevented', { iteration, reason: 'tools_returned_when_disabled', count: toolCalls.length });
             return [...spotifyMessages, 'El ciclo de herramientas terminó, pero no pude generar una respuesta final segura.'].filter(Boolean).join('\n\n');
@@ -357,8 +369,15 @@ ${memoryToPrompt(memory)}
             || [...spotifyMessages, 'El ciclo de herramientas terminó, pero no pude generar una respuesta final.'].filter(Boolean).join('\n\n');
     }
 
-    async function run(userMessage, source = 'untrusted') {
+    async function run(userMessage, source = 'untrusted', options = {}) {
         if (typeof userMessage !== 'string') throw new TypeError('user_message_must_be_text');
+        const signal = options?.signal;
+        if (signal !== undefined && !(signal instanceof AbortSignal)) throw new TypeError('request_signal_invalid');
+        const conversationLength = conversation.length;
+        const priorRecentUserTurns = recentUserTurns;
+        const priorContextDigest = contextDigest;
+        try {
+        throwIfAborted(signal);
         if (!activeDirectTurn || source !== 'direct_user') automaticAssessmentContextTainted = true;
         lastRunAssessmentEligible = true;
         currentMessage = userMessage; currentSource = source;
@@ -370,14 +389,16 @@ ${memoryToPrompt(memory)}
         conversation.push({ role: 'user', content: userMessage });
 
         for (let iteration = 1; iteration <= maxToolIterations; iteration++) {
+            throwIfAborted(signal);
             const availableTools = readOnlyMemory2 && !memory2ReadOnlyAllowExternalTools ? [] : getTools(permissionPolicy);
-            const { response, toolCalls } = await getModelResponse(availableTools, iteration);
+            const { response, toolCalls } = await getModelResponse(availableTools, iteration, false, signal);
             if (toolCalls.length === 0) {
                 return [response.output_text, ...spotifyMessages].filter(Boolean).join('\n\n');
             }
 
             let repeatedSuccessfulCall = false;
             for (const toolCall of toolCalls) {
+                throwIfAborted(signal);
                 let args;
                 try {
                     args = JSON.parse(toolCall.arguments);
@@ -422,6 +443,7 @@ ${memoryToPrompt(memory)}
                 } catch (error) {
                     result = { success: false, error: { code: 'tool_execution_failed', message: error.message } };
                 }
+                throwIfAborted(signal);
                 const succeeded = result?.success === true;
                 if (succeeded && ['set_ui_value', 'invoke_ui_element'].includes(toolCall.name)) {
                     result = { ...result, completed: true };
@@ -441,12 +463,21 @@ ${memoryToPrompt(memory)}
             }
 
             if (repeatedSuccessfulCall) {
-                return finalAnswer(spotifyMessages, iteration, 'repeated_successful_tool_call');
+                return finalAnswer(spotifyMessages, iteration, 'repeated_successful_tool_call', signal);
             }
         }
 
         // Tool rounds are capped; give the model one response-only turn to summarize their outcomes.
-        return finalAnswer(spotifyMessages, maxToolIterations, 'max_tool_iterations');
+        return finalAnswer(spotifyMessages, maxToolIterations, 'max_tool_iterations', signal);
+        } catch (error) {
+            if (signal?.aborted) {
+                conversation.length = conversationLength;
+                recentUserTurns = priorRecentUserTurns;
+                contextDigest = priorContextDigest;
+                throwIfAborted(signal);
+            }
+            throw error;
+        }
     }
 
     // No method accepting a caller string can assert trusted Memory 2 provenance.
@@ -611,7 +642,7 @@ ${memoryToPrompt(memory)}
             } finally { releaseDirectUserTurn(turn.capability); }
         });
     }
-    const agent = { run: message => enqueue(() => run(message)), readAndRun,
+    const agent = { run: (message, source, options) => enqueue(() => run(message, source, options)), readAndRun,
         // The CLI calls this only after presenting readAndRun()'s response. It takes no
         // caller text or proof and is deliberately not exposed as a model tool.
         completePresentedTurn: () => enqueue(completePendingAutomaticMemoryAssessment),
