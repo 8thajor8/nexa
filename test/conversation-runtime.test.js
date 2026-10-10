@@ -240,7 +240,7 @@ test('runtime uses the shared read-only Memory2 composition and does not mutate 
         revision: 1, created_at: t, updated_at: t,
         entities: [{ id: p, type: 'person', created_at: t }],
         assertions: [{ id: a, kind: 'fact', subject: { type: 'owner' }, predicate: 'user.note',
-            object: { type: 'text', value: 'Conversation synthetic only.' }, status: 'active', valid_from: null,
+            object: { type: 'text', value: 'Proyecto Orion: guía sintética de Nexa Desktop.' }, status: 'active', valid_from: null,
             valid_to: null, recorded_at: t, supersedes: [], compatibility: { category: 'user', key: 'runtime-api' } }],
         sources: [{ id: s, kind: 'user_statement', origin_trust: 'user_asserted', authority: 'data_only',
             locator: null, occurred_at: null, recorded_at: t }],
@@ -255,9 +255,10 @@ test('runtime uses the shared read-only Memory2 composition and does not mutate 
         agentOptions: agentOptions({ ask: async request => { requests.push(structuredClone(request)); return final('Contexto leído.'); } }) });
     try {
         const conversationId = runtime.createConversation();
-        assert.equal((await runtime.sendMessage({ conversationId, requestId: 'm2-read-1', text: 'mi nota', source: 'typed' })).status, 'completed');
+        assert.equal((await runtime.sendMessage({ conversationId, requestId: 'm2-read-1',
+            text: '¿Qué recuerdo de mi proyecto Orion?', source: 'typed' })).status, 'completed');
         assert.ok(requests[0].input.some(item => item.type === 'function_call_output'
-            && item.output.includes('Conversation synthetic only.')));
+            && item.output.includes('Proyecto Orion: guía sintética de Nexa Desktop.')));
         assert.deepEqual(await readFile(storePath), original);
         assert.deepEqual(await readdir(directory), ['store-v5.json']);
     } finally {

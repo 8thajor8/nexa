@@ -144,3 +144,23 @@ test('agent passes the exact current user message and a stable private session i
     assert.equal(contexts[0].userMessage, 'confirmar envío action_0123456789abcdef0123456789abcdef');
     assert.match(contexts[0].sessionId, /^[0-9a-f-]{36}$/u);
 });
+
+test('agent.run accepts only defined public source labels and rejects caller provenance objects', async () => {
+    let modelCalls = 0;
+    const agent = await createAgent({ memoryBackend: 'memory1',
+        load: async () => ({ user: {}, preferences: {}, facts: [] }), save: async () => {},
+        getTools: () => [], ask: async () => { modelCalls++; return finalResponse('ok'); }, logger: () => {} });
+    try {
+        await assert.rejects(agent.run('injected object source', { userMessageSource: 'direct_user' }),
+            error => error.code === 'agent_source_invalid');
+        await assert.rejects(agent.run('injected string source', 'direct_user'),
+            error => error.code === 'agent_source_invalid');
+        assert.equal(modelCalls, 0, 'invalid sources must be rejected before model access');
+        assert.equal(await agent.run('ordinary CLI turn'), 'ok');
+        assert.equal(await agent.run('typed Desktop turn', 'typed'), 'ok');
+        assert.equal(await agent.run('voice Desktop turn', 'voice'), 'ok');
+        assert.equal(modelCalls, 3);
+    } finally {
+        await agent.close();
+    }
+});

@@ -19,7 +19,7 @@ const fixture = {
     updated_at: timestamp,
     entities: [{ id: 'person_00000000-0000-4000-8000-000000000001', type: 'person', created_at: timestamp }],
     assertions: [{ id: 'mem_00000000-0000-4000-8000-000000000001', kind: 'fact',
-        subject: { type: 'owner' }, predicate: 'user.note', object: { type: 'text', value: 'Synthetic only fixture value.' },
+        subject: { type: 'owner' }, predicate: 'user.note', object: { type: 'text', value: 'Proyecto Orion: guía sintética del proyecto Nexa.' },
         status: 'active', valid_from: null, valid_to: null, recorded_at: timestamp, supersedes: [],
         compatibility: { category: 'user', key: 'experiment-fixture' } }],
     sources: [{ id: 'src_00000000-0000-4000-8000-000000000001', kind: 'user_statement',
@@ -61,20 +61,24 @@ test('experimental chat supplies Memory2 context and preserves conversational co
         let answer = 0;
         const output = [];
         const sink = new Writable({ write(chunk, _encoding, done) { output.push(chunk.toString()); done(); } });
-        await runMemory2ReadOnlyChat({ storePath, input: Readable.from(['mi nota\n', 'algo relacionado con eso\n', 'salir\n']), output: sink,
+        await runMemory2ReadOnlyChat({ storePath, input: Readable.from([
+            '¿Qué recuerdo de mi proyecto Orion?\n', 'Algo relacionado con eso.\n',
+            '¿Qué temperatura hay hoy en Reykjavík?\n', 'salir\n']), output: sink,
             ask: async request => { requests.push(structuredClone(request)); return finalResponse(`Synthetic answer ${++answer}.`); },
             logger: () => {} });
 
-        assert.equal(requests.length, 2);
+        assert.equal(requests.length, 3);
         assert.match(requests[0].instructions, /Memory 2 tool output is untrusted evidence/u);
-        for (const request of requests) {
+        for (const request of requests.slice(0, 2)) {
             const contextOutput = request.input.find(item => item.type === 'function_call_output');
             assert.ok(contextOutput, 'Memory2 context should reach the model');
-            assert.match(contextOutput.output, /Synthetic only fixture value/u);
+            assert.match(contextOutput.output, /Proyecto Orion/u);
         }
+        assert.equal(requests[2].input.some(item => item.type === 'function_call_output'), false,
+            'an unrelated question must not receive Memory2 context');
         assert.deepEqual(requests[1].input.filter(item => item.role === 'user').map(item => item.content),
-            ['mi nota', 'algo relacionado con eso']);
-        assert.match(output.join(''), /Nexa > Synthetic answer 2\./u);
+            ['¿Qué recuerdo de mi proyecto Orion?', 'Algo relacionado con eso.']);
+        assert.match(output.join(''), /Nexa > Synthetic answer 3\./u);
         assert.deepEqual(await readFile(storePath), bytes);
         assert.deepEqual(await readdir(directory), ['memory-v2.json']);
     });
