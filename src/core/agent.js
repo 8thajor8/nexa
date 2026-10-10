@@ -325,7 +325,7 @@ ${memoryToPrompt(memory)}
         const response = await ask({
             instructions: getInstructions(),
             input: memoryContext ? [...memoryContext.items, ...structuredClone(conversation)] : conversation,
-            tools: memory2 || readOnlyMemory2 ? tools.filter(tool => !memoryToolNames.has(tool.name)) : tools,
+            tools: readOnlyMemory2 ? [] : memory2 ? tools.filter(tool => !memoryToolNames.has(tool.name)) : tools,
         });
         if (response?.status !== 'completed') lastRunAssessmentEligible = false;
         conversation.push(...(response.output ?? []));
@@ -363,7 +363,7 @@ ${memoryToPrompt(memory)}
         conversation.push({ role: 'user', content: userMessage });
 
         for (let iteration = 1; iteration <= maxToolIterations; iteration++) {
-            const { response, toolCalls } = await getModelResponse(getTools(permissionPolicy), iteration);
+            const { response, toolCalls } = await getModelResponse(readOnlyMemory2 ? [] : getTools(permissionPolicy), iteration);
             if (toolCalls.length === 0) {
                 return [response.output_text, ...spotifyMessages].filter(Boolean).join('\n\n');
             }
@@ -400,8 +400,8 @@ ${memoryToPrompt(memory)}
                 diagnostic('tool_call', { iteration, tool: toolCall.name, arguments: safeArgumentSummary(args) });
                 let result;
                 try {
-                    if (readOnlyMemory2 && memoryToolNames.has(toolCall.name)) {
-                        result = { success: false, error: { code: 'memory_read_only', message: 'Memory commands are disabled in this read-only session.' } };
+                    if (readOnlyMemory2) {
+                        result = { success: false, error: { code: 'tool_execution_disabled', message: 'Tool execution is disabled in this read-only session.' } };
                     } else if (memory2 && memoryToolNames.has(toolCall.name)) {
                         result = { success: false, error: { code: 'memory_write_not_authorized', message: 'Memory commands require direct terminal input.' } };
                     } else {

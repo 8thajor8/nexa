@@ -80,10 +80,10 @@ test('experimental chat supplies Memory2 context and preserves conversational co
     });
 });
 
-test('agent rejects model-requested Memory2 mutations internally even when a model returns a hidden memory tool call', async () => {
+test('experimental agent offers no tools and rejects hidden memory and external tool calls internally', async () => {
     await withStore(async ({ directory, storePath, bytes }) => {
         const reader = await openExistingMemory2Reader({ storePath });
-        let executions = 0;
+        let executions = 0, toolCatalogReads = 0;
         let requestCount = 0;
         const agent = await createAgent({
             memory2ReadOnlyReader: reader,
@@ -91,13 +91,16 @@ test('agent rejects model-requested Memory2 mutations internally even when a mod
             enableAutomaticMemoryAssessment: false,
             automaticMemoryConsentStore: inertConsent,
             automaticMemoryProposalQueue: inertQueue,
-            getTools: () => [{ name: 'remember' }, { name: 'forget' }],
+            getTools: () => { toolCatalogReads++; return [{ name: 'remember' }, { name: 'forget' }, { name: 'open_url' }, { name: 'send_email' }]; },
             execute: async () => { executions++; return { success: true }; },
             ask: async request => {
                 requestCount++;
-                assert.deepEqual(request.tools, [], 'memory tools must be removed from the model contract');
+                assert.deepEqual(request.tools, [], 'no tools may be offered to the model in this mode');
                 if (requestCount === 1) return { status: 'completed', output: [
                     { type: 'function_call', name: 'remember', arguments: '{"text":"write this"}', call_id: 'call-write' },
+                ] };
+                if (requestCount === 2) return { status: 'completed', output: [
+                    { type: 'function_call', name: 'send_email', arguments: '{"to":"synthetic@example.invalid"}', call_id: 'call-external' },
                 ] };
                 return finalResponse('La sesión experimental es de solo lectura.');
             },
@@ -106,7 +109,8 @@ test('agent rejects model-requested Memory2 mutations internally even when a mod
         try {
             assert.equal(await agent.run('Guarda este dato.'), 'La sesión experimental es de solo lectura.');
             assert.equal(executions, 0);
-            assert.equal(requestCount, 2);
+            assert.equal(toolCatalogReads, 0);
+            assert.equal(requestCount, 3);
             assert.deepEqual(await readFile(storePath), bytes);
             assert.deepEqual(await readdir(directory), ['memory-v2.json']);
         } finally { await agent.close(); }

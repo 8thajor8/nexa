@@ -26,7 +26,7 @@ const isolatedProposalQueue = Object.freeze({
  * The reader and agent are always closed when input ends or a turn fails.
  * `ask` is exposed for deterministic local tests; production uses the normal API.
  */
-export async function runMemory2ReadOnlyChat({ storePath, input = stdin, output = stdout, ask, getTools, logger } = {}) {
+export async function runMemory2ReadOnlyChat({ storePath, input = stdin, output = stdout, ask, logger } = {}) {
     if (typeof storePath !== 'string' || !path.isAbsolute(storePath)) {
         throw new Error('Provide an absolute path to an existing Memory 2 Schema v5 store.');
     }
@@ -42,7 +42,6 @@ export async function runMemory2ReadOnlyChat({ storePath, input = stdin, output 
             automaticMemoryConsentStore: isolatedConsentStore,
             automaticMemoryProposalQueue: isolatedProposalQueue,
             ...(ask ? { ask } : {}),
-            ...(getTools ? { getTools } : {}),
             ...(logger ? { logger } : {}),
         });
 
