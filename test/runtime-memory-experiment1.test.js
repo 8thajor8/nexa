@@ -158,7 +158,7 @@ test('Memory1 remains default and the usual application entry is unchanged', asy
     assert.equal(config.memoryBackend, 'memory1');
     const source = await readFile(new URL('../src/index.js', import.meta.url), 'utf8');
     assert.match(source, /createCliAgent\(\)/u);
-    const cliComposition = await readFile(new URL('../src/core/cli-agent.js', import.meta.url), 'utf8');
+    const cliComposition = await readFile(new URL('../src/core/runtime-agent.js', import.meta.url), 'utf8');
     assert.match(cliComposition, /memoryMode = config\.cliMemoryMode/u);
     assert.match(cliComposition, /automaticMemoryDetector: createAutomaticMemoryDetector\(\),\s*enableAutomaticMemoryAssessment: false/u);
 });

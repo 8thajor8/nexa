@@ -24,13 +24,13 @@ export function getOpenAIClient() {
     return client;
 }
 
-export async function askOpenAI({ instructions, input, tools = [] }) {
+export async function askOpenAI({ instructions, input, tools = [], signal }) {
     return getOpenAIClient().responses.create({
         model: config.model,
         instructions,
         input,
         tools,
-    });
+    }, signal ? { signal } : undefined);
 }
 
 export class AutomaticMemoryResponseError extends Error {
