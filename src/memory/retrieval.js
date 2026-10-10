@@ -16,6 +16,14 @@ const QUERY_KEYS = ['entityIds', 'includeSelf', 'predicates', 'relationPredicate
 const LIMIT_KEYS = Object.keys(MEMORY_RETRIEVAL_LIMITS);
 const VALID_STATUSES = Object.freeze(['active', 'superseded']);
 const QUERY_STOP_WORDS = new Set(('a al algo as at con de del desde el en for from he her how i in is it la las le lo los me mi mis my of on or para por que se she sobre the this to un una uno y yo you your do what where which who about are can describe tell use using related remember have has').split(' '));
+const QUERY_EQUIVALENCE_GROUPS = Object.freeze([
+    Object.freeze(['amount', 'cost', 'costaba', 'costar', 'coste', 'costo', 'cuanto', 'cuesta', 'price', 'precio', 'pricing', 'priced']),
+    Object.freeze(['choice', 'chosen', 'choose', 'chose', 'decision', 'elegi', 'elegida', 'elegido', 'elegimos', 'elegir', 'eligio', 'eleccion', 'pick', 'picked', 'seleccionado', 'seleccionar', 'selection', 'selected']),
+    Object.freeze(['cuando', 'date', 'dated', 'fecha', 'moment', 'momento', 'time', 'when', 'year']),
+    Object.freeze(['arquitectura', 'architectural', 'architecture']),
+]);
+const QUERY_EQUIVALENTS = new Map(QUERY_EQUIVALENCE_GROUPS.flatMap(group => group.map(token => [token, group])));
+const TEMPORAL_QUERY_TOKEN = '__memory_temporal_query__';
 
 function assertAllowedObject(value, keys, path) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('memory_retrieval_invalid');
@@ -59,24 +67,50 @@ function boundedOccurrences(text, phrase) {
 function compareText(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
 function uniqueSorted(values) { return [...new Set(values)].sort(compareText); }
 
-function relevanceTokens(text) {
+function normalizedTokens(text) {
     if (typeof text !== 'string') return [];
     return [...new Set(text.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().match(/[\p{L}\p{N}]{2,}/gu) ?? [])]
         .filter(token => !QUERY_STOP_WORDS.has(token)).slice(0, 64);
 }
 
+function relevanceTokens(text) {
+    const terms = new Set();
+    for (const token of normalizedTokens(text)) {
+        const equivalents = QUERY_EQUIVALENTS.get(token);
+        if (equivalents) for (const equivalent of equivalents) terms.add(equivalent);
+        else terms.add(token);
+        if (equivalents?.includes('when')) terms.add(TEMPORAL_QUERY_TOKEN);
+    }
+    return [...terms].slice(0, 128);
+}
+
 function scoreRecordForTokens(record, terms) {
     if (!terms.length || !record || typeof record !== 'object') return 0;
-    const predicateTokens = new Set(relevanceTokens(record.predicate));
-    const objectTokens = new Set(relevanceTokens(record.object?.type === 'text' ? record.object.value : ''));
+    const predicateTokens = new Set(normalizedTokens(record.predicate));
+    const objectTokens = new Set(normalizedTokens(record.object?.type === 'text' ? record.object.value : ''));
     let score = 0;
-    for (const term of terms) score += (predicateTokens.has(term) ? 2 : 0) + (objectTokens.has(term) ? 1 : 0);
+    for (const term of terms) {
+        if (term === TEMPORAL_QUERY_TOKEN) continue;
+        score += (predicateTokens.has(term) ? 2 : 0) + (objectTokens.has(term) ? 1 : 0);
+    }
+    if (terms.includes(TEMPORAL_QUERY_TOKEN) && (record.valid_from !== null || record.valid_to !== null)) score += 2;
     return score;
 }
 
 /** Deterministic lexical signal only; it does not infer semantic equivalence. */
 export function scoreMemoryRecordRelevance(record, relevanceText = '') {
     return scoreRecordForTokens(record, relevanceTokens(relevanceText));
+}
+
+/** Whether a record matches actual topic terms, excluding the generic time cue. */
+export function hasMemoryRecordTopicRelevance(record, relevanceText = '') {
+    const terms = relevanceTokens(relevanceText).filter(term => term !== TEMPORAL_QUERY_TOKEN);
+    return scoreRecordForTokens(record, terms) > 0;
+}
+
+export function hasMemoryRecordSpecificTopicRelevance(record, relevanceText = '') {
+    const terms = normalizedTokens(relevanceText).filter(term => !QUERY_EQUIVALENTS.has(term));
+    return scoreRecordForTokens(record, terms) > 0;
 }
 
 /** Finds complete name/alias mentions within a sentence. Spans are offsets in
