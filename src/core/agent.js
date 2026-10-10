@@ -2,7 +2,8 @@ import { readDirectUserTurn, releaseDirectUserTurn, finalizeTrustedLocalTurnCont
 import { createMemoryService } from '../memory/service.js';
 import { authorizeMemoryRemember, authorizeMemoryForget, authorizePersonCreation, authorizeRelationCreation,
     authorizeRelationCorrection, authorizeRelationForget } from '../memory/authorization.js';
-import { createMemoryContextProvider, MEMORY_CONTEXT_POLICY } from '../memory/context-provider.js';
+import { createMemory2ReadOnly } from '../memory/read-only.js';
+import { MEMORY_CONTEXT_POLICY } from '../memory/context-provider.js';
 import { openMemoryBackend } from '../memory/backend.js';
 import { randomUUID } from 'node:crypto';
 import { askOpenAI, isAutomaticMemoryLiveDetector } from '../brain/openai.js';
@@ -92,10 +93,18 @@ export async function createAgent({
     let selectedBackend;
     if (memory2Repository) {
         if (memoryBackend !== 'memory2') throw new Error('Injected Memory 2 repository requires memoryBackend=memory2.');
+        const memory2ReadOnly = createMemory2ReadOnly({ repository: memory2Repository });
         selectedBackend = { backend: 'memory2', repository: memory2Repository,
             memory: { user: {}, preferences: {}, facts: [] },
             service: createMemoryService({ repository: memory2Repository }),
-            contextProvider: createMemoryContextProvider({ repository: memory2Repository }), close: async () => {} };
+            contextProvider: {
+                read: options => memory2ReadOnly.readContext(options),
+                // Successful writes clear the agent's digest and conversation below.
+                // The read-only facade intentionally has no invalidation or mutation API.
+                invalidate() {},
+            },
+            // The repository remains owned by the explicit composition caller.
+            close: () => memory2ReadOnly.close() };
     } else {
         selectedBackend = await openMemoryBackend({ backend: memoryBackend, storePath: memory2StorePath, loadLegacy: load });
     }
