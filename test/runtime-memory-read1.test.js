@@ -211,7 +211,10 @@ test('closing Runtime closes its facade but leaves the injected repository with 
 
 test('the normal CLI does not inject the experimental repository consumer', async () => {
     const source = await readFile(new URL('../src/index.js', import.meta.url), 'utf8');
-    assert.match(source, /createAgent\(\{ automaticMemoryDetector: createAutomaticMemoryDetector\(\),\s*enableAutomaticMemoryAssessment: false \}\)/u);
+    assert.match(source, /createCliAgent\(\)/u);
     assert.doesNotMatch(source, /memory2Repository|createMemory2ReadOnly/u);
+    const composition = await readFile(new URL('../src/core/cli-agent.js', import.meta.url), 'utf8');
+    assert.match(composition, /memoryMode = config\.cliMemoryMode/u);
+    assert.match(composition, /automaticMemoryDetector: createAutomaticMemoryDetector\(\),\s*enableAutomaticMemoryAssessment: false/u);
     assert.equal(resolveMemoryBackend(undefined), 'memory1');
 });

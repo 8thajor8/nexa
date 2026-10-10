@@ -61,6 +61,7 @@ export async function createAgent({
     memory2StorePath = config.memory2StorePath,
     memory2Repository = null, // Explicit host composition only; the personal CLI never sets this.
     memory2ReadOnlyReader = null, // Experimental composition with an existing-store reader only.
+    memory2ReadOnlyAllowExternalTools = false,
     ask = askOpenAI,
     load = loadMemory,
     save = saveMemory,
@@ -79,6 +80,7 @@ export async function createAgent({
         || (automaticMemoryDetector !== null && typeof automaticMemoryDetector?.detect !== 'function')
         || (enableAutomaticMemoryAssessment && automaticMemoryDetector === null)
         || (enableAutomaticMemoryAssessment && isAutomaticMemoryLiveDetector(automaticMemoryDetector))
+        || typeof memory2ReadOnlyAllowExternalTools !== 'boolean'
         || !Number.isSafeInteger(automaticMemoryAssessmentTimeoutMs) || automaticMemoryAssessmentTimeoutMs < 1
         || automaticMemoryAssessmentTimeoutMs > AUTOMATIC_MEMORY_ASSESSMENT_TIMEOUT_MS
         || typeof automaticMemoryConsentStore?.load !== 'function' || typeof automaticMemoryConsentStore?.grant !== 'function'
@@ -93,6 +95,9 @@ export async function createAgent({
     }
     let selectedBackend;
     const readOnlyMemory2 = memory2ReadOnlyReader !== null;
+    if (memory2ReadOnlyAllowExternalTools && !readOnlyMemory2) {
+        throw new Error('External tools in read-only Memory 2 require an explicit reader.');
+    }
     if (readOnlyMemory2) {
         if (typeof memory2ReadOnlyReader?.readContext !== 'function'
             || typeof memory2ReadOnlyReader?.close !== 'function'
@@ -325,7 +330,9 @@ ${memoryToPrompt(memory)}
         const response = await ask({
             instructions: getInstructions(),
             input: memoryContext ? [...memoryContext.items, ...structuredClone(conversation)] : conversation,
-            tools: readOnlyMemory2 ? [] : memory2 ? tools.filter(tool => !memoryToolNames.has(tool.name)) : tools,
+            tools: readOnlyMemory2
+                ? (memory2ReadOnlyAllowExternalTools ? tools.filter(tool => !memoryToolNames.has(tool.name)) : [])
+                : memory2 ? tools.filter(tool => !memoryToolNames.has(tool.name)) : tools,
         });
         if (response?.status !== 'completed') lastRunAssessmentEligible = false;
         conversation.push(...(response.output ?? []));
@@ -363,7 +370,8 @@ ${memoryToPrompt(memory)}
         conversation.push({ role: 'user', content: userMessage });
 
         for (let iteration = 1; iteration <= maxToolIterations; iteration++) {
-            const { response, toolCalls } = await getModelResponse(readOnlyMemory2 ? [] : getTools(permissionPolicy), iteration);
+            const availableTools = readOnlyMemory2 && !memory2ReadOnlyAllowExternalTools ? [] : getTools(permissionPolicy);
+            const { response, toolCalls } = await getModelResponse(availableTools, iteration);
             if (toolCalls.length === 0) {
                 return [response.output_text, ...spotifyMessages].filter(Boolean).join('\n\n');
             }
@@ -400,12 +408,14 @@ ${memoryToPrompt(memory)}
                 diagnostic('tool_call', { iteration, tool: toolCall.name, arguments: safeArgumentSummary(args) });
                 let result;
                 try {
-                    if (readOnlyMemory2) {
+                    if (readOnlyMemory2 && memoryToolNames.has(toolCall.name)) {
+                        result = { success: false, error: { code: 'memory_write_not_authorized', message: 'Memory operations are disabled in this read-only session.' } };
+                    } else if (readOnlyMemory2 && !memory2ReadOnlyAllowExternalTools) {
                         result = { success: false, error: { code: 'tool_execution_disabled', message: 'Tool execution is disabled in this read-only session.' } };
                     } else if (memory2 && memoryToolNames.has(toolCall.name)) {
                         result = { success: false, error: { code: 'memory_write_not_authorized', message: 'Memory commands require direct terminal input.' } };
                     } else {
-                        result = await execute(toolCall.name, args, { memory, saveMemory: memory2 ? undefined : save,
+                        result = await execute(toolCall.name, args, { memory, saveMemory: memory2 || readOnlyMemory2 ? undefined : save,
                             permissionPolicy, sessionId, userMessage,
                             userMessageSource: currentSource });
                     }
