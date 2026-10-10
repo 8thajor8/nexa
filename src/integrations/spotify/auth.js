@@ -1,5 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { createServer } from 'node:http';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadSpotifyTokens, saveSpotifyTokens } from './token-store.js';
 
 export const spotifyScopes = Object.freeze([
@@ -11,6 +13,20 @@ export const spotifyScopes = Object.freeze([
 export const defaultSpotifyRedirectUri = 'http://127.0.0.1:8888/callback';
 const authorizeEndpoint = 'https://accounts.spotify.com/authorize';
 const tokenEndpoint = 'https://accounts.spotify.com/api/token';
+let activeAuthorizationFlow = null;
+let spotifyEnvironmentLoad;
+
+async function ensureSpotifyEnvironment(environment) {
+    if (environment !== process.env) return environment;
+    if (!spotifyEnvironmentLoad) {
+        const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
+        spotifyEnvironmentLoad = import('dotenv').then(({ config: loadDotenv }) => {
+            loadDotenv({ path: path.join(projectRoot, '.env'), override: false, quiet: true });
+        }).catch(() => {});
+    }
+    await spotifyEnvironmentLoad;
+    return environment;
+}
 
 export class SpotifyAuthError extends Error {
     constructor(code, message) {
@@ -103,6 +119,7 @@ function tokensFromResponse(payload, previous = {}) {
 }
 
 export async function exchangeSpotifyAuthorizationCode({ code, verifier, environment = process.env, fetchImpl = fetch, tokenStore = { save: saveSpotifyTokens } } = {}) {
+    await ensureSpotifyEnvironment(environment);
     const { clientId, redirectUri } = getSpotifyConfiguration(environment);
     const payload = await postTokenForm({
         client_id: clientId,
@@ -120,6 +137,7 @@ export async function exchangeSpotifyAuthorizationCode({ code, verifier, environ
 }
 
 export async function refreshSpotifyTokens({ refreshToken, environment = process.env, fetchImpl = fetch, tokenStore = { save: saveSpotifyTokens }, previous = {} } = {}) {
+    await ensureSpotifyEnvironment(environment);
     const { clientId } = getSpotifyConfiguration(environment);
     if (typeof refreshToken !== 'string' || !refreshToken) {
         throw new SpotifyAuthError('spotify_auth_required', 'Spotify todavía no está autorizado. Ejecutá npm run spotify:auth.');
@@ -136,6 +154,7 @@ export async function refreshSpotifyTokens({ refreshToken, environment = process
 
 export async function getSpotifyAccessToken({ environment = process.env, tokenStore = { load: loadSpotifyTokens, save: saveSpotifyTokens }, fetchImpl = fetch, now = Date.now, forceRefresh = false } = {}) {
     try {
+        await ensureSpotifyEnvironment(environment);
         const tokens = await tokenStore.load();
         if (!tokens?.refreshToken) {
             throw new SpotifyAuthError('spotify_auth_required', 'Spotify todavía no está autorizado. Ejecutá npm run spotify:auth.');
@@ -157,31 +176,98 @@ export async function getSpotifyAccessToken({ environment = process.env, tokenSt
     }
 }
 
-export async function authorizeSpotify({ environment = process.env, fetchImpl = fetch, tokenStore = { save: saveSpotifyTokens }, output = console.log } = {}) {
+/** Start one loopback PKCE flow. The returned URL is generated for this flow;
+ * completion contains token data for trusted process code only. */
+export async function startSpotifyAuthorizationFlow({ environment = process.env, fetchImpl = fetch,
+    tokenStore = { save: saveSpotifyTokens }, signal } = {}) {
+    await ensureSpotifyEnvironment(environment);
     const { clientId, redirectUri } = getSpotifyConfiguration(environment);
     const authorization = createSpotifyAuthorizationUrl({ clientId, redirectUri });
     const callback = new URL(redirectUri);
+    if (signal !== undefined && !(signal instanceof AbortSignal)) throw new TypeError('spotify_authorization_signal_invalid');
+    if (signal?.aborted) throw new SpotifyAuthError('spotify_authorization_cancelled', 'La autorización de Spotify fue cancelada.');
+    if (activeAuthorizationFlow) throw new SpotifyAuthError('spotify_authorization_in_progress', 'Ya hay una autorización de Spotify en curso.');
 
-    return new Promise((resolve, reject) => {
-        const server = createServer(async (request, response) => {
+    const owner = {};
+    activeAuthorizationFlow = owner;
+    let server;
+    let timeout;
+    let started = false;
+    let settled = false;
+    let callbackProcessing = false;
+    let resolveCompletion;
+    let rejectCompletion;
+    const completion = new Promise((resolve, reject) => {
+        resolveCompletion = resolve;
+        rejectCompletion = reject;
+    });
+    // A caller may cancel before awaiting completion. Keep that rejection
+    // handled while preserving the original promise for the caller.
+    completion.catch(() => {});
+
+    const result = await new Promise((resolve, reject) => {
+        const cleanup = () => {
+            clearTimeout(timeout);
+            signal?.removeEventListener('abort', onAbort);
+        };
+        const release = () => {
+            if (activeAuthorizationFlow === owner) activeAuthorizationFlow = null;
+        };
+        const finish = (error, value) => {
+            if (settled) return false;
+            settled = true;
+            cleanup();
+            const complete = () => {
+                release();
+                if (error) rejectCompletion(error);
+                else resolveCompletion(value);
+            };
+            if (started) server.close(complete);
+            else complete();
+            return true;
+        };
+        const failToStart = error => {
+            cleanup();
+            if (server?.listening) server.close();
+            release();
+            reject(error);
+        };
+        const onAbort = () => {
+            if (settled || callbackProcessing) return false;
+            const error = new SpotifyAuthError('spotify_authorization_cancelled', 'La autorización de Spotify fue cancelada.');
+            if (started) finish(error);
+            else failToStart(error);
+            return true;
+        };
+
+        server = createServer(async (request, response) => {
             const requestUrl = new URL(request.url, redirectUri);
             if (requestUrl.pathname !== callback.pathname) {
                 response.writeHead(404).end('Not found');
                 return;
             }
+            if (settled || callbackProcessing) {
+                response.writeHead(409).end('Authorization flow is no longer active.');
+                return;
+            }
             if (requestUrl.searchParams.get('state') !== authorization.state) {
                 response.writeHead(400).end('State validation failed.');
-                server.close();
-                reject(new SpotifyAuthError('spotify_state_mismatch', 'Spotify devolvió un estado OAuth inválido.'));
+                finish(new SpotifyAuthError('spotify_state_mismatch', 'Spotify devolvió un estado OAuth inválido.'));
+                return;
+            }
+            const providerError = requestUrl.searchParams.get('error');
+            if (providerError) {
+                response.writeHead(400).end('Spotify authorization was cancelled.');
+                finish(new SpotifyAuthError('spotify_authorization_denied', 'La autorización de Spotify fue cancelada o denegada.'));
                 return;
             }
             const code = requestUrl.searchParams.get('code');
             if (!code) {
                 response.writeHead(400).end('Spotify authorization was cancelled.');
-                server.close();
-                reject(new SpotifyAuthError('spotify_authorization_denied', 'La autorización de Spotify fue cancelada o denegada.'));
+                finish(new SpotifyAuthError('spotify_authorization_denied', 'La autorización de Spotify fue cancelada o denegada.'));
                 return;
             }
+            callbackProcessing = true;
             try {
                 const tokens = await exchangeSpotifyAuthorizationCode({
                     code,
@@ -192,26 +278,32 @@ export async function authorizeSpotify({ environment = process.env, fetchImpl = 
                 });
                 response.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' })
                     .end('Nexa ya quedó autorizada con Spotify. Podés cerrar esta pestaña.');
-                server.close();
-                resolve(tokens);
+                finish(null, tokens);
             } catch (error) {
                 response.writeHead(500).end('No se pudo completar Spotify OAuth. Revisá la terminal de Nexa.');
-                server.close();
-                reject(error);
+                finish(error);
             }
         });
-        let timeout;
         server.once('error', () => {
-            clearTimeout(timeout);
-            reject(new SpotifyAuthError('spotify_callback_unavailable', 'No se pudo abrir el callback local 127.0.0.1:8888.'));
+            const error = new SpotifyAuthError('spotify_callback_unavailable', 'No se pudo abrir el callback local 127.0.0.1:8888.');
+            if (started) finish(error);
+            else failToStart(error);
         });
         server.listen(Number(callback.port), '127.0.0.1', () => {
-            output(`Abrí este enlace para autorizar Nexa con Spotify:\n${authorization.url}`);
+            started = true;
+            timeout = setTimeout(() => finish(new SpotifyAuthError('spotify_authorization_timeout', 'Se agotó el tiempo de espera para autorizar Spotify.')),
+                5 * 60_000);
+            signal?.addEventListener('abort', onAbort, { once: true });
+            if (signal?.aborted) onAbort();
+            else resolve({ authorizationUrl: authorization.url, completion, cancel: onAbort });
         });
-        timeout = setTimeout(() => {
-            server.close();
-            reject(new SpotifyAuthError('spotify_authorization_timeout', 'Se agotó el tiempo de espera para autorizar Spotify.'));
-        }, 5 * 60_000);
-        server.once('close', () => clearTimeout(timeout));
     });
+    return result;
+}
+
+export async function authorizeSpotify({ environment = process.env, fetchImpl = fetch,
+    tokenStore = { save: saveSpotifyTokens }, output = console.log } = {}) {
+    const flow = await startSpotifyAuthorizationFlow({ environment, fetchImpl, tokenStore });
+    output(`Abrí este enlace para autorizar Nexa con Spotify:\n${flow.authorizationUrl}`);
+    return flow.completion;
 }
