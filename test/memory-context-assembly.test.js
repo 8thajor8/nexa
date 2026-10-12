@@ -85,6 +85,16 @@ test('only singular first-person self references orient Self; plural references 
     assert.equal((await repository.readSnapshot()).revision, current.revision);
 });
 
+test('natural first-person preference questions retrieve owner Memory2 without an explicit memory command', async () => {
+    const { repository, add } = fixture();
+    add({ subject: { type: 'owner' }, predicate: 'user.preference.editor',
+        object: { type: 'text', value: 'Mi editor habitual es Windsurf.' } });
+    const provider = providerFor(repository);
+    const result = outputOf(await provider.read({ message: '¿Qué editor uso normalmente?' }));
+    assert.equal(result.orientation.mode, 'self');
+    assert.deepEqual(result.assertions.map(item => item.object.value), ['Mi editor habitual es Windsurf.']);
+});
+
 test('recent continuity uses only a unique verified entity from bounded prior user turns', async () => {
     const { repository, add } = fixture();
     add({ subject: { type: 'entity', entity_type: 'person', id: coti }, object: { type: 'text', value: 'Synthetic architecture plan.' } });
@@ -234,7 +244,7 @@ test('no oriented or relevant memory returns no context item, and prompt injecti
 
 test('agent continuity is bounded to recent user turns and never persists retrieval orientation', async () => {
     const { repository, add, current } = fixture();
-    add({ subject: { type: 'entity', entity_type: 'person', id: coti }, object: { type: 'text', value: 'Continuity architecture fact.' } });
+    add({ subject: { type: 'entity', entity_type: 'person', id: coti }, object: { type: 'text', value: 'Continuity fact.' } });
     const requests = [];
     const agent = await createAgent({ memoryBackend: 'memory2', memory2Repository: repository,
         ask: async request => { requests.push(structuredClone(request)); return final('ok'); }, getTools: () => [],
@@ -243,12 +253,12 @@ test('agent continuity is bounded to recent user turns and never persists retrie
     await agent.run('Algo relacionado con arquitectura.');
     const secondPayload = JSON.parse(requests[1].input.find(item => item.type === 'function_call_output').output);
     assert.equal(secondPayload.orientation.mode, 'continuity');
-    assert.ok(JSON.stringify(secondPayload).includes('Continuity architecture fact.'));
+    assert.ok(JSON.stringify(secondPayload).includes('Continuity fact.'));
     for (const turn of ['Sin personas.', 'Otra consulta.', 'Una más.', 'Nada relacionado.']) await agent.run(turn);
     await agent.run('Algo relacionado con arquitectura.');
     assert.equal(requests.at(-1).input.some(item => item.type === 'function_call_output'), false);
     assert.equal(current.revision, 4);
-    assert.equal(current.snapshot.assertions.find(item => item.object?.value === 'Continuity architecture fact.').status, 'active');
+    assert.equal(current.snapshot.assertions.find(item => item.object?.value === 'Continuity fact.').status, 'active');
     await agent.close();
 });
 

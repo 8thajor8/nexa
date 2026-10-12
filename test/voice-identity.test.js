@@ -65,9 +65,67 @@ test('injected provider-independent renderer produces duration-preserving stereo
 test('official Signalsmith WASM renderer processes on an inaudible real-time AudioContext without TTS or audible playback', async () => {
     const source = sourceTone(720);
     const renderer = createSignalsmithVoiceRenderer();
-    const shifted = await renderer.render(source.samples, source.sampleRate);
-    assert.equal(shifted.length, source.samples.length);
-    assert.ok(measureSamples(shifted, source.samples).rmsDifference > 0.002);
-    assert.ok(measureSamples(shifted).peak < 1);
-    assert.equal(measureSamples(shifted).nonFiniteSamples, 0);
+    try {
+        const shifted = await renderer.render(source.samples, source.sampleRate);
+        assert.equal(shifted.length, source.samples.length);
+        assert.ok(measureSamples(shifted, source.samples).rmsDifference > 0.002);
+        assert.ok(measureSamples(shifted).peak < 1);
+        assert.equal(measureSamples(shifted).nonFiniteSamples, 0);
+    } finally { await renderer.close(); }
+});
+
+test('identity renderer reports an unavailable local browser with a safe code', async () => {
+    const source = sourceTone(120);
+    const renderer = createSignalsmithVoiceRenderer({ browserType: { async launch() { throw new Error('private executable path'); } } });
+    await assert.rejects(renderer.render(source.samples, source.sampleRate), error => error.code === 'voice_identity_browser_unavailable');
+    await renderer.close();
+});
+
+test('identity renderer reuses one browser page across serialized renders and closes its resources', async () => {
+    const source = sourceTone(120);
+    let launches = 0;
+    let pages = 0;
+    let navigations = 0;
+    let pageCloses = 0;
+    let browserCloses = 0;
+    let activeEvaluations = 0;
+    let maxEvaluations = 0;
+    const browser = {
+        async newPage() {
+            pages++;
+            return {
+                async goto() { navigations++; },
+                async waitForFunction() {},
+                async evaluate(_operation, options) {
+                    activeEvaluations++;
+                    maxEvaluations = Math.max(maxEvaluations, activeEvaluations);
+                    await new Promise(resolve => setTimeout(resolve, 5));
+                    activeEvaluations--;
+                    return { output: options.source, latencySeconds: 0.01, processingMs: 7,
+                        setupMs: 3, captureWaitMs: 4, capturedFrames: options.source.length, alignedOffset: 0 };
+                },
+                async close() { pageCloses++; },
+            };
+        },
+        async close() { browserCloses++; },
+    };
+    const renderer = createSignalsmithVoiceRenderer({ browserType: {
+        async launch() { launches++; return browser; },
+    } });
+    const [first, second] = await Promise.all([
+        renderer.render(source.samples, source.sampleRate),
+        renderer.render(source.samples, source.sampleRate),
+    ]);
+    assert.deepEqual(first, second);
+    assert.equal(launches, 1);
+    assert.equal(pages, 1);
+    assert.equal(navigations, 1);
+    assert.equal(maxEvaluations, 1);
+    assert.equal(renderer.getLastMetrics().dspProcessingMs, 7);
+    assert.equal(renderer.getLastMetrics().audioCaptureWaitMs, 4);
+    assert.equal(renderer.getLastMetrics().browserStartupMs, 0);
+    assert.equal(renderer.getLastMetrics().rendererPreparationMs, 0);
+    await renderer.close();
+    assert.equal(pageCloses, 1);
+    assert.equal(browserCloses, 1);
 });

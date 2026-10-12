@@ -26,6 +26,44 @@ test('open_app launches only a whitelisted application target', async () => {
     assert.deepEqual(calls, [[windowsAppWhitelist.notepad[0].executable, []]]);
 });
 
+test('open_app resolves Calculator by its natural Spanish Windows name through the fixed whitelist', async () => {
+    const calls = [];
+    const traces = [];
+    const result = await openApp({
+        args: { app: 'Calculadora de Windows' },
+        platform: 'win32',
+        loadCatalog: async () => ({ version: 1, apps: [] }),
+        launchProcess: async (...args) => calls.push(args),
+        diagnostic: (event, details) => traces.push({ event, details }),
+    });
+
+    assert.equal(result.success, true);
+    assert.deepEqual(calls, [[windowsAppWhitelist.calculator[0].executable, []]]);
+    assert.deepEqual(traces.filter(item => item.event === 'windows_app_resolution')
+        .map(item => item.details), [{ tool: 'open_app', appQuery: 'calculadora de windows',
+            resolution: 'not_found', target: 'whitelist' }]);
+});
+
+test('open_app resolves Google Chrome and Explorador de archivos through fixed whitelist targets', async () => {
+    for (const [app, target] of [
+        ['Spotify', 'spotify'],
+        ['Google Chrome', 'chrome'],
+        ['Explorador de archivos', 'explorer'],
+    ]) {
+        const calls = [];
+        const result = await openApp({
+            args: { app },
+            platform: 'win32',
+            loadCatalog: async () => ({ version: 1, apps: [] }),
+            launchProcess: async (...args) => calls.push(args),
+        });
+        assert.equal(result.success, true, app);
+        assert.equal(path.win32.basename(calls[0][0]).toLowerCase(),
+            path.win32.basename(windowsAppWhitelist[target][0].executable).toLowerCase(), app);
+        assert.deepEqual(calls[0][1], [], app);
+    }
+});
+
 test('open_app rejects arbitrary commands without launching a process', async () => {
     let launched = false;
     const result = await openApp({

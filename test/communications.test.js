@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
 import { createCommunicationsService } from '../src/communications/service.js';
 import { getMicrosoftConfiguration, microsoftGraphScopes } from '../src/communications/config.js';
 import { createMicrosoftGraphProvider, normalizeMailbox } from '../src/communications/providers/microsoft-graph.js';
-import { createMicrosoftAuth, microsoftTokenPath } from '../src/integrations/microsoft/auth.js';
+import { createMicrosoftAuth, MicrosoftAuthError, microsoftAuthorizationPage, microsoftTokenPath, resolveMicrosoftTokenPath } from '../src/integrations/microsoft/auth.js';
 import { communicationsRegistrations } from '../src/communications/tools.js';
 import { checkToolPermission, defaultPermissionPolicy } from '../src/tools/permissions.js';
 import { localToolRegistry } from '../src/tools/index.js';
@@ -16,6 +17,8 @@ test('Microsoft config validates client/tenant and normalizes configured shared 
     assert.equal(config.success, true);
     assert.deepEqual(config.sharedMailboxes, ['sales@example.com', 'hr@example.com']);
     assert.equal(getMicrosoftConfiguration({ MICROSOFT_CLIENT_ID: '' }).success, false);
+    assert.equal(getMicrosoftConfiguration({}).error.code, 'microsoft_configuration_missing');
+    assert.equal(getMicrosoftConfiguration({ ...environment, MICROSOFT_TENANT_ID: 'bad-tenant' }).error.code, 'microsoft_configuration_invalid');
     assert.equal(getMicrosoftConfiguration({ ...environment, MICROSOFT_SHARED_MAILBOXES: 'not-an-address' }).success, false);
 });
 
@@ -53,9 +56,23 @@ test('communications service delegates to an interchangeable email provider', as
 test('Microsoft Graph provider reports a disconnected state without making requests', async () => {
     let calls = 0;
     const provider = createMicrosoftGraphProvider({ environment, auth: { async getAccessToken() { return null; } }, fetchImpl: async () => { calls++; } });
-    assert.deepEqual(await provider.getConnectionStatus(), { success: true, connected: false, provider: 'microsoft' });
+    assert.deepEqual(await provider.getConnectionStatus(), { success: true, connected: false, provider: 'microsoft', reason: 'no_session' });
     assert.equal((await provider.getMailboxes()).error.code, 'email_not_connected');
+    const missingConfig = createMicrosoftGraphProvider({ environment: {}, auth: { async getAccessToken() { throw new Error('must not be called'); } }, fetchImpl: async () => { calls++; } });
+    assert.equal((await missingConfig.getConnectionStatus()).error.code, 'microsoft_configuration_missing');
+    const invalidConfig = createMicrosoftGraphProvider({ environment: { ...environment, MICROSOFT_TENANT_ID: 'invalid' }, auth: { async getAccessToken() {} }, fetchImpl: async () => { calls++; } });
+    assert.equal((await invalidConfig.getConnectionStatus()).error.code, 'microsoft_configuration_invalid');
+    const expiredSession = createMicrosoftGraphProvider({ environment, auth: { async getAccessToken() { throw new MicrosoftAuthError('microsoft_authorization_required', 'safe'); } }, fetchImpl: async () => { calls++; } });
+    assert.equal((await expiredSession.getConnectionStatus()).error.code, 'microsoft_authorization_required');
+    const dpapiFailure = createMicrosoftGraphProvider({ environment, auth: { async getAccessToken() { throw new MicrosoftAuthError('microsoft_dpapi_unavailable', 'safe'); } }, fetchImpl: async () => { calls++; } });
+    assert.equal((await dpapiFailure.getConnectionStatus()).error.code, 'microsoft_dpapi_unavailable');
     assert.equal(calls, 0);
+});
+
+test('Desktop and CLI can resolve the same repository-root Microsoft cache path', () => {
+    const syntheticRoot = path.resolve('/synthetic/nexa');
+    assert.equal(resolveMicrosoftTokenPath(syntheticRoot), path.join(syntheticRoot, 'data', 'microsoft-token.json'));
+    assert.throws(() => resolveMicrosoftTokenPath('relative-root'), /absolute/u);
 });
 
 test('lists the personal mailbox and only configured shared mailboxes validated by Graph', async () => {
@@ -85,6 +102,21 @@ test('Graph error responses are sanitized and do not expose response bodies or t
     assert(!JSON.stringify(result).includes('private body'));
 });
 
+test('Microsoft status preserves Graph authorization, access and network diagnostics', async () => {
+    const responseFor = status => ({ ok: false, status, async json() { throw new Error('private Graph body'); } });
+    for (const [status, expectedCode] of [[401, 'microsoft_authorization_required'], [403, 'microsoft_access_denied'], [503, 'microsoft_graph_unavailable']]) {
+        const provider = createMicrosoftGraphProvider({ environment, auth: { async getAccessToken() { return 'test-token'; } }, fetchImpl: async () => responseFor(status) });
+        const result = await provider.getConnectionStatus();
+        assert.equal(result.success, false);
+        assert.equal(result.error.code, expectedCode);
+        assert(!JSON.stringify(result).includes('private Graph body'));
+    }
+    const networkProvider = createMicrosoftGraphProvider({ environment, auth: { async getAccessToken() { return 'test-token'; } }, fetchImpl: async () => { throw new Error('private network details'); } });
+    const networkResult = await networkProvider.getConnectionStatus();
+    assert.equal(networkResult.error.code, 'microsoft_network_error');
+    assert(!JSON.stringify(networkResult).includes('private network details'));
+});
+
 test('MSAL uses current-user protected cache and never exposes tokens to callers', async () => {
     let persistenceConfig;
     let msalConfig;
@@ -103,6 +135,36 @@ test('MSAL uses current-user protected cache and never exposes tokens to callers
     assert.match(microsoftTokenPath, /data[\\/]microsoft-token\.json$/u);
 });
 
+test('Microsoft auth accepts an absolute Desktop cache override before initialization only', async () => {
+    let persistenceConfig;
+    const auth = createMicrosoftAuth({ environment, tokenPath: 'test-cache.json',
+        persistenceFactory: async config => { persistenceConfig = config; return {}; },
+        cachePluginFactory: () => ({}),
+        clientFactory: () => ({ getTokenCache: () => ({ async getAllAccounts() { return []; } }) }),
+    });
+    assert.equal(auth.configureCachePath('/synthetic/nexa/data/microsoft-token.json'), '/synthetic/nexa/data/microsoft-token.json');
+    assert.equal(await auth.getAccessToken(), null);
+    assert.equal(persistenceConfig.cachePath, '/synthetic/nexa/data/microsoft-token.json');
+    assert.throws(() => auth.configureCachePath('/other/cache.json'), error => error.code === 'microsoft_auth_already_initialized');
+    const relativeAuth = createMicrosoftAuth({ environment });
+    assert.throws(() => relativeAuth.configureCachePath('relative-cache.json'), /absolute/u);
+});
+
+test('Microsoft auth distinguishes DPAPI failures from other protected-storage failures without leaking details', async () => {
+    for (const [failure, expectedCode] of [
+        [new Error('DPAPI internal details and secret path'), 'microsoft_dpapi_unavailable'],
+        [new Error('disk internal details and secret path'), 'microsoft_token_storage_unavailable'],
+    ]) {
+        const auth = createMicrosoftAuth({ environment, persistenceFactory: async () => { throw failure; } });
+        await assert.rejects(auth.getAccessToken(), error => {
+            assert.equal(error.code, expectedCode);
+            assert(!error.message.includes('internal details'));
+            assert(!error.message.includes('secret path'));
+            return true;
+        });
+    }
+});
+
 test('explicit OAuth connection uses the minimal scopes and sanitizes tenant consent failures', async () => {
     let request;
     const auth = createMicrosoftAuth({ environment,
@@ -113,6 +175,11 @@ test('explicit OAuth connection uses the minimal scopes and sanitizes tenant con
     assert.deepEqual(connected, { success: true, account: { username: 'jor@example.com' } });
     assert.deepEqual(request.scopes, [...microsoftGraphScopes]);
     assert.equal(request.prompt, 'select_account');
+    assert.match(request.successTemplate, /Nexa · Microsoft/u);
+    assert.match(request.successTemplate, /Content-Security-Policy/u);
+    assert.doesNotMatch(request.successTemplate, /access_token|refresh_token|authorization_code/iu);
+    assert.match(microsoftAuthorizationPage('cancelled'), /Conexión cancelada/u);
+    assert.equal(request.errorTemplate, microsoftAuthorizationPage('failed'));
 
     const denied = createMicrosoftAuth({ environment, persistenceFactory: async () => ({}), cachePluginFactory: () => ({}),
         clientFactory: () => ({ async acquireTokenInteractive() { const error = new Error('secret diagnostic'); error.errorCode = 'consent_required'; throw error; } }),

@@ -19,6 +19,7 @@ const SOURCE_POLICIES = Object.freeze({
 // the trusted tool name by the runtime, never from payload-supplied metadata.
 const TOOL_SOURCES = Object.freeze({
     get_email_connection_status: 'email', list_email_mailboxes: 'email',
+    lifeguard_search_incidents: 'api:lifeguard', lifeguard_read_incident: 'api:lifeguard',
     list_recent_emails: 'email', search_emails: 'email', get_email: 'email',
     list_calendar_events: 'calendar', get_calendar_event: 'calendar',
     search_web: 'web', web_search: 'web',

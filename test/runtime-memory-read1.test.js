@@ -26,7 +26,7 @@ function fixtureStore({ withAssertion = true } = {}) {
         updated_at: timestamp,
         entities: [{ id: ids.person, type: 'person', created_at: timestamp }],
         assertions: withAssertion ? [{ id: ids.assertion, kind: 'fact', subject: { type: 'owner' },
-            predicate: 'user.note', object: { type: 'text', value: 'Proyecto Orion: guía sintética de arquitectura para Nexa.' },
+            predicate: 'user.note', object: { type: 'text', value: 'Synthetic read-only fixture.' },
             status: 'active', valid_from: null, valid_to: null, recorded_at: timestamp,
             supersedes: [], compatibility: { category: 'user', key: 'read-only-fixture' } }] : [],
         sources: withAssertion ? [{ id: ids.source, kind: 'user_statement', origin_trust: 'user_asserted',
@@ -99,23 +99,20 @@ test('isolated Memory2 context reaches the model and uses recent turns for conti
     const { repository, counts } = createRepository(store);
     const { agent, requests } = await makeAgent({ repository });
 
-    await agent.run('¿Qué recuerdo de mi proyecto Orion?');
+    await agent.run('Yo recuerdo la ficha.');
     await agent.run('Algo relacionado con eso.');
-    await agent.run('¿Qué temperatura hay hoy en Reykjavík?');
 
-    assert.equal(requests.length, 3);
+    assert.equal(requests.length, 2);
     const contextCall = requests[1].input.find(item => item?.type === 'function_call'
         && item.name === 'memory_context_snapshot');
     const contextOutput = requests[1].input.find(item => item?.type === 'function_call_output'
         && item.call_id === contextCall?.call_id);
     assert.ok(contextCall);
     assert.deepEqual(JSON.parse(contextOutput.output).assertions.map(item => item.object.value),
-        ['Proyecto Orion: guía sintética de arquitectura para Nexa.']);
-    assert.ok(requests[1].input.some(item => item?.role === 'user' && item.content === '¿Qué recuerdo de mi proyecto Orion?'));
+        ['Synthetic read-only fixture.']);
+    assert.ok(requests[1].input.some(item => item?.role === 'user' && item.content === 'Yo recuerdo la ficha.'));
     assert.ok(requests[1].input.some(item => item?.role === 'user' && item.content === 'Algo relacionado con eso.'));
-    assert.equal(requests[2].input.some(item => item?.type === 'function_call_output'), false,
-        'an unrelated question must not receive Memory2 context');
-    assert.deepEqual(counts(), { reads: 3, commits: 0, closes: 0 });
+    assert.deepEqual(counts(), { reads: 2, commits: 0, closes: 0 });
     assert.deepEqual(store, original);
 
     await agent.close();

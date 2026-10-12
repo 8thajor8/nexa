@@ -1,8 +1,9 @@
 import { chromium } from 'playwright';
 import { createServer } from 'node:http';
-import { readFile } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { performance } from 'node:perf_hooks';
 import { speechConfig } from './config.js';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -105,23 +106,73 @@ function createRendererServer() {
 // so use an active, inaudible AudioContext and capture its exact output in memory.
 export function createSignalsmithVoiceRenderer({ browserType = chromium } = {}) {
     let lastMetrics = null;
-    return {
-        async render(samples, sampleRate, settings = nexaVoiceIdentity) {
-            const server = createRendererServer();
-            await new Promise((resolve, reject) => {
-                server.once('error', reject);
-                server.listen(0, '127.0.0.1', resolve);
-            });
-            let browser;
+    let browserPromise = null;
+    let serverPromise = null;
+    let pagePromise = null;
+    let renderQueue = Promise.resolve();
+    async function launchBrowser() {
+        const options = { headless: true, args: ['--autoplay-policy=no-user-gesture-required'] };
+        if (typeof browserType.executablePath === 'function') {
             try {
-                browser = await browserType.launch({ headless: true, args: ['--autoplay-policy=no-user-gesture-required'] });
+                await access(browserType.executablePath());
+                try { return await browserType.launch(options); }
+                catch { /* Fall through to the installed Chrome channel. */ }
+            } catch { /* The Playwright-pinned Chromium may not be installed. */ }
+        }
+        try { return await browserType.launch({ ...options, channel: 'chrome' }); }
+        catch { throw Object.assign(new Error('voice_identity_browser_unavailable'), { code: 'voice_identity_browser_unavailable' }); }
+    }
+    function getBrowser() {
+        if (!browserPromise) browserPromise = launchBrowser().catch(error => { browserPromise = null; throw error; });
+        return browserPromise;
+    }
+    function ensureServer() {
+        if (!serverPromise) {
+            const server = createRendererServer();
+            serverPromise = new Promise((resolve, reject) => {
+                server.once('error', reject);
+                server.listen(0, '127.0.0.1', () => resolve(server));
+            }).catch(error => { serverPromise = null; throw error; });
+        }
+        return serverPromise;
+    }
+    async function ensurePage(server) {
+        const initialize = !pagePromise;
+        if (!pagePromise) {
+            pagePromise = (async () => {
+                const browserStartedAt = performance.now();
+                const browser = await getBrowser();
+                const browserStartupMs = Math.round(performance.now() - browserStartedAt);
+                const pageSetupStartedAt = performance.now();
                 const page = await browser.newPage();
-                await page.goto(`http://127.0.0.1:${server.address().port}/`, { waitUntil: 'load' });
-                await page.waitForFunction(() => typeof window.Stretch === 'function');
-                const rendered = await page.evaluate(async ({ source, sampleRate: rate, pitch, formant, baseHz }) => {
+                try {
+                    await page.goto(`http://127.0.0.1:${server.address().port}/`, { waitUntil: 'load' });
+                    await page.waitForFunction(() => typeof window.Stretch === 'function');
+                    return { page, browserStartupMs, rendererPreparationMs: Math.round(performance.now() - pageSetupStartedAt) };
+                } catch (error) {
+                    try { await page.close(); } catch { /* Preserve the setup failure. */ }
+                    throw error;
+                }
+            })().catch(error => { pagePromise = null; throw error; });
+        }
+        const prepared = await pagePromise;
+        return initialize ? prepared : { ...prepared, browserStartupMs: 0, rendererPreparationMs: 0 };
+    }
+    async function renderOnce(samples, sampleRate, settings) {
+        lastMetrics = null;
+        const totalStartedAt = performance.now();
+        const serverStartedAt = performance.now();
+        const server = await ensureServer();
+        const serverStartupMs = Math.round(performance.now() - serverStartedAt);
+        const preparedPage = await ensurePage(server);
+        let rendered;
+        try {
+            rendered = await preparedPage.page.evaluate(async ({ source, sampleRate: rate, pitch, formant, baseHz }) => {
                     const input = Float32Array.from(source);
                     const started = performance.now();
                     const context = new AudioContext({ sampleRate: rate });
+            try {
+                const contextCreatedAt = performance.now();
                     const audioBuffer = context.createBuffer(1, input.length, rate);
                     audioBuffer.copyToChannel(input, 0);
                     const stretch = await window.Stretch(context, {
@@ -139,20 +190,37 @@ export function createSignalsmithVoiceRenderer({ browserType = chromium } = {}) 
                     capture.connect(context.destination);
                     const chunks = [];
                     let firstFrame = null;
+                    let capturedSamples = 0;
+                    let requiredEndFrame = null;
+                    let resolveCapture;
+                    const captureComplete = new Promise(resolve => { resolveCapture = resolve; });
                     capture.port.onmessage = event => {
                         firstFrame ??= event.data.frame;
-                        chunks.push(new Float32Array(event.data.samples));
+                        const samples = new Float32Array(event.data.samples);
+                        chunks.push(samples);
+                        capturedSamples += samples.length;
+                        if (requiredEndFrame !== null && firstFrame + capturedSamples >= requiredEndFrame) resolveCapture(true);
                     };
                     stretch.connect(capture);
                     await context.resume();
                     const outputTime = context.currentTime + 0.2;
                     const outputFrame = Math.round(outputTime * rate);
+                    requiredEndFrame = outputFrame + audioBuffer.length;
+            const setupMs = performance.now() - contextCreatedAt;
+            const captureStartedAt = performance.now();
                     await stretch.schedule({
                         active: true, input: 0, output: outputTime, rate: 1,
                         semitones: pitch, formantSemitones: formant,
                         formantCompensation: false, formantBaseHz: baseHz,
                     });
-                    await new Promise(resolve => setTimeout(resolve, (audioBuffer.duration + 0.9) * 1000));
+                    if (firstFrame !== null && firstFrame + capturedSamples >= requiredEndFrame) resolveCapture(true);
+                    let captureTimer;
+                    const captureDeadline = new Promise(resolve => {
+                        captureTimer = setTimeout(() => resolve(false), Math.max(5_000, (audioBuffer.duration + 2) * 1_000));
+                    });
+                    const capturedAllFrames = await Promise.race([captureComplete, captureDeadline]);
+                    clearTimeout(captureTimer);
+                    if (!capturedAllFrames) throw new Error('signalsmith_capture_timeout');
                     const captured = new Float32Array(chunks.reduce((count, chunk) => count + chunk.length, 0));
                     let offset = 0;
                     for (const chunk of chunks) { captured.set(chunk, offset); offset += chunk.length; }
@@ -162,23 +230,56 @@ export function createSignalsmithVoiceRenderer({ browserType = chromium } = {}) 
                     else output.set(captured.subarray(0, output.length), -alignedOffset);
                     if (firstFrame === null || captured.length < outputFrame - firstFrame + output.length) throw new Error('signalsmith_capture_incomplete');
                     const processingMs = performance.now() - started;
-                    await context.close();
-                    return { output: Array.from(output), latencySeconds, processingMs, capturedFrames: captured.length, alignedOffset };
+            return { output: Array.from(output), latencySeconds, processingMs, setupMs,
+                captureWaitMs: performance.now() - captureStartedAt, capturedFrames: captured.length, alignedOffset };
+            } finally {
+                await context.close();
+            }
                 }, {
                     source: Array.from(samples), sampleRate,
                     pitch: settings.pitchSemitones,
                     formant: settings.formantSemitones,
                     baseHz: settings.formantBaseHz,
                 });
-                await page.close();
-                if (rendered.output.length !== samples.length || rendered.output.every(value => value === 0)) throw new Error(`signalsmith_render_invalid:${JSON.stringify({ output: rendered.output.length, captured: rendered.capturedFrames, offset: rendered.alignedOffset })}`);
-                lastMetrics = { processingMs: rendered.processingMs, algorithmLatencyMs: rendered.latencySeconds * 1000 };
-                const output = Float32Array.from(rendered.output);
-                return output;
-            } finally {
-                if (browser) await browser.close();
-                await new Promise(resolve => server.close(resolve));
-            }
+        } catch (error) {
+            const failedPage = pagePromise;
+            pagePromise = null;
+            try { if (failedPage) await (await failedPage).page.close(); } catch { /* Preserve the rendering failure. */ }
+            throw error;
+        }
+        if (rendered.output.length !== samples.length || rendered.output.every(value => value === 0)) throw new Error(`signalsmith_render_invalid:${JSON.stringify({ output: rendered.output.length, captured: rendered.capturedFrames, offset: rendered.alignedOffset })}`);
+        lastMetrics = { serverStartupMs, browserStartupMs: preparedPage.browserStartupMs, rendererPreparationMs: preparedPage.rendererPreparationMs,
+            dspProcessingMs: Math.round(rendered.processingMs), rendererTotalMs: Math.round(performance.now() - totalStartedAt),
+            dspSetupMs: Math.round(rendered.setupMs), audioCaptureWaitMs: Math.round(rendered.captureWaitMs),
+            algorithmLatencyMs: Math.round(rendered.latencySeconds * 1000) };
+        return Float32Array.from(rendered.output);
+    }
+    function render(samples, sampleRate, settings = nexaVoiceIdentity) {
+        const task = renderQueue.then(() => renderOnce(samples, sampleRate, settings));
+        renderQueue = task.then(() => undefined, () => undefined);
+        return task;
+    }
+    return {
+        render,
+        async close() {
+            const cleanup = renderQueue.then(async () => {
+                const pendingPage = pagePromise;
+                const pendingServer = serverPromise;
+                const pendingBrowser = browserPromise;
+                pagePromise = null;
+                serverPromise = null;
+                browserPromise = null;
+                if (pendingPage) { try { await (await pendingPage).page.close(); } catch { /* Shutdown remains best effort. */ } }
+                if (pendingServer) {
+                    try {
+                        const server = await pendingServer;
+                        await new Promise(resolve => server.close(resolve));
+                    } catch { /* Shutdown remains best effort. */ }
+                }
+                if (pendingBrowser) { try { await (await pendingBrowser).close(); } catch { /* Shutdown remains best effort. */ } }
+            });
+            renderQueue = cleanup.then(() => undefined, () => undefined);
+            await cleanup;
         },
         getLastMetrics() { return lastMetrics ? { ...lastMetrics } : null; },
     };
@@ -260,23 +361,48 @@ function encodeStereoPcm16Wav(samples, sampleRate) {
 }
 
 export function createVoiceIdentityProcessor({ renderer = createSignalsmithVoiceRenderer() } = {}) {
+    let lastMetrics = null;
     return {
         async process(audio, { enabled = nexaVoiceIdentity.enabled } = {}) {
             if (!Buffer.isBuffer(audio) && !(audio instanceof Uint8Array)) throw new TypeError('invalid_audio_buffer');
-            if (!enabled) return Buffer.from(audio);
-            const { samples, sampleRate } = parseMonoPcm16Wav(Buffer.from(audio));
-            const shifted = await renderer.render(samples, sampleRate, nexaVoiceIdentity);
-            if (!(shifted instanceof Float32Array) || shifted.length !== samples.length || shifted.some(value => !Number.isFinite(value))) throw new TypeError('invalid_signalsmith_output');
-            const companion = processSecondary(samples, shifted, sampleRate, nexaVoiceIdentity);
-            const stereo = processSpatialStereo(companion, sampleRate, nexaVoiceIdentity);
-            const result = encodeStereoPcm16Wav(stereo, sampleRate);
-            // Validate the final artifact format and duration before storage.
-            if (result.toString('ascii', 0, 4) !== 'RIFF' || result.toString('ascii', 8, 12) !== 'WAVE'
-                || result.readUInt16LE(22) !== 2 || result.readUInt16LE(34) !== 16
-                || result.readUInt32LE(24) !== sampleRate || result.readUInt32LE(40) !== samples.length * 4) {
-                throw new TypeError('invalid_voice_identity_wav');
+            lastMetrics = null;
+            const startedAt = performance.now();
+            if (!enabled) {
+                lastMetrics = { totalMs: Math.round(performance.now() - startedAt), rendererPreparationMs: 0,
+                    browserStartupMs: 0, serverStartupMs: 0, dspProcessingMs: 0, postProcessingMs: 0 };
+                return Buffer.from(audio);
             }
-            return result;
+            let postProcessingMs = 0;
+            let rendererMetrics = {};
+            try {
+                const { samples, sampleRate } = parseMonoPcm16Wav(Buffer.from(audio));
+                const shifted = await renderer.render(samples, sampleRate, nexaVoiceIdentity);
+                rendererMetrics = renderer.getLastMetrics?.() ?? {};
+                if (!(shifted instanceof Float32Array) || shifted.length !== samples.length || shifted.some(value => !Number.isFinite(value))) throw new TypeError('invalid_signalsmith_output');
+                const postStartedAt = performance.now();
+                const companion = processSecondary(samples, shifted, sampleRate, nexaVoiceIdentity);
+                const stereo = processSpatialStereo(companion, sampleRate, nexaVoiceIdentity);
+                const result = encodeStereoPcm16Wav(stereo, sampleRate);
+                postProcessingMs = Math.round(performance.now() - postStartedAt);
+                // Validate the final artifact format and duration before storage.
+                if (result.toString('ascii', 0, 4) !== 'RIFF' || result.toString('ascii', 8, 12) !== 'WAVE'
+                    || result.readUInt16LE(22) !== 2 || result.readUInt16LE(34) !== 16
+                    || result.readUInt32LE(24) !== sampleRate || result.readUInt32LE(40) !== samples.length * 4) {
+                    throw new TypeError('invalid_voice_identity_wav');
+                }
+                return result;
+            } finally {
+                lastMetrics = { totalMs: Math.round(performance.now() - startedAt),
+                    serverStartupMs: rendererMetrics.serverStartupMs ?? null,
+                    browserStartupMs: rendererMetrics.browserStartupMs ?? null,
+                    rendererPreparationMs: rendererMetrics.rendererPreparationMs ?? null,
+                    dspProcessingMs: rendererMetrics.dspProcessingMs ?? null,
+                    dspSetupMs: rendererMetrics.dspSetupMs ?? null,
+                    audioCaptureWaitMs: rendererMetrics.audioCaptureWaitMs ?? null,
+                    rendererTotalMs: rendererMetrics.rendererTotalMs ?? null, postProcessingMs };
+            }
         },
+        close() { return renderer.close?.(); },
+        getLastMetrics() { return lastMetrics ? { ...lastMetrics } : null; },
     };
 }

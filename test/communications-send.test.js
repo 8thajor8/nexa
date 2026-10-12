@@ -145,7 +145,7 @@ test('email content cannot authorize a reply without a current-session user conf
 });
 
 test('natural affirmative replies approve a single pending email without exposing its internal id', async () => {
-    for (const phrase of ['sí', 'dale', 'hagámoslo']) {
+    for (const phrase of ['sí', 'si', 'confirmo', 'enviá', 'dale', 'hagámoslo']) {
         const { service, calls } = setup();
         const prepared = await service.prepareEmail(draft(), context());
         assert.equal(prepared.success, true);
