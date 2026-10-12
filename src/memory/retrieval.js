@@ -15,7 +15,7 @@ export const MEMORY_RETRIEVAL_LIMITS = Object.freeze({
 const QUERY_KEYS = ['entityIds', 'includeSelf', 'predicates', 'relationPredicates', 'statuses', 'limits', 'relevanceText'];
 const LIMIT_KEYS = Object.keys(MEMORY_RETRIEVAL_LIMITS);
 const VALID_STATUSES = Object.freeze(['active', 'superseded']);
-const QUERY_STOP_WORDS = new Set(('a al algo as at con de del desde el en for from he her how i in is it la las le lo los me mi mis my of on or para por que se she sobre the this to un una uno y yo you your do what where which who about are can describe tell use using related remember have has').split(' '));
+const QUERY_STOP_WORDS = new Set(('a al algo as at con de del desde el en es for from he her how i in is it la las le lo los me mi mis my of on or para por que se she sobre the this to un una uno y yo you your do what where which who about are can describe tell use using related remember have has usuario usuarios usuaria usuarias ficticio ficticia ficticios ficticias prefiero prefiere prefieren prefiera preferir preferencia preferencias recuerdo recuerdos recuerda recuerdas recuerden recuerde tenes tienes tiene tienen sabes sabe conozco conoces conoce conocen informacion memoria memorias user users owner owners fictitious prefer prefers preferred remembers recall recalls knows know knowledge').split(' '));
 
 function assertAllowedObject(value, keys, path) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('memory_retrieval_invalid');
@@ -61,8 +61,18 @@ function uniqueSorted(values) { return [...new Set(values)].sort(compareText); }
 
 function relevanceTokens(text) {
     if (typeof text !== 'string') return [];
-    return [...new Set(text.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().match(/[\p{L}\p{N}]{2,}/gu) ?? [])]
+    const singularize = token => token.length >= 5
+        ? token.endsWith('es') ? token.slice(0, -2) : token.endsWith('s') ? token.slice(0, -1) : token
+        : token;
+    const canonicalize = token => token === 'nota' ? 'note' : token;
+    return [...new Set((text.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().match(/[\p{L}\p{N}]{2,}/gu) ?? [])
+        .filter(token => !QUERY_STOP_WORDS.has(token) && !QUERY_STOP_WORDS.has(singularize(token)))
+        .map(token => canonicalize(singularize(token))))]
         .filter(token => !QUERY_STOP_WORDS.has(token)).slice(0, 64);
+}
+
+export function hasMemoryRelevanceTerms(text) {
+    return relevanceTokens(text).length > 0;
 }
 
 function scoreRecordForTokens(record, terms) {

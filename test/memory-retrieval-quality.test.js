@@ -177,6 +177,22 @@ test('retrieval-quality synthetic benchmark: direct topics, follow-up, history, 
     assert.equal(programming.assertions.find(item => item.predicate === 'user.technology').evidence.items.length, 2);
 });
 
+test('Spanish broad self-queries keep owner context and specific “nota” queries match Schema v5 user.note', async () => {
+    const data = fixture();
+    const note = data.add({ predicate: 'user.note', value: 'Synthetic only fixture value.' });
+    data.add({ predicate: 'user.hobby', value: 'Practica escalada en interiores.' });
+    const provider = providerFor(data, { matchSpecificSelfQueries: true });
+
+    const broad = await payload(provider, { message: '¿Qué sabés de mí?' });
+    assert.ok(broad.assertions.some(item => item.id === note),
+        'broad Spanish self-query must not become a false lexical filter through stemming');
+
+    const specific = await payload(provider, { message: '¿Qué dice mi nota?' });
+    assert.ok(specific.assertions.some(item => item.id === note),
+        'Spanish “nota” must match the existing Schema v5 predicate “note”');
+    assert.equal(specific.assertions.some(item => item.object?.value === 'Practica escalada en interiores.'), false);
+});
+
 test('lexical ranking stays deterministic when Schema v5 collection order changes', async () => {
     const data = fixture();
     data.add({ predicate: 'user.note', value: 'Disfruta caminar por el parque.' });

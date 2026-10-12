@@ -15,6 +15,11 @@ const showMinimized = 6;
 const showMaximized = 3;
 const windowMessageClose = 0x0010;
 const modernWindowHostProcesses = new Set(['applicationframehost.exe', 'wwahost.exe']);
+const builtInAppAliases = Object.freeze({
+    calculator: ['calculadora', 'calculadora de windows', 'calculadora windows'],
+    chrome: ['google chrome'],
+    explorer: ['explorador', 'explorador de archivos', 'file explorer', 'windows explorer'],
+});
 
 function failure(code, message, extra = {}) {
     return { success: false, error: { code, message }, ...extra };
@@ -49,16 +54,16 @@ function windowTool(name, description, argumentName = null) {
 
 export const isAppRunningTool = windowTool(
     'is_app_running',
-    'Comprueba si está ejecutándose una aplicación conocida por su nombre lógico.',
+    'Comprueba el estado actual de ejecución de una aplicación conocida. Es evidencia del equipo ahora; no indica preferencia ni uso habitual.',
     'app'
 );
 export const getActiveWindowTool = windowTool(
     'get_active_window',
-    'Indica cuál es la ventana activa de Windows.'
+    'Indica cuál es la ventana activa de Windows en este momento. Es estado observable actual, no una preferencia o hábito.'
 );
 export const listWindowsTool = windowTool(
     'list_windows',
-    'Lista las ventanas visibles de Windows con título, proceso, PID e identificador interno.'
+    'Lista las ventanas visibles actuales de Windows con título, proceso, PID e identificador interno. No informa qué aplicaciones prefiere o usa habitualmente el usuario.'
 );
 export const focusWindowTool = windowTool(
     'focus_window',
@@ -264,11 +269,17 @@ export async function listWindows(options = {}) {
 function targetApplication(requestedName, catalog, environment = process.env) {
     const query = normalizeAppName(requestedName);
     const builtIn = Object.entries(windowsAppWhitelist)
-        .find(([name]) => normalizeAppName(name) === query);
+        .find(([name]) => normalizeAppName(name) === query
+            || (builtInAppAliases[name] ?? []).some(alias => normalizeAppName(alias) === query));
     if (builtIn) {
         const processNames = builtIn[1].map(item => path.win32.basename(item.executable).toLowerCase());
         if (processNames.length === 0) processNames.push(`${query.replace(/\s+/gu, '')}.exe`);
-        return { kind: 'application', name: builtIn[0], processNames, modernWindowTitles: [builtIn[0]] };
+        return {
+            kind: 'application',
+            name: builtIn[0],
+            processNames,
+            modernWindowTitles: [builtIn[0], ...(builtInAppAliases[builtIn[0]] ?? [])],
+        };
     }
 
     const resolved = resolveApp(catalog, requestedName, environment);

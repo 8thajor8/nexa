@@ -1,8 +1,28 @@
 import { randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { VoiceError } from './errors.js';
 
 const validCancelReasons = new Set(['user', 'superseded', 'session_ended']);
 const validOptions = new Set(['style', 'persist']);
+const safeSpeechStages = new Set(['audio_preparation', 'synthesis', 'identity_processing']);
+
+function safeSpeechMetrics(value) {
+    if (!value || typeof value !== 'object') return null;
+    const duration = key => Number.isFinite(value[key]) && value[key] >= 0 ? Math.round(value[key]) : null;
+    return Object.freeze({
+        model: value.model === 'gpt-4o-mini-tts' ? value.model : null,
+        voice: value.voice === 'nova' ? value.voice : null,
+        identityProfile: value.identityProfile === 'nova-portena' ? value.identityProfile : null,
+        identityProcessing: typeof value.identityProcessing === 'boolean' ? value.identityProcessing : null,
+        failureStage: safeSpeechStages.has(value.failureStage) ? value.failureStage : null,
+        storageInitializationMs: duration('storageInitializationMs'), synthesisMs: duration('synthesisMs'),
+        identityProcessingMs: duration('identityProcessingMs'), identityServerStartupMs: duration('identityServerStartupMs'),
+        identityBrowserStartupMs: duration('identityBrowserStartupMs'), identityRendererPreparationMs: duration('identityRendererPreparationMs'),
+        identityDspSetupMs: duration('identityDspSetupMs'), identityDspProcessingMs: duration('identityDspProcessingMs'),
+        identityAudioCaptureWaitMs: duration('identityAudioCaptureWaitMs'), identityPostProcessingMs: duration('identityPostProcessingMs'),
+        audioSaveMs: duration('audioSaveMs'), audioReadyMs: duration('audioReadyMs'),
+    });
+}
 export const defaultPlaybackTimeoutMs = 300_000;
 
 function normalizeOptions(options) {
@@ -18,8 +38,10 @@ function normalizeOptions(options) {
 }
 
 function defaultServiceLoader() {
-    return import('../speech/service.js').then(({ generateSpeech, playAudio, stopSpeechPlayback, getSpeechPlaybackStatus, removeTemporarySpeech }) => ({
-        generate: generateSpeech, play: playAudio, stopPlayback: stopSpeechPlayback, getPlaybackStatus: getSpeechPlaybackStatus, removeTemporary: removeTemporarySpeech,
+    const serviceUrl = new URL('../speech/service.js', import.meta.url);
+        return import(serviceUrl.href).then(({ generateSpeech, playAudio, stopSpeechPlayback, getSpeechPlaybackStatus, removeTemporarySpeech, getSpeechMetrics }) => ({
+            generate: generateSpeech, play: playAudio, stopPlayback: stopSpeechPlayback, getPlaybackStatus: getSpeechPlaybackStatus, removeTemporary: removeTemporarySpeech,
+            getLastMetrics: getSpeechMetrics,
     }));
 }
 
@@ -65,7 +87,8 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
     function makeOperation(text, options) {
         let resolveCancellation;
         const cancellation = new Promise(resolve => { resolveCancellation = resolve; });
-        return { turnId: idFactory(), text, options, phase: 'synthesizing', cancelled: false, cancellation, resolveCancellation };
+        return { turnId: idFactory(), text, options, phase: 'synthesizing', startedAt: performance.now(), phaseStartedAt: performance.now(),
+            cancelled: false, cancellation, resolveCancellation };
     }
     function discardGenerated(operation) {
         if (operation.options.persist || !operation.generatedAudioId || typeof operation.service?.removeTemporary !== 'function') return Promise.resolve(false);
@@ -148,20 +171,30 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
             synthesisInFlight = true;
             try { generated = await service.generate({ text: operation.text, ...operation.options }); }
             finally { synthesisInFlight = false; }
+            operation.speechMetrics = typeof service.getLastMetrics === 'function' ? safeSpeechMetrics(service.getLastMetrics()) : null;
             if (active !== operation) {
                 operation.service = service;
                 operation.generatedAudioId = generated?.audioId;
                 if (generated?.success) await discardGenerated(operation);
                 return null;
             }
-            if (!generated?.success || typeof generated.audioId !== 'string') throw new VoiceError('voice_speech_generation_failed');
+            if (!generated?.success || typeof generated.audioId !== 'string') {
+                const underlying = generated?.error?.code;
+                const mapped = ({ audio_storage_unavailable: 'voice_audio_storage_unavailable',
+                    speech_generation_failed: 'voice_tts_generation_failed', invalid_provider_audio: 'voice_tts_response_invalid',
+                    audio_processing_failed: 'voice_audio_processing_failed', voice_identity_browser_unavailable: 'voice_identity_browser_unavailable',
+                    audio_storage_failed: 'voice_audio_storage_failed' })[underlying];
+                operation.errorStage = operation.speechMetrics?.failureStage ?? 'synthesis';
+                throw new VoiceError(mapped ?? 'voice_speech_generation_failed');
+            }
 
             operation.phase = 'speaking';
+            operation.phaseStartedAt = performance.now();
             operation.service = service;
             operation.generatedAudioId = generated.audioId;
             operation.playbackId = randomUUID();
             playbackState = 'playing';
-            emit('voice.speaking', operation);
+            emit('voice.speaking', operation, { diagnostics: Object.freeze({ stage: 'playback', state: 'started', metrics: operation.speechMetrics }) });
             const observedPlay = Promise.resolve().then(() => {
                 if (operation.cancelled || active !== operation) return { success: false, status: 'stopped', released: true };
                 operation.playStarted = true;
@@ -199,13 +232,16 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
                 throw new VoiceError(code);
             }
             active = null;
-            emit('voice.speech.completed', operation);
+            emit('voice.speech.completed', operation, { diagnostics: Object.freeze({ stage: 'playback', state: 'success',
+                durationMs: Math.round(performance.now() - operation.phaseStartedAt), metrics: operation.speechMetrics }) });
             return Object.freeze({ sessionId, turnId: operation.turnId, completed: true });
         } catch (error) {
             if (active !== operation || operation.cancelled) return null;
             active = null;
             const safeError = error instanceof VoiceError ? error : new VoiceError(operation.phase === 'speaking' ? 'voice_speech_playback_failed' : 'voice_speech_generation_failed');
-            emit('voice.speech.error', operation, { phase: operation.phase, error: Object.freeze({ code: safeError.code, message: safeError.message }) });
+            emit('voice.speech.error', operation, { phase: operation.phase, error: Object.freeze({ code: safeError.code, message: safeError.message }),
+                diagnostics: Object.freeze({ stage: operation.errorStage ?? (operation.phase === 'speaking' ? 'playback' : 'synthesis'),
+                    state: 'error', durationMs: Math.round(performance.now() - operation.phaseStartedAt), metrics: operation.speechMetrics }) });
             throw safeError;
         }
     }

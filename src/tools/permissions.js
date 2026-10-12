@@ -57,6 +57,8 @@ export const toolPermissions = Object.freeze({
     prepare_calendar_event: 'action',
     prepare_calendar_event_update: 'action',
     prepare_calendar_event_cancel: 'action',
+    lifeguard_search_incidents: 'external_read',
+    lifeguard_read_incident: 'external_read',
 });
 
 export const defaultPermissionPolicy = Object.freeze({

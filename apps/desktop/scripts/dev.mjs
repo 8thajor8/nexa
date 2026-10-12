@@ -9,7 +9,7 @@ const tsconfig = resolve(appRoot, "node_modules", "typescript", "bin", "tsc");
 const vite = resolve(appRoot, "node_modules", "vite", "bin", "vite.js");
 const electronBuild = resolve(appRoot, "scripts", "build-electron.mjs");
 const electron = resolve(appRoot, "node_modules", "electron", "cli.js");
-const rendererUrl = "http://127.0.0.1:5173";
+const rendererUrl = "http://127.0.0.1:5174";
 
 function run(command, args, options = {}) {
   return new Promise((resolvePromise, rejectPromise) => {

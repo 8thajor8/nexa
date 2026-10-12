@@ -151,9 +151,11 @@ export function createMicrosoftGraphProvider({ auth, fetchImpl = fetch, environm
     }
     async function getConnectionStatus() {
         const config = getMicrosoftConfiguration(environment);
-        if (!config.success) return { success: true, connected: false, provider: 'microsoft', reason: 'configuration_missing' };
+        if (!config.success) return { success: false, connected: false, provider: 'microsoft', error: config.error };
         const response = await request('me?$select=id,displayName,mail,userPrincipalName');
-        if (!response.success) return response.error.code === 'email_not_connected' ? { success: true, connected: false, provider: 'microsoft' } : response;
+        if (!response.success) return response.error.code === 'email_not_connected'
+            ? { success: true, connected: false, provider: 'microsoft', reason: 'no_session' }
+            : response;
         const address = response.data.mail ?? response.data.userPrincipalName;
         const mailbox = normalizeMailbox({ id: response.data.id, address, displayName: response.data.displayName, type: 'personal' });
         if (!mailbox) return { success: false, error: { code: 'microsoft_identity_invalid', message: 'Microsoft no devolvió una identidad de buzón válida.' } };

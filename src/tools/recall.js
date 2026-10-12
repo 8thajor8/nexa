@@ -1,7 +1,7 @@
 export const recallTool = {
     type: 'function',
     name: 'recall',
-    description: 'Busca información que Nexa haya guardado previamente sobre el usuario.',
+    description: 'Busca información persistente que Nexa haya guardado previamente, como preferencias y hábitos. No informa qué aplicaciones o ventanas están abiertas ahora.',
     parameters: {
         type: 'object',
         properties: {

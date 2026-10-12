@@ -25,8 +25,13 @@ export async function createRuntimeAgent({
     memoryMode = config.cliMemoryMode,
     storePath = config.memory2ReadOnlyStorePath,
     agentOptions = {},
+    allowConfirmedMemoryWrites = agentOptions?.allowConfirmedMemoryWrites === true,
 } = {}) {
-    memoryMode = resolveCliMemoryMode(memoryMode);
+    const confirmedWriteMode = memoryMode === 'memory2-confirmed-write';
+    if (confirmedWriteMode && allowConfirmedMemoryWrites !== true) {
+        throw new Error('confirmed_memory_writes_require_explicit_host_composition');
+    }
+    if (!confirmedWriteMode) memoryMode = resolveCliMemoryMode(memoryMode);
     if (memoryMode === 'memory1') {
         return createAgent({
             automaticMemoryDetector: createAutomaticMemoryDetector(),
@@ -37,6 +42,15 @@ export async function createRuntimeAgent({
 
     if (memoryMode === 'memory2') {
         return createAgent({ memoryBackend: 'memory2', ...agentOptions });
+    }
+
+    if (memoryMode === 'memory2-confirmed-write') {
+        if (typeof storePath !== 'string' || !path.isAbsolute(storePath)) {
+            throw new Error('A dedicated absolute synthetic Memory 2 store is required for confirmed writes.');
+        }
+        const { allowConfirmedMemoryWrites: _hostGate, ...safeAgentOptions } = agentOptions;
+        return createAgent({ ...safeAgentOptions, memoryBackend: 'memory2', memory2StorePath: storePath,
+            enableConfirmedMemoryWrites: true, enableAutomaticMemoryAssessment: false });
     }
 
     if (typeof storePath !== 'string' || !path.isAbsolute(storePath)) {

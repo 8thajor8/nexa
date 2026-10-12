@@ -8,6 +8,7 @@ import { validateForgetTarget, validatePersonCreation, validateRelationRequest, 
 import { getRelationPredicate } from './relation-predicates.js';
 import { screenMemorySecret } from './secret-screening.js';
 import { MemoryRepositoryError } from './repository.js';
+import { getOrganicMemoryAttributePolicy } from '../core/organic-memory-authorization.js';
 
 const publicErrors = Object.freeze({
     memory_write_not_authorized: 'A matching explicit direct-user memory command is required.',
@@ -16,6 +17,9 @@ const publicErrors = Object.freeze({
     memory_not_found: 'No memory matched the exact target.',
     memory_ambiguous: 'The memory target is ambiguous; no records were changed.',
     memory_operation_failed: 'The memory operation could not be completed.',
+    memory_confirmation_expired: 'This memory confirmation expired; no memory was saved.',
+    memory_confirmation_invalid: 'No matching memory confirmation is pending; no memory was saved.',
+    memory_target_changed: 'The memory changed after review; no update was applied.',
 });
 function failure(code) { return { success: false, error: { code, message: publicErrors[code] ?? publicErrors.memory_operation_failed } }; }
 function safeFailure(error) {
@@ -43,12 +47,17 @@ function equivalent(a, b, store) {
 function newId(prefix) { return prefix + '_' + randomUUID(); }
 function validateProposal(proposal) { validateRememberProposal(proposal); }
 /** Domain service over the repository contract; it never constructs trusted prompts. */
-export function createMemoryService({ repository, now = () => new Date().toISOString(), idFactory = newId, secretScreen = screenMemorySecret } = {}) {
+export function createMemoryService({ repository, now = () => new Date().toISOString(), idFactory = newId,
+    secretScreen = screenMemorySecret, organicMemoryAuthorizationFactory = null } = {}) {
     if (!repository || !['open', 'readSnapshot', 'commit', 'close'].every(name => typeof repository[name] === 'function')) {
         throw new TypeError('memory_repository_contract_invalid');
     }
-    if (typeof now !== 'function' || typeof idFactory !== 'function' || typeof secretScreen !== 'function') throw new TypeError('memory_service_dependency_invalid');
+    if (typeof now !== 'function' || typeof idFactory !== 'function' || typeof secretScreen !== 'function'
+        || (organicMemoryAuthorizationFactory !== null && typeof organicMemoryAuthorizationFactory !== 'function'))
+        throw new TypeError('memory_service_dependency_invalid');
     const retriever = createMemoryRetriever({ readSnapshot: () => repository.readSnapshot(), now });
+    let pendingExplicitRemember = null;
+    let organicMemoryAuthorization = null;
 
     function timestamp() {
         const value = now();
@@ -87,14 +96,8 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
             invalidateContext: true, trust: { authority: 'data_only' } };
     }
 
-    async function remember(input, authorization) {
+    async function persistRememberProposal(proposal, { derivation = 'explicit', extractionConfidence = null, preCommit = null } = {}) {
         try {
-            assertExactObject(input, ['proposal'], 'input');
-            validateProposal(input.proposal);
-            const proposal = structuredClone(input.proposal);
-            consumeMemoryAuthorization(authorization, 'remember', proposal, service);
-            const screened = secretScreen(proposal.object.value);
-            if (!screened?.safe) return failure('memory_secret_suspected');
             const current = await snapshot();
             const candidates = current.snapshot.assertions.filter(record => record.status === 'active' && sameSlot(record, proposal, current.snapshot));
             if (candidates.length > 1) return failure('memory_ambiguous');
@@ -109,32 +112,221 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
                 const previous = candidates[0];
                 changes.push({ type: 'put', collection: 'assertions', record: { ...previous, status: 'superseded' } });
             }
-            const assertion = {
-                id: assertionId, ...structuredClone(proposal),
-                status: 'active', recorded_at: learnedAt,
-                supersedes: candidates.length === 1 ? [candidates[0].id] : [],
-            };
-            const source = {
-                id: sourceId, kind: 'user_statement', origin_trust: 'user_asserted', authority: 'data_only',
-                locator: null, occurred_at: { value: learnedAt, precision: 'instant' }, recorded_at: learnedAt,
-            };
-            const evidence = {
-                id: evidenceId, assertion_id: assertionId, source_id: sourceId, derivation: 'explicit',
-                extraction_confidence: null, learned_at: learnedAt, last_confirmed_at: null, legacy_ref: null,
-            };
+            const assertion = { id: assertionId, ...structuredClone(proposal), status: 'active', recorded_at: learnedAt,
+                supersedes: candidates.length === 1 ? [candidates[0].id] : [] };
+            const source = { id: sourceId, kind: 'user_statement', origin_trust: 'user_asserted', authority: 'data_only',
+                locator: null, occurred_at: { value: learnedAt, precision: 'instant' }, recorded_at: learnedAt };
+            const evidence = { id: evidenceId, assertion_id: assertionId, source_id: sourceId, derivation,
+                extraction_confidence: extractionConfidence, learned_at: learnedAt, last_confirmed_at: null, legacy_ref: null };
             validateMemoryRecord('assertions', assertion);
             validateMemoryRecord('sources', source);
             validateMemoryRecord('evidence', evidence);
             changes.push({ type: 'put', collection: 'assertions', record: assertion },
                 { type: 'put', collection: 'sources', record: source }, { type: 'put', collection: 'evidence', record: evidence });
+            if (preCommit) {
+                let allowed = false;
+                try { allowed = preCommit() === true; } catch { /* A stale grant fails closed. */ }
+                if (!allowed) return failure('memory_write_not_authorized');
+            }
             const committed = await repository.commit({ expectedRevision: current.revision, expectedDigest: current.digest, changes });
-            return {
-                success: true, outcome: candidates.length ? 'superseded' : 'created', id: assertionId,
+            return { success: true, outcome: candidates.length ? 'superseded' : 'created', id: assertionId,
                 previousId: candidates[0]?.id ?? null, revision: committed.revision,
                 changedIds: [assertionId, sourceId, evidenceId, ...(candidates[0] ? [candidates[0].id] : [])],
-                trust: { authority: 'data_only' },
-            };
+                trust: { authority: 'data_only' } };
         } catch (error) { return safeFailure(error); }
+    }
+
+    async function persistOrganicProposal(input, authorization, evidence) {
+        try {
+            if ((authorization?.syntheticOnly !== true && authorization?.ownerOnly !== true)
+                || !['remember', 'update'].includes(input?.operation)
+                || !getOrganicMemoryAttributePolicy(input?.attribute)
+                || getOrganicMemoryAttributePolicy(input.attribute)?.scope !== input.scope)
+                return failure('memory_write_not_authorized');
+            const proposal = structuredClone(evidence?.proposal);
+            validateProposal(proposal);
+            const attributePolicy = getOrganicMemoryAttributePolicy(input.attribute);
+            if (!attributePolicy || proposal.kind !== attributePolicy.kind || proposal.subject?.type !== 'owner'
+                || proposal.predicate !== attributePolicy.predicate || proposal.compatibility?.category !== attributePolicy.category
+                || proposal.compatibility?.key !== input.attribute || proposal.valid_from !== null || proposal.valid_to !== null
+                || typeof evidence?.extractionConfidence !== 'number' || !Number.isFinite(evidence.extractionConfidence)
+                || evidence.extractionConfidence < 0.9 || evidence.extractionConfidence > 1)
+                return failure('memory_invalid_input');
+            if (!secretScreen(proposal.object.value)?.safe) return failure('memory_secret_suspected');
+            return await persistRememberProposal(proposal, { derivation: 'inferred', extractionConfidence: evidence.extractionConfidence,
+                preCommit: () => organicMemoryAuthorization?.verify(input)?.allowed === true });
+        } catch (error) { return safeFailure(error); }
+    }
+
+    async function rememberOrganic(input) {
+        if (!organicMemoryAuthorization) return failure('memory_write_not_authorized');
+        try {
+            const result = await organicMemoryAuthorization.persistIfAuthorized(input);
+            return result.success ? result.result : failure('memory_write_not_authorized');
+        } catch { return failure('memory_operation_failed'); }
+    }
+
+    async function remember(input, authorization) {
+        try {
+            assertExactObject(input, ['proposal'], 'input');
+            validateProposal(input.proposal);
+            const proposal = structuredClone(input.proposal);
+            consumeMemoryAuthorization(authorization, 'remember', proposal, service);
+            if (!secretScreen(proposal.object.value)?.safe) return failure('memory_secret_suspected');
+            return await persistRememberProposal(proposal);
+        } catch (error) { return safeFailure(error); }
+    }
+
+    /** One pending proposal per service, which is scoped to one Runtime agent/session.
+     * This is only for explicit direct-user confirmation and is not a model tool. */
+    function prepareConfirmedRemember(proposalInput) {
+        try {
+            validateProposal(proposalInput);
+            const proposal = structuredClone(proposalInput);
+            if (!secretScreen(proposal.object.value)?.safe) return failure('memory_secret_suspected');
+            if (/[\p{Cc}\p{Cf}]/u.test(proposal.object.value)) return failure('memory_invalid_input');
+            const proposalId = 'memprop_' + randomUUID();
+            pendingExplicitRemember = { operation: 'remember', proposalId, proposal, expiresAt: Date.now() + 120_000 };
+            return { success: true, proposalId, value: proposal.object.value };
+        } catch (error) { return safeFailure(error); }
+    }
+
+    async function prepareConfirmedUpdate(input) {
+        try {
+            assertExactObject(input, ['targetId', 'value'], 'update');
+            validateId(input.targetId, 'assertions', 'update.targetId');
+            if (typeof input.value !== 'string' || !input.value.isWellFormed()) throw new Error();
+            if (!secretScreen(input.value)?.safe || /[\p{Cc}\p{Cf}]/u.test(input.value)) return failure('memory_secret_suspected');
+            const current = await snapshot();
+            const target = current.snapshot.assertions.find(record => record.id === input.targetId && record.status === 'active');
+            if (!target) return failure('memory_not_found');
+            if (target.object?.type !== 'text') return failure('memory_invalid_input');
+            const candidates = current.snapshot.assertions.filter(record => record.status === 'active'
+                && sameSlot(record, target, current.snapshot));
+            if (candidates.length !== 1 || candidates[0].id !== target.id) return failure('memory_ambiguous');
+            const proposal = { kind: target.kind, subject: structuredClone(target.subject), predicate: target.predicate,
+                object: { type: 'text', value: input.value }, valid_from: structuredClone(target.valid_from),
+                valid_to: structuredClone(target.valid_to), compatibility: structuredClone(target.compatibility) };
+            validateProposal(proposal);
+            if (equivalent(target, proposal, current.snapshot)) {
+                return { success: true, outcome: 'equivalent', targetId: target.id,
+                    previousValue: target.object.value, value: input.value, revision: current.revision };
+            }
+            const proposalId = 'memupd_' + randomUUID();
+            pendingExplicitRemember = { operation: 'update', proposalId, proposal, target: structuredClone(target),
+                expiresAt: Date.now() + 120_000 };
+            return { success: true, proposalId, targetId: target.id, previousValue: target.object.value, value: input.value };
+        } catch (error) { return safeFailure(error); }
+    }
+
+    async function confirmPreparedUpdate(proposalId) {
+        if (!pendingExplicitRemember || pendingExplicitRemember.operation !== 'update'
+            || pendingExplicitRemember.proposalId !== proposalId) return failure('memory_confirmation_invalid');
+        const pending = pendingExplicitRemember;
+        pendingExplicitRemember = null;
+        if (Date.now() >= pending.expiresAt) return failure('memory_confirmation_expired');
+        try {
+            const current = await snapshot();
+            const target = current.snapshot.assertions.find(record => record.id === pending.target.id && record.status === 'active');
+            if (!target || !same(target, pending.target)) return failure('memory_target_changed');
+            const candidates = current.snapshot.assertions.filter(record => record.status === 'active'
+                && sameSlot(record, target, current.snapshot));
+            if (candidates.length !== 1 || candidates[0].id !== target.id) return failure('memory_ambiguous');
+            const learnedAt = timestamp();
+            const assertionId = idFactory('mem'), sourceId = idFactory('src'), evidenceId = idFactory('ev');
+            const knownIds = new Set(current.snapshot.entities.concat(current.snapshot.assertions, current.snapshot.sources, current.snapshot.evidence).map(item => item.id));
+            if ([assertionId, sourceId, evidenceId].some(id => knownIds.has(id))
+                || new Set([assertionId, sourceId, evidenceId]).size !== 3) return failure('memory_invalid_input');
+            const assertion = { id: assertionId, ...structuredClone(pending.proposal), status: 'active', recorded_at: learnedAt,
+                supersedes: [target.id] };
+            const previous = { ...target, status: 'superseded' };
+            const source = { id: sourceId, kind: 'user_statement', origin_trust: 'user_asserted', authority: 'data_only',
+                locator: null, occurred_at: { value: learnedAt, precision: 'instant' }, recorded_at: learnedAt };
+            const evidence = { id: evidenceId, assertion_id: assertionId, source_id: sourceId, derivation: 'explicit',
+                extraction_confidence: null, learned_at: learnedAt, last_confirmed_at: null, legacy_ref: null };
+            validateMemoryRecord('assertions', previous);
+            validateMemoryRecord('assertions', assertion);
+            validateMemoryRecord('sources', source);
+            validateMemoryRecord('evidence', evidence);
+            const committed = await repository.commit({ expectedRevision: current.revision, expectedDigest: current.digest,
+                changes: [['assertions', previous], ['assertions', assertion], ['sources', source], ['evidence', evidence]]
+                    .map(([collection, record]) => ({ type: 'put', collection, record })) });
+            return { success: true, outcome: 'superseded', id: assertionId, previousId: target.id,
+                revision: committed.revision, changedIds: [assertionId, sourceId, evidenceId, target.id],
+                invalidateContext: true, trust: { authority: 'data_only' } };
+        } catch (error) { return safeFailure(error); }
+    }
+
+    async function confirmPreparedRemember(proposalId) {
+        if (!pendingExplicitRemember || pendingExplicitRemember.operation !== 'remember'
+            || pendingExplicitRemember.proposalId !== proposalId) return failure('memory_confirmation_invalid');
+        const pending = pendingExplicitRemember;
+        pendingExplicitRemember = null; // Consume before I/O so retries cannot duplicate the write.
+        if (Date.now() >= pending.expiresAt) return failure('memory_confirmation_expired');
+        const result = await persistRememberProposal(pending.proposal);
+        return result.success ? { ...result, invalidateContext: true } : result;
+    }
+
+    function cancelPreparedRemember(proposalId) {
+        if (!pendingExplicitRemember || pendingExplicitRemember.operation !== 'remember'
+            || pendingExplicitRemember.proposalId !== proposalId) return false;
+        pendingExplicitRemember = null;
+        return true;
+    }
+
+    function cancelPreparedUpdate(proposalId) {
+        if (!pendingExplicitRemember || pendingExplicitRemember.operation !== 'update'
+            || pendingExplicitRemember.proposalId !== proposalId) return false;
+        pendingExplicitRemember = null;
+        return true;
+    }
+
+    async function prepareConfirmedForget(input) {
+        try {
+            assertExactObject(input, ['targetId'], 'forget');
+            validateId(input.targetId, 'assertions', 'forget.targetId');
+            const current = await snapshot();
+            const target = current.snapshot.assertions.find(record => record.id === input.targetId && record.status === 'active');
+            if (!target) return failure('memory_not_found');
+            const slot = current.snapshot.assertions.filter(record => record.status === 'active'
+                && sameSlot(record, target, current.snapshot));
+            if (slot.length !== 1) return failure('memory_ambiguous');
+            const proposalId = 'memforget_' + randomUUID();
+            pendingExplicitRemember = { operation: 'forget', proposalId, target: structuredClone(target),
+                revision: current.revision, digest: current.digest, expiresAt: Date.now() + 120_000 };
+            return { success: true, proposalId, targetId: target.id, value: target.object.value };
+        } catch (error) { return safeFailure(error); }
+    }
+
+    async function confirmPreparedForget(proposalId) {
+        if (!pendingExplicitRemember || pendingExplicitRemember.operation !== 'forget'
+            || pendingExplicitRemember.proposalId !== proposalId) return failure('memory_confirmation_invalid');
+        const pending = pendingExplicitRemember;
+        pendingExplicitRemember = null;
+        if (Date.now() >= pending.expiresAt) return failure('memory_confirmation_expired');
+        try {
+            const current = await snapshot();
+            const target = current.snapshot.assertions.find(record => record.id === pending.target.id && record.status === 'active');
+            if (current.revision !== pending.revision || current.digest !== pending.digest
+                || !target || !same(target, pending.target)) return failure('memory_target_changed');
+            const slot = current.snapshot.assertions.filter(record => record.status === 'active'
+                && sameSlot(record, target, current.snapshot));
+            if (slot.length !== 1 || slot[0].id !== target.id) return failure('memory_ambiguous');
+            const recordedAt = timestamp();
+            const forgotten = { ...target, status: 'superseded', valid_to: { value: recordedAt, precision: 'instant' } };
+            validateMemoryRecord('assertions', forgotten);
+            const committed = await repository.commit({ expectedRevision: current.revision, expectedDigest: current.digest,
+                changes: [{ type: 'put', collection: 'assertions', record: forgotten }] });
+            return { success: true, outcome: 'forgotten', targetId: target.id, revision: committed.revision,
+                changedIds: [target.id], invalidateContext: true, trust: { authority: 'data_only' } };
+        } catch (error) { return safeFailure(error); }
+    }
+
+    function cancelPreparedForget(proposalId) {
+        if (!pendingExplicitRemember || pendingExplicitRemember.operation !== 'forget'
+            || pendingExplicitRemember.proposalId !== proposalId) return false;
+        pendingExplicitRemember = null;
+        return true;
     }
 
     async function forget(target, authorization) {
@@ -190,6 +382,7 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
                 .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
             const result = records.map(record => ({
                 record: structuredClone(record),
+                forgotten: record.status === 'superseded' && record.valid_to !== null,
                 evidence: current.snapshot.evidence.filter(item => item.assertion_id === record.id).map(item => ({
                     evidence: structuredClone(item), source: structuredClone(current.snapshot.sources.find(source => source.id === item.source_id)),
                 })),
@@ -375,8 +568,17 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
         } catch (error) { return safeFailure(error); }
     }
 
+    if (organicMemoryAuthorizationFactory) {
+        organicMemoryAuthorization = organicMemoryAuthorizationFactory({ repository, persist: persistOrganicProposal });
+        if (typeof organicMemoryAuthorization?.persistIfAuthorized !== 'function')
+            throw new TypeError('organic_memory_authorization_contract_invalid');
+    }
+
     const service = Object.freeze({ createPerson, getPerson, getSelf, resolvePerson, resolveEntityMentions, retrieveCandidates,
         currentKnowledge, knowledgeValidAt, history, createRelation, correctRelation,
-        forgetRelation, relationsForEntity, remember, forget, getById, find, open: () => repository.open(), close: () => repository.close() });
+        forgetRelation, relationsForEntity, remember, rememberOrganic, prepareConfirmedRemember, confirmPreparedRemember, cancelPreparedRemember,
+        prepareConfirmedUpdate, confirmPreparedUpdate, cancelPreparedUpdate,
+        prepareConfirmedForget, confirmPreparedForget, cancelPreparedForget,
+        forget, getById, find, open: () => repository.open(), close: () => repository.close() });
     return service;
 }

@@ -64,18 +64,18 @@ test('preserves conversation context and isolates histories between conversation
     await runtime.close();
 });
 
-test('passes voice source to the existing tool execution path', async () => {
+test('preserves voice modality and marks Desktop turns as direct user input for action authorization', async () => {
     const sources = [];
     let count = 0;
     const runtime = createConversationRuntime({ agentOptions: agentOptions({
         getTools: () => [{ type: 'function', name: 'test_action' }],
-        execute: async (_name, _args, context) => { sources.push(context.userMessageSource); return { success: true }; },
+        execute: async (_name, _args, context) => { sources.push([context.userMessageSource, context.inputSource]); return { success: true }; },
         ask: async () => ++count === 1 ? toolCall('test_action', {}, 'voice-action') : final('Entendido.'),
     }) });
     const conversationId = runtime.createConversation();
     const result = await runtime.sendMessage({ conversationId, requestId: 'voice-1', text: 'abre la ventana', source: 'voice' });
     assert.equal(result.status, 'completed');
-    assert.deepEqual(sources, ['voice']);
+    assert.deepEqual(sources, [['direct_user', 'voice']]);
     await runtime.close();
 });
 
@@ -148,6 +148,7 @@ test('cancellation aborts Responses API work, ignores a late result, and emits e
     let resolveFirst;
     let calls = 0;
     const events = [];
+    const traces = [];
     const runtime = createConversationRuntime({ agentOptions: agentOptions({
         ask: request => {
             calls++;
@@ -155,12 +156,12 @@ test('cancellation aborts Responses API work, ignores a late result, and emits e
             assert.equal(request.signal.aborted, false);
             return final('nuevo intento');
         },
-    }) });
+    }), diagnostic: event => traces.push(event) });
     runtime.onEvent(event => events.push(event));
     const conversationId = runtime.createConversation();
     const pending = runtime.sendMessage({ conversationId, requestId: 'cancel-1', text: 'tardía', source: 'typed' });
     while (!resolveFirst) await new Promise(resolve => setImmediate(resolve));
-    assert.equal(runtime.cancelRequest('cancel-1'), true);
+    assert.equal(runtime.cancelRequest('cancel-1', 'user'), true);
     assert.equal(events.filter(event => event.requestId === 'cancel-1').at(-1).status, 'processing');
     resolveFirst(final('respuesta tardía que no debe aparecer'));
     const cancelled = await pending;
@@ -168,6 +169,10 @@ test('cancellation aborts Responses API work, ignores a late result, and emits e
     assert.equal(JSON.stringify(events).includes('respuesta tardía'), false);
     assert.equal(events.filter(event => event.requestId === 'cancel-1'
         && ['completed', 'cancelled', 'error'].includes(event.status)).length, 1);
+    assert.deepEqual(traces.filter(event => event.event === 'cancel_requested')
+        .map(event => event.origin), ['user']);
+    assert.deepEqual(traces.filter(event => event.event === 'request_cancelled')
+        .map(event => event.origin), ['user']);
 
     const retried = await runtime.sendMessage({ conversationId, requestId: 'cancel-2', text: 'nuevo', source: 'typed' });
     assert.equal(retried.status, 'completed');
@@ -201,7 +206,8 @@ test('cancellation during an external tool waits for it and does not claim its e
 test('close aborts active work and closes all conversation agents once', async () => {
     let resolveAsk;
     let closes = 0;
-    const runtime = createConversationRuntime({ agentFactory: async () => ({
+    const traces = [];
+    const runtime = createConversationRuntime({ diagnostic: event => traces.push(event), agentFactory: async () => ({
         run: (_text, _source, { signal }) => new Promise(resolve => {
             resolveAsk = () => resolve('late');
             signal.addEventListener('abort', () => resolveAsk(), { once: true });
@@ -214,8 +220,30 @@ test('close aborts active work and closes all conversation agents once', async (
     await runtime.close();
     assert.equal((await pending).status, 'cancelled');
     assert.equal(closes, 1);
+    assert.deepEqual(traces.filter(event => event.event === 'cancel_requested')
+        .map(event => event.origin), ['runtime_close']);
     await runtime.close();
     assert.throws(() => runtime.createConversation(), /conversation_runtime_closed/u);
+});
+
+test('runtime close preserves an earlier lifecycle cancellation origin', async () => {
+    const traces = [];
+    const runtime = createConversationRuntime({ diagnostic: event => traces.push(event), agentFactory: async () => ({
+        run: (_text, _source, { signal }) => new Promise(resolve => {
+            signal.addEventListener('abort', () => resolve('late'), { once: true });
+        }),
+        async close() {},
+    }) });
+    const conversationId = runtime.createConversation();
+    const pending = runtime.sendMessage({ conversationId, requestId: 'origin-1', text: 'work', source: 'typed' });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(runtime.cancelRequest('origin-1', 'navigation'), true);
+    await runtime.close();
+    assert.equal((await pending).status, 'cancelled');
+    assert.deepEqual(traces.filter(event => event.event === 'cancel_requested')
+        .map(event => event.origin), ['navigation']);
+    assert.deepEqual(traces.filter(event => event.event === 'request_cancelled')
+        .map(event => event.origin), ['navigation']);
 });
 
 test('importing the conversation API does not launch the interactive CLI', () => {
@@ -255,7 +283,7 @@ test('runtime uses the shared read-only Memory2 composition and does not mutate 
         agentOptions: agentOptions({ ask: async request => { requests.push(structuredClone(request)); return final('Contexto leído.'); } }) });
     try {
         const conversationId = runtime.createConversation();
-        assert.equal((await runtime.sendMessage({ conversationId, requestId: 'm2-read-1', text: 'mi nota', source: 'typed' })).status, 'completed');
+        assert.equal((await runtime.sendMessage({ conversationId, requestId: 'm2-read-1', text: '¿Qué sabés de mí?', source: 'typed' })).status, 'completed');
         assert.ok(requests[0].input.some(item => item.type === 'function_call_output'
             && item.output.includes('Conversation synthetic only.')));
         assert.deepEqual(await readFile(storePath), original);
@@ -265,4 +293,58 @@ test('runtime uses the shared read-only Memory2 composition and does not mutate 
         assert.deepEqual(await readFile(storePath), original);
         await rm(directory, { recursive: true, force: true });
     }
+});
+
+test('memory diagnostics retain a sanitized initialization failure without retrying agent creation', async () => {
+    let attempts = 0;
+    const runtime = createConversationRuntime({ memoryMode: 'memory2-readonly', agentFactory: async () => {
+        attempts++;
+        const error = new Error('C:\\private\\store.json contains protected content');
+        error.code = 'memory_store_invalid';
+        throw error;
+    } });
+    try {
+        const conversationId = runtime.createConversation();
+        const failed = await runtime.sendMessage({ conversationId, requestId: 'diag-init-fail-1',
+            text: 'Hola Nexa', source: 'typed' });
+        assert.equal(failed.status, 'error');
+        const diagnosis = await runtime.sendMessage({ conversationId, requestId: 'diag-init-fail-2',
+            text: 'Nexa, diagnosticá tu memoria', source: 'typed' });
+        assert.equal(diagnosis.status, 'completed');
+        assert.match(diagnosis.text, /memory_store_invalid/u);
+        assert.match(diagnosis.text, /No intenté leer recuerdos/u);
+        assert.doesNotMatch(diagnosis.text, /C:\\private|protected content/u);
+        assert.equal(attempts, 1);
+    } finally { await runtime.close(); }
+});
+
+test('system status and tool catalog carry per-response technical metadata without calling the agent', async () => {
+    const runtime = createConversationRuntime({
+        agentFactory: () => { throw new Error('agent must not start'); },
+        memoryMode: 'memory2-readonly',
+        agentOptions: { getTools: () => [{ name: 'spotify_play' }, { name: 'open_app' }] },
+    });
+    const conversationId = runtime.createConversation();
+    const memory = await runtime.sendMessage({ conversationId, requestId: 'format-memory-1',
+        text: '¿Qué sistema de memoria estás usando?', source: 'typed' });
+    assert.equal(memory.status, 'completed');
+    assert.match(memory.text, /Estado de mi memoria/u);
+    assert.doesNotMatch(memory.text, /spotify_play|open_app/u);
+    assert.equal(memory.presentation.kind, 'diagnostic');
+    assert.match(memory.presentation.technicalDetail, /memory2-readonly/u);
+
+    const tools = await runtime.sendMessage({ conversationId, requestId: 'format-tools-1',
+        text: '¿Qué herramientas tenés disponibles?', source: 'typed' });
+    assert.equal(tools.status, 'completed');
+    assert.match(tools.text, /Música y Spotify/u);
+    assert.doesNotMatch(tools.text, /spotify_play|open_app/u);
+    assert.equal(tools.presentation.kind, 'tool_catalog');
+    assert.match(tools.presentation.technicalDetail, /spotify_play/u);
+    const spotify = await runtime.sendMessage({ conversationId, requestId: 'format-spotify-1',
+        text: '¿Qué podés hacer con Spotify?', source: 'typed' });
+    assert.equal(spotify.status, 'completed');
+    assert.match(spotify.text, /Herramientas de Spotify/u);
+    assert.doesNotMatch(spotify.text, /Computadora y aplicaciones|open_app/u);
+    assert.match(spotify.text, /No comprobé el estado de conexión/u);
+    await runtime.close();
 });

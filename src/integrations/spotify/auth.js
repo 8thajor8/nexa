@@ -70,6 +70,16 @@ export function createSpotifyAuthorizationUrl({ clientId, redirectUri = defaultS
     return { url: url.toString(), verifier, state };
 }
 
+export function spotifyCallbackPage(status) {
+    const content = {
+        success: { title: 'Spotify conectado', heading: 'Spotify conectado', copy: 'Nexa ya puede usar tu conexión de Spotify. Volvé a Nexa para continuar.' },
+        cancelled: { title: 'Conexión cancelada', heading: 'Conexión cancelada', copy: 'No se realizaron cambios. Podés volver a Nexa e intentarlo cuando quieras.' },
+        failed: { title: 'No se pudo conectar', heading: 'No se pudo conectar con Spotify', copy: 'La conexión no se completó. Volvé a Nexa para revisar el estado e intentarlo de nuevo.' },
+    }[status] ?? { title: 'No se pudo conectar', heading: 'No se pudo conectar con Spotify', copy: 'La conexión no se completó. Volvé a Nexa para revisar el estado e intentarlo de nuevo.' };
+    const symbol = status === 'success' ? '✓' : status === 'cancelled' ? '↩' : '!';
+    return `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><meta name="referrer" content="no-referrer"><title>${content.title} · Nexa</title><style>:root{color-scheme:dark;font-family:Segoe UI,Inter,Arial,sans-serif;background:#050b17;color:#e8f5ff}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(ellipse at 50% 0%,rgba(17,108,183,.28),transparent 55%),linear-gradient(145deg,#071326,#030711)}main{width:min(480px,100%);padding:34px;border:1px solid rgba(92,190,255,.35);border-radius:18px;background:rgba(8,20,39,.9);box-shadow:0 22px 70px rgba(0,0,0,.5),0 0 34px rgba(36,164,255,.12);text-align:center}mark{display:grid;place-items:center;width:54px;height:54px;margin:0 auto 20px;border:1px solid rgba(79,221,255,.5);border-radius:50%;background:rgba(27,132,189,.2);color:#71e4ff;font-size:24px}small{color:#75dfff;font-weight:700;letter-spacing:.2em;text-transform:uppercase}h1{margin:12px 0;color:#f3faff;font-size:25px;line-height:1.2}p{margin:0;color:#b6cce1;font-size:15px;line-height:1.65}footer{margin-top:26px;color:#7896b1;font-size:12px}</style></head><body><main><mark aria-hidden="true">${symbol}</mark><small>Nexa · Spotify</small><h1>${content.heading}</h1><p>${content.copy}</p><footer>Podés cerrar esta pestaña después de volver a Nexa.</footer></main></body></html>`;
+}
+
 async function postTokenForm(body, fetchImpl = fetch) {
     let response;
     try {
@@ -157,29 +167,36 @@ export async function getSpotifyAccessToken({ environment = process.env, tokenSt
     }
 }
 
-export async function authorizeSpotify({ environment = process.env, fetchImpl = fetch, tokenStore = { save: saveSpotifyTokens }, output = console.log } = {}) {
+export async function authorizeSpotify({ environment = process.env, fetchImpl = fetch, tokenStore = { save: saveSpotifyTokens },
+    output = console.log, browserOpener = null, signal = null } = {}) {
     const { clientId, redirectUri } = getSpotifyConfiguration(environment);
     const authorization = createSpotifyAuthorizationUrl({ clientId, redirectUri });
     const callback = new URL(redirectUri);
 
     return new Promise((resolve, reject) => {
+        let settled = false;
+        let timeout;
         const server = createServer(async (request, response) => {
+            if (settled) return;
             const requestUrl = new URL(request.url, redirectUri);
             if (requestUrl.pathname !== callback.pathname) {
                 response.writeHead(404).end('Not found');
                 return;
             }
             if (requestUrl.searchParams.get('state') !== authorization.state) {
-                response.writeHead(400).end('State validation failed.');
-                server.close();
-                reject(new SpotifyAuthError('spotify_state_mismatch', 'Spotify devolvió un estado OAuth inválido.'));
+                response.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+                    .end(spotifyCallbackPage('failed'));
+                finish(new SpotifyAuthError('spotify_state_mismatch', 'Spotify devolvió un estado OAuth inválido.'));
                 return;
             }
             const code = requestUrl.searchParams.get('code');
             if (!code) {
-                response.writeHead(400).end('Spotify authorization was cancelled.');
-                server.close();
-                reject(new SpotifyAuthError('spotify_authorization_denied', 'La autorización de Spotify fue cancelada o denegada.'));
+                const denied = requestUrl.searchParams.get('error') === 'access_denied';
+                const cancelled = denied || !requestUrl.searchParams.has('error');
+                response.writeHead(cancelled ? 200 : 400, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+                    .end(spotifyCallbackPage(cancelled ? 'cancelled' : 'failed'));
+                finish(new SpotifyAuthError(cancelled ? 'spotify_authorization_cancelled' : 'spotify_authorization_denied',
+                    cancelled ? 'Spotify no completó la autorización.' : 'Spotify devolvió un error de autorización.'));
                 return;
             }
             try {
@@ -190,28 +207,43 @@ export async function authorizeSpotify({ environment = process.env, fetchImpl = 
                     fetchImpl,
                     tokenStore,
                 });
-                response.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' })
-                    .end('Nexa ya quedó autorizada con Spotify. Podés cerrar esta pestaña.');
-                server.close();
-                resolve(tokens);
+                response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+                    .end(spotifyCallbackPage('success'));
+                finish(null, tokens);
             } catch (error) {
-                response.writeHead(500).end('No se pudo completar Spotify OAuth. Revisá la terminal de Nexa.');
-                server.close();
-                reject(error);
+                response.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+                    .end(spotifyCallbackPage('failed'));
+                finish(error);
             }
         });
-        let timeout;
-        server.once('error', () => {
+        function finish(error, value) {
+            if (settled) return;
+            settled = true;
             clearTimeout(timeout);
-            reject(new SpotifyAuthError('spotify_callback_unavailable', 'No se pudo abrir el callback local 127.0.0.1:8888.'));
-        });
+            signal?.removeEventListener?.('abort', onAbort);
+            try { server.close(); } catch { /* The listener may not have started yet. */ }
+            if (error) reject(error); else resolve(value);
+        }
+        function onAbort() {
+            finish(new SpotifyAuthError('spotify_authorization_cancelled', 'La autorización de Spotify fue cancelada.'));
+        }
+        if (signal?.aborted) {
+            onAbort();
+            return;
+        }
+        signal?.addEventListener?.('abort', onAbort, { once: true });
+        server.once('error', () => finish(new SpotifyAuthError(
+            'spotify_callback_unavailable', 'No se pudo abrir el callback local 127.0.0.1:8888.'
+        )));
         server.listen(Number(callback.port), '127.0.0.1', () => {
-            output(`Abrí este enlace para autorizar Nexa con Spotify:\n${authorization.url}`);
+            Promise.resolve(browserOpener
+                ? browserOpener(authorization.url)
+                : output(`Abrí este enlace para autorizar Nexa con Spotify:\n${authorization.url}`))
+                .catch(() => finish(new SpotifyAuthError('spotify_browser_unavailable',
+                    'No se pudo abrir el navegador para autorizar Spotify.')));
         });
         timeout = setTimeout(() => {
-            server.close();
-            reject(new SpotifyAuthError('spotify_authorization_timeout', 'Se agotó el tiempo de espera para autorizar Spotify.'));
+            finish(new SpotifyAuthError('spotify_authorization_timeout', 'Se agotó el tiempo de espera para autorizar Spotify.'));
         }, 5 * 60_000);
-        server.once('close', () => clearTimeout(timeout));
     });
 }

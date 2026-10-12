@@ -9,26 +9,83 @@ import { WindowChrome } from "../src/renderer/components/WindowChrome";
 import { HolographicFrame } from "../src/renderer/components/HolographicFrame";
 import { DashboardModules } from "../src/renderer/components/DashboardModules";
 import App from "../src/renderer/App";
+import type { PttVoiceController } from "../src/renderer/voice/ptt-voice-controller";
+import type { PttVoiceSnapshot, PttVoiceStatus } from "../src/renderer/voice/ptt-voice-controller";
+import type { VoiceTranscriptItem } from "../src/renderer/components/ConversationPanel";
+import { MicrophoneDeviceStore } from "../src/renderer/audio/microphone-device-store";
+import { CommandHeader } from "../src/renderer/components/CommandHeader";
+import { DEFAULT_DESKTOP_PREFERENCES } from "../src/renderer/desktop-preferences";
+
+const idleSnapshot: PttVoiceSnapshot = { status: "idle", canStart: true };
+const noop = () => undefined;
+const testController = {
+  getSnapshot: () => idleSnapshot,
+  subscribe: () => () => undefined,
+  start: async () => undefined,
+  finish: async () => undefined,
+  cancel: async () => undefined,
+  recoverMainCancellation: async () => undefined,
+} as unknown as PttVoiceController;
+
+const testMicrophoneDevices = new MicrophoneDeviceStore({
+  mediaDevices: { enumerateDevices: async () => [], addEventListener: () => undefined, removeEventListener: () => undefined },
+});
+
+function renderApp() {
+  return renderToStaticMarkup(createElement(App, { voiceController: testController, microphoneDevices: testMicrophoneDevices }));
+}
+
+function renderConversation(snapshot: PttVoiceSnapshot = idleSnapshot, transcripts: VoiceTranscriptItem[] = []) {
+  return renderToStaticMarkup(createElement(ConversationPanel, {
+    snapshot, transcripts, transcriptNotice: null, onStart: noop, onFinish: noop, onCancel: noop, onRecover: noop,
+  }));
+}
+
+function renderPresence(status: PttVoiceStatus = "idle", statusLabel = "PTT en espera") {
+  return renderToStaticMarkup(createElement(PresencePanel, { status, statusLabel }));
+}
 
 describe("Command Center visual structure", () => {
-  it("provides wallpaper enable and manual refresh controls without replacing panels", () => {
-    const markup = renderToStaticMarkup(createElement(App));
+  it("renders the primary date without the old timezone label and keeps the clocks", () => {
+    const markup = renderToStaticMarkup(createElement(CommandHeader, {
+      preferences: DEFAULT_DESKTOP_PREFERENCES,
+      weather: { available: false, location: "Barcelona", temperatureC: null, condition: null, updatedAt: 0 },
+    }));
+    expect(markup).not.toContain("FECHA /");
+    expect(markup).toContain("command-header-date");
+    expect(markup).toContain("command-header-clocks");
+    expect(markup.indexOf('class="command-header-left"')).toBeLessThan(markup.indexOf('class="command-header-clocks"'));
+    expect(markup).toContain('class="command-weather"');
+    expect(markup).not.toContain("holographic-frame");
+  });
+  it("keeps the primary workspace clean and preserves the existing panels", () => {
+    const markup = renderApp();
 
-    expect(markup).toContain('aria-label="Fondo de Windows activado"');
-    expect(markup).toContain('aria-label="Actualizar el wallpaper de Windows"');
+    expect(markup).toContain("COMMAND CENTER");
+    expect(markup).not.toContain('aria-label="Fondo de Windows activado"');
+    expect(markup).not.toContain('aria-label="Actualizar el wallpaper de Windows"');
     expect(markup).toContain('aria-labelledby="conversation-title"');
     expect(markup).toContain('data-renderer-slot="presence"');
   });
 
-  it("removes the redundant title while keeping the compact top controls", () => {
-    const markup = renderToStaticMarkup(createElement(App));
+  it("replaces development controls with the international header", () => {
+    const markup = renderApp();
 
     expect(markup).not.toContain("<h1");
-    expect(markup).toContain('aria-label="Controles del Command Center"');
-    expect(markup).toContain("Estado simulado");
-    expect(markup).toContain('aria-label="Comprobar el puente IPC local"');
-    expect(markup).toContain('aria-label="Fondo de Windows activado"');
-    expect(markup).toContain('aria-label="Actualizar el wallpaper de Windows"');
+    expect(markup).toContain('aria-label="Nexa Command Center"');
+    expect(markup).toContain("Barcelona");
+    expect(markup).toContain("Buenos Aires");
+    expect(markup).toContain("Costa Rica");
+    expect(markup).not.toContain('class="command-header-brand"');
+    expect(markup).not.toContain("FECHA ·");
+    expect(markup).toContain("Consultando clima");
+    expect(markup).not.toContain("Estado simulado");
+    expect(markup).not.toContain("Probar IPC");
+    expect(markup).not.toContain("Wallpaper ON");
+    expect(markup).not.toContain("Actualizar");
+    expect(markup).not.toContain("workspace-footer");
+    expect(markup).toContain('class="nexa-core-mark"');
+    expect(markup).toContain('class="nexa-core-mark__core"');
   });
 
   it("renders the three lower dashboard modules with clearly labeled mock and future data", () => {
@@ -39,19 +96,24 @@ describe("Command Center visual structure", () => {
     expect(markup).toContain("Herramientas disponibles");
     expect(markup).toContain("Capacidades futuras, aún no conectadas");
     expect(markup).toContain("Estado del sistema");
-    expect(markup).toContain("Sin métricas de rendimiento ni monitorización real.");
+    expect(markup).toContain("Los demás indicadores son demostrativos.");
     expect(markup).toContain("Sin conexión");
   });
 
   it("cleans panel and navigation labels while preserving their useful titles and the composer", () => {
-    const conversation = renderToStaticMarkup(createElement(ConversationPanel));
-    const presence = renderToStaticMarkup(createElement(PresencePanel));
+    const conversation = renderConversation();
+    const presence = renderPresence();
     const sidebar = renderToStaticMarkup(createElement(Sidebar));
 
     expect(conversation).toContain("Conversación");
     expect(conversation).not.toContain("ESPACIO DE TRABAJO");
     expect(conversation).not.toContain("INTERFAZ INACTIVA");
-    expect(conversation).toContain("Entrada no habilitada");
+    expect(conversation).not.toContain("Entrada conectada a Runtime; no se muestran respuestas simuladas");
+    expect(conversation).not.toContain("DEMO · MOCK");
+    expect(conversation).not.toContain("Voz en espera. El micrófono se activa al iniciar una grabación.");
+    expect(conversation).not.toContain("Sesión de demostración");
+    expect(conversation).not.toContain("Los mensajes siguientes son contenido de muestra.");
+    expect(conversation).not.toContain("LOCAL</span>");
     expect(conversation).toContain('id="message-composer"');
     expect(presence).toContain("Nexa Presence");
     expect(presence).not.toContain("PRESENCE · C-4");
@@ -67,7 +129,7 @@ describe("Command Center visual structure", () => {
 
   it("keeps the dashboard modules inside the fixed viewport with only localized compact scrolling", () => {
     const styles = readFileSync(new URL("../src/renderer/styles.css", import.meta.url), "utf8");
-    const markup = renderToStaticMarkup(createElement(App));
+    const markup = renderApp();
 
     expect(styles).toMatch(/html\s*\{[^}]*overflow:\s*hidden/s);
     expect(styles).toMatch(/body\s*\{[^}]*overflow:\s*hidden/s);
@@ -82,9 +144,20 @@ describe("Command Center visual structure", () => {
     expect(markup).toContain('aria-label="Mostrar controles de ventana"');
   });
 
+  it("adapts the international header and Settings modal to compact windows", () => {
+    const styles = readFileSync(new URL("../src/renderer/styles.css", import.meta.url), "utf8");
+    expect(styles).toMatch(/\.workspace-header\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\) auto/s);
+    expect(styles).toMatch(/\.command-header-left\s*\{[^}]*display:\s*flex/s);
+    expect(styles).toMatch(/\.command-header-clocks\s*\{[^}]*grid-template-columns:\s*repeat\(3, minmax\(102px, 1fr\)\)[^}]*justify-self:\s*end/s);
+    expect(styles).toMatch(/\.command-weather\s*\{[^}]*border:\s*0[^}]*background:\s*transparent[^}]*box-shadow:\s*none/s);
+    expect(styles).toMatch(/@media \(max-width:\s*760px\)[\s\S]*?\.workspace-header\s*\{[^}]*grid-template-rows:\s*auto auto/s);
+    expect(styles).toMatch(/\.settings-dialog\s*\{[^}]*max-height:\s*min\(850px, 92dvh\)/s);
+    expect(styles).toMatch(/@media \(max-width:\s*390px\)[\s\S]*?\.settings-add-clock, \.settings-weather-form\s*\{[^}]*grid-template-columns:\s*1fr/s);
+  });
+
   it("uses one horizontal gap token and hides only the conversation history scrollbar", () => {
     const styles = readFileSync(new URL("../src/renderer/styles.css", import.meta.url), "utf8");
-    const conversation = renderToStaticMarkup(createElement(ConversationPanel));
+    const conversation = renderConversation();
 
     expect(styles).toMatch(/--nexa-layout-column-gap:\s*18px/);
     expect(styles).toMatch(/\.app-shell\s*\{[^}]*column-gap:\s*var\(--nexa-layout-column-gap\)/s);
@@ -181,7 +254,8 @@ describe("Command Center visual structure", () => {
     expect(markup).toContain("Tools");
     expect(markup).toContain("Activity");
     expect(markup).toContain("Settings");
-    expect((markup.match(/disabled=""/g) ?? []).length).toBe(6);
+    expect((markup.match(/disabled=""/g) ?? []).length).toBe(5);
+    expect(markup).toContain('aria-label="Abrir Settings"');
     expect(markup).toContain("Memory");
     expect(markup).toContain("Files");
     expect(styles).toMatch(/\.sidebar\s*\{[^}]*padding:[^}]*\}/s);
@@ -211,19 +285,90 @@ describe("Command Center visual structure", () => {
     expect(navigation).toContain("holographic-frame-node");
   });
 
-  it("labels sample messages and keeps the composer inactive", () => {
-    const markup = renderToStaticMarkup(createElement(ConversationPanel));
+  it("starts with an empty real conversation and enables the real message composer", () => {
+    const markup = renderConversation();
 
-    expect(markup).toContain("DEMO · MOCK");
-    expect(markup).toContain("Mensajes de ejemplo");
-    expect(markup).toContain("no se han enviado a un modelo ni se han guardado");
+    expect(markup).toContain('aria-label="Historial de conversación"');
+    expect(markup).not.toContain('class="message message--user"');
+    expect(markup).not.toContain('class="message message--nexa');
+    expect(markup).not.toContain("MOCK");
+    expect(markup).not.toContain("Sesión de demostración");
     expect(markup).toContain('id="message-composer"');
-    expect(markup).toContain('placeholder="La entrada de mensajes no está activa"');
-    expect(markup).toContain('aria-label="Enviar mensaje, no disponible en esta versión"');
+    expect(markup).toContain('placeholder="Escribí un mensaje a Nexa…"');
+    expect(markup).toContain('aria-label="Enviar mensaje a Nexa"');
+    expect(markup).not.toContain("Nexa · Runtime");
+  });
+
+  it("keeps an OAuth action inside its assistant response, not the user's message", () => {
+    const requestId = "00000000-0000-4000-8000-000000000002";
+    const markup = renderToStaticMarkup(createElement(ConversationPanel, {
+      snapshot: idleSnapshot, transcripts: [], transcriptNotice: null, onStart: noop, onFinish: noop, onCancel: noop, onRecover: noop,
+      chatMessages: [
+        { id: requestId, requestId, conversationId: "conversation", role: "user", text: "¿Qué suena?", source: "typed", status: "completed", createdAt: 1 },
+        { id: `${requestId}:response`, requestId, conversationId: "conversation", role: "assistant", text: "Conectá Spotify para consultar la pista.", source: "typed", status: "completed", createdAt: 2, originalRequestText: "¿Qué suena?" },
+      ],
+      authorizationRequirements: { [requestId]: { provider: "spotify", state: "not_connected", reason: "spotify_auth_required", canConnect: true, retrySafe: true } },
+      onConnectAuthorization: noop,
+    }));
+    const userPosition = markup.indexOf('class="message message--user');
+    const assistantPosition = markup.indexOf('class="message message--nexa');
+    const authorizationPosition = markup.indexOf('class="authorization-card"');
+    expect(userPosition).toBeGreaterThanOrEqual(0);
+    expect(assistantPosition).toBeGreaterThan(userPosition);
+    expect(authorizationPosition).toBeGreaterThan(assistantPosition);
+  });
+
+  it("renders Spotify Now Playing with real metadata, a safe link, and artwork fallback", () => {
+    const requestId = "00000000-0000-4000-8000-000000000003";
+    const base = {
+      id: `${requestId}:response`, requestId, conversationId: "conversation", role: "assistant" as const,
+      text: "", source: "typed" as const, status: "completed" as const, createdAt: 2,
+    };
+    const renderCard = (card: { name: string; artists: string[]; imageUrl: string | null; spotifyUrl: string | null; playing: boolean }) =>
+      renderToStaticMarkup(createElement(ConversationPanel, {
+        snapshot: idleSnapshot, transcripts: [], transcriptNotice: null, onStart: noop, onFinish: noop, onCancel: noop, onRecover: noop,
+        chatMessages: [base], spotifyNowPlayingCards: { [requestId]: card }, onOpenSpotifyTrack: noop,
+      }));
+    const withImage = renderCard({ name: "Track", artists: ["Artist"], imageUrl: "https://i.scdn.co/image/abc", spotifyUrl: "https://open.spotify.com/track/abc123", playing: true });
+    expect(withImage).toContain('src="https://i.scdn.co/image/abc"');
+    expect(withImage).toContain("Track");
+    expect(withImage).toContain("Artist");
+    expect(withImage).toContain('class="spotify-now-playing__link"');
+    expect(withImage).toContain("Abrir en Spotify");
+    const withoutImage = renderCard({ name: "Track", artists: [], imageUrl: null, spotifyUrl: null, playing: false });
+    expect(withoutImage).not.toContain("<img");
+    expect(withoutImage).toContain("Carátula no disponible");
+    expect(withoutImage).toContain("Artistas no disponibles");
+    expect(withoutImage).toContain("Spotify");
+    expect(withoutImage.match(/Track/g)?.length).toBe(1);
+  });
+
+  it("renders the live Spotify miniplayer and disables controls until a compatible device is available", () => {
+    const unavailable = renderToStaticMarkup(createElement(DashboardModules, {
+      assistantState: "En espera",
+      spotifyStatus: { state: "not_connected", connected: false, deviceAvailable: false, controlsEnabled: false,
+        track: null, message: "Conectá Spotify desde Nexa para ver la reproducción.", updatedAt: 1 },
+    }));
+    expect(unavailable).toContain("Reproductor de Spotify");
+    expect(unavailable).toContain("Conectá Spotify desde el chat");
+    expect(unavailable).toContain('aria-label="Pista anterior"');
+    expect(unavailable).toContain('aria-label="Reanudar Spotify"');
+    expect(unavailable).toContain('aria-label="Pista siguiente"');
+    expect(unavailable.match(/disabled=""/gu)?.length).toBeGreaterThanOrEqual(3);
+
+    const playing = renderToStaticMarkup(createElement(DashboardModules, {
+      assistantState: "En espera", spotifyStatus: { state: "playing", connected: true, deviceAvailable: true,
+        controlsEnabled: true, track: { name: "Blue Hour", artists: ["Nexa Test"], imageUrl: "https://i.scdn.co/image/test",
+          spotifyUrl: "https://open.spotify.com/track/abc123", playing: true }, message: null, updatedAt: 2 },
+    }));
+    expect(playing).toContain("Blue Hour");
+    expect(playing).toContain("Nexa Test");
+    expect(playing).toContain('aria-label="Pausar Spotify"');
+    expect(playing).toContain("i.scdn.co/image/test");
   });
 
   it("provides an independent empty Presence renderer slot without generic media", () => {
-    const markup = renderToStaticMarkup(createElement(PresencePanel));
+    const markup = renderPresence();
 
     expect(markup).toContain('data-renderer-slot="presence"');
     expect(markup).toContain('data-renderer-mode="external"');

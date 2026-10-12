@@ -53,9 +53,9 @@ La ventana de Windows es frameless y conserva los límites de redimensionamiento
 
 BrowserWindow establece contextIsolation, sandbox y webSecurity en true, y nodeIntegration y allowRunningInsecureContent en false. El preload solo expone ping, lectura del wallpaper y tres operaciones de ventana específicas. Los handlers validan que el emisor sea el frame principal de Nexa; los canales de minimize/close descartan silenciosamente emisores no confiables. Se bloquean navegación fuera del punto de entrada, ventanas secundarias y webviews.
 
-La política CSP de producción solo permite recursos locales e imágenes `data:` validadas por el preload. En desarrollo agrega únicamente el servidor Vite en 127.0.0.1:5173 y su WebSocket; permite scripts y estilos inline para el preámbulo de React Refresh y el HMR local. Nunca habilita unsafe-eval.
+La política CSP de producción solo permite recursos locales e imágenes `data:` validadas por el preload. En desarrollo agrega únicamente el servidor Vite en 127.0.0.1:5174 y su WebSocket; permite scripts y estilos inline para el preámbulo de React Refresh y el HMR local. Nunca habilita unsafe-eval.
 
-La selección del renderer usa `app.isPackaged` como criterio principal. Una app empaquetada ignora `VITE_DEV_SERVER_URL` y carga siempre `dist/index.html`. En una ejecución no empaquetada, la variable solo acepta `http://127.0.0.1:5173` (también con `/` final), sin credenciales, rutas, parámetros ni fragmentos; cualquier otro valor detiene el arranque. `npm start` ejecuta la compilación sin empaquetar: si la variable no está definida, carga el `dist/index.html` local; si está definida, solo puede apuntar al Vite local exacto.
+La selección del renderer usa `app.isPackaged` como criterio principal. Una app empaquetada ignora `VITE_DEV_SERVER_URL` y carga siempre `dist/index.html`. En una ejecución no empaquetada, la variable solo acepta `http://127.0.0.1:5174` (también con `/` final), sin credenciales, rutas, parámetros ni fragmentos; cualquier otro valor detiene el arranque. `npm start` ejecuta la compilación sin empaquetar: si la variable no está definida, carga el `dist/index.html` local; si está definida, solo puede apuntar al Vite local exacto.
 
 ## Wallpaper local de Windows
 

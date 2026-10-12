@@ -135,6 +135,66 @@ test('is_app_running and UI Automation share the built-in modern-window matcher'
     assert.equal(result.processes[0].name, 'ApplicationFrameHost.exe');
 });
 
+test('is_app_running and window actions resolve Spanish names for the built-in Windows Calculator', async () => {
+    const windows = [{
+        id: '0x515', title: 'Calculator', process: 'ApplicationFrameHost.exe', pid: 515,
+    }];
+    const windowsApi = makeWindowsApi({
+        windows: [{ handle: 0x515n, title: 'Calculator', pid: 515, visible: true }],
+    });
+    const runningContext = {
+        platform: 'win32',
+        loadCatalog: async () => ({ version: 1, apps: [] }),
+        listProcesses: async () => taskList([{ name: 'ApplicationFrameHost.exe', pid: 515 }]),
+        readSnapshot: async () => ({ success: true, windows }),
+    };
+
+    for (const app of ['Calculadora', 'Calculadora de Windows', 'Calculadora Windows']) {
+        const result = await isAppRunning({ args: { app }, ...runningContext });
+        assert.equal(result.success, true, app);
+        assert.equal(result.running, true, app);
+        assert.equal(result.processes[0].name, 'ApplicationFrameHost.exe', app);
+    }
+
+    const maximized = await executeTool('maximize_window', { target: 'Calculadora' }, {
+        platform: 'win32', windowsApi,
+        listProcesses: async () => taskList([{ name: 'ApplicationFrameHost.exe', pid: 515 }]),
+        loadCatalog: async () => ({ version: 1, apps: [] }),
+    });
+    assert.equal(maximized.success, true);
+    assert.deepEqual(windowsApi.calls, [['show', 0x515n, 'maximize']]);
+});
+
+test('built-in application aliases resolve Chrome and File Explorer in English and Spanish', () => {
+    const windows = [
+        { id: '0x601', title: 'private browser title omitted', process: 'chrome.exe', pid: 601 },
+        { id: '0x602', title: 'File Explorer', process: 'explorer.exe', pid: 602 },
+    ];
+    for (const alias of ['Chrome', 'Google Chrome']) {
+        const result = matchWindows(windows, alias, { apps: [] });
+        assert.equal(result.kind, 'application', alias);
+        assert.deepEqual(result.matches.map(window => window.pid), [601]);
+    }
+    for (const alias of ['Explorer', 'File Explorer', 'Windows Explorer', 'Explorador', 'Explorador de archivos']) {
+        const result = matchWindows(windows, alias, { apps: [] });
+        assert.equal(result.kind, 'application', alias);
+        assert.deepEqual(result.matches.map(window => window.pid), [602]);
+    }
+});
+
+test('built-in application aliases preserve ambiguity for multiple Explorer and Chrome windows', () => {
+    const windows = [
+        { id: '0x611', title: 'first window', process: 'chrome.exe', pid: 611 },
+        { id: '0x612', title: 'second window', process: 'chrome.exe', pid: 612 },
+        { id: '0x613', title: 'File Explorer', process: 'explorer.exe', pid: 613 },
+        { id: '0x614', title: 'File Explorer', process: 'explorer.exe', pid: 614 },
+    ];
+    for (const alias of ['Google Chrome', 'Chrome', 'Explorador de archivos', 'Explorer']) {
+        const result = matchWindows(windows, alias, { apps: [] });
+        assert.equal(result.matches.length, 2, alias);
+    }
+});
+
 test('is_app_running resolves discovered apps through the existing catalog', async () => {
     const result = await isAppRunning({
         args: { app: 'Ableton' },

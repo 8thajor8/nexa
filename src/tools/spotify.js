@@ -1,6 +1,7 @@
 import {
     getCurrentSpotifyTrack,
     getSpotifyDevices,
+    formatSpotifyActionOutcome,
     nextSpotifyTrack,
     pauseSpotify,
     playSpotify,
@@ -37,7 +38,7 @@ const typeProperty = {
 
 export const spotifyGetCurrentTrackTool = functionTool(
     'spotify_get_current_track',
-    'Consulta qué contenido está sonando ahora en Spotify.'
+    'Consulta el contenido que está sonando ahora en Spotify. Es estado de reproducción actual, no evidencia de música preferida o escuchada habitualmente.'
 );
 export const spotifyGetDevicesTool = functionTool(
     'spotify_get_devices',
@@ -64,10 +65,10 @@ export const spotifyRegistrations = [
     { definition: spotifyGetCurrentTrackTool, execute: getCurrentSpotifyTrack },
     { definition: spotifyGetDevicesTool, execute: getSpotifyDevices },
     { definition: spotifySearchTool, execute: ({ args }) => searchSpotify(args.query, args.type) },
-    { definition: spotifyPlayTool, execute: ({ args }) => playSpotify(args) },
-    { definition: spotifyPauseTool, execute: pauseSpotify },
-    { definition: spotifyNextTool, execute: nextSpotifyTrack },
-    { definition: spotifyPreviousTool, execute: previousSpotifyTrack },
+    { definition: spotifyPlayTool, execute: ({ args, ...context }) => playSpotify({ ...context, ...args }) },
+    { definition: spotifyPauseTool, execute: context => pauseSpotify(context) },
+    { definition: spotifyNextTool, execute: context => nextSpotifyTrack(context) },
+    { definition: spotifyPreviousTool, execute: context => previousSpotifyTrack(context) },
 ];
 
 export function isSpotifyTool(name) {
@@ -78,7 +79,7 @@ export function isSpotifyTool(name) {
 // These compact outputs contain control state only; content is formatted locally.
 export function spotifyModelSafeOutput(name, result) {
     if (!result?.success) {
-        return { success: false, error: { code: result?.error?.code ?? 'spotify_error' } };
+        return { success: false, outcome: result?.outcome ?? 'rejected', error: { code: result?.error?.code ?? 'spotify_error' } };
     }
     if (name === 'spotify_search') return { success: true, resultsReady: true };
     if (name === 'spotify_get_current_track') {
@@ -87,7 +88,10 @@ export function spotifyModelSafeOutput(name, result) {
     if (name === 'spotify_get_devices') {
         return { success: true, deviceAvailable: Array.isArray(result.devices) && result.devices.length > 0 };
     }
-    return { success: true, confirmed: result.confirmed === true, action: result.action ?? name };
+    const action = result.action ?? name.replace(/^spotify_/u, '');
+    return { success: true, accepted: result.accepted === true, stateConfirmed: result.stateConfirmed === true,
+        outcome: result.outcome ?? 'provider_accepted', postStateConfirmed: result.postStateConfirmed === true, action,
+        confirmation: formatSpotifyActionOutcome(action, result.outcome ?? 'provider_accepted', result.verification) };
 }
 
 function spotifyLink(url) {
@@ -101,6 +105,46 @@ function spotifyLink(url) {
     }
 }
 
+function trustedProviderUrl(value, hostname) {
+    if (typeof value !== 'string') return null;
+    try {
+        const url = new URL(value);
+        return url.protocol === 'https:' && url.hostname === hostname && !url.username && !url.password && !url.port
+            ? url.href : null;
+    } catch { return null; }
+}
+
+function trustedSpotifyTrackUrl(value) {
+    const trusted = trustedProviderUrl(value, 'open.spotify.com');
+    if (!trusted) return null;
+    try {
+        const url = new URL(trusted);
+        if (!/^\/track\/[A-Za-z0-9]+\/?$/u.test(url.pathname)) return null;
+        return `https://open.spotify.com${url.pathname.replace(/\/$/u, '')}`;
+    } catch { return null; }
+}
+
+function safeMetadataText(value, maximumLength) {
+    return typeof value === 'string' ? value.replace(/[\u0000-\u001f\u007f-\u009f]/gu, '').trim().slice(0, maximumLength) : '';
+}
+
+// This card crosses the trusted Runtime-to-Main event channel, never the model input.
+export function createSpotifyNowPlayingCard(result) {
+    if (result?.success !== true || !result.track) return null;
+    const name = safeMetadataText(result.track.name, 300);
+    if (!name) return null;
+    const artists = Array.isArray(result.track.artists)
+        ? result.track.artists.map(value => safeMetadataText(value, 200)).filter(Boolean).slice(0, 10)
+        : [];
+    return {
+        name,
+        artists,
+        imageUrl: trustedProviderUrl(result.track.imageUrl, 'i.scdn.co'),
+        spotifyUrl: trustedSpotifyTrackUrl(result.track.spotifyUrl),
+        playing: result.playing === true,
+    };
+}
+
 function displayText(value) {
     return String(value ?? '')
         .replace(/[\u0000-\u001f\u007f]/gu, '')
@@ -111,7 +155,7 @@ export function formatSpotifyToolResult(name, result) {
     if (!result?.success) {
         const message = result?.error?.message ?? 'Spotify no pudo completar la solicitud.';
         const candidates = Array.isArray(result.candidates) ? result.candidates : [];
-        if (candidates.length === 0) return `Spotify: ${message}`;
+        if (candidates.length === 0) return /^Spotify\b/u.test(message) ? message : `Spotify: ${message}`;
         const lines = candidates.map((item, index) => {
             const artists = item.artists?.length ? ` — ${item.artists.map(displayText).join(', ')}` : '';
             return `${index + 1}. ${displayText(item.name)}${artists} ([Spotify](${spotifyLink(item.spotifyUrl)}))`;
@@ -145,15 +189,20 @@ export function formatSpotifyToolResult(name, result) {
         });
         return `Dispositivos de Spotify:\n${lines.join('\n')}`;
     }
+    if (result.outcome === 'state_confirmed') {
+        const action = result.action ?? name.replace(/^spotify_/u, '');
+        return formatSpotifyActionOutcome(action, 'state_confirmed', result.verification)
+            ?? 'El estado solicitado de Spotify está confirmado.';
+    }
     if (name === 'spotify_play' && result.selected) {
         const artists = result.selected.artists?.length ? ` — ${result.selected.artists.map(displayText).join(', ')}` : '';
-        return `Spotify confirmó la reproducción de **${displayText(result.selected.name)}**${artists}. ([Abrir en Spotify](${spotifyLink(result.selected.spotifyUrl)}))`;
+        return `Spotify aceptó la orden de reproducir **${displayText(result.selected.name)}**${artists}. ([Abrir en Spotify](${spotifyLink(result.selected.spotifyUrl)}))`;
     }
     const messages = {
-        spotify_play: 'Spotify confirmó la reproducción.',
-        spotify_pause: 'Spotify confirmó la pausa.',
-        spotify_next: 'Spotify confirmó el cambio a la siguiente pista.',
-        spotify_previous: 'Spotify confirmó el cambio a la pista anterior.',
+        spotify_play: 'Spotify aceptó la orden de reproducción.',
+        spotify_pause: 'Spotify aceptó la orden de pausa.',
+        spotify_next: 'Spotify aceptó la orden de avanzar. Estoy actualizando el estado de reproducción.',
+        spotify_previous: 'Spotify aceptó la orden de volver a la pista anterior. Estoy actualizando el estado de reproducción.',
     };
     return messages[name] ?? 'Spotify completó la solicitud.';
 }

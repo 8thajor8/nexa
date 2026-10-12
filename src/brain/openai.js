@@ -24,12 +24,13 @@ export function getOpenAIClient() {
     return client;
 }
 
-export async function askOpenAI({ instructions, input, tools = [], signal }) {
+export async function askOpenAI({ instructions, input, tools = [], toolChoice, signal }) {
     return getOpenAIClient().responses.create({
         model: config.model,
         instructions,
         input,
         tools,
+        ...(toolChoice ? { tool_choice: toolChoice } : {}),
     }, signal ? { signal } : undefined);
 }
 

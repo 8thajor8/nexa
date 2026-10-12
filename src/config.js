@@ -12,6 +12,14 @@ export function resolveCliMemoryMode(value) {
     throw new Error('NEXA_MEMORY_BACKEND must be memory1, memory2, or memory2-readonly.');
 }
 
+/** Resolve Desktop Runtime memory settings from the environment at composition time. */
+export function resolveRuntimeMemoryOptions(env = process.env) {
+    return {
+        memoryMode: resolveCliMemoryMode(env.NEXA_MEMORY_BACKEND),
+        storePath: env.NEXA_MEMORY2_STORE_PATH,
+    };
+}
+
 const configuredCliMode = process.env.NEXA_MEMORY_BACKEND;
 
 export const config = Object.freeze({

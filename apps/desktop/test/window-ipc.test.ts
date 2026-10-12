@@ -3,6 +3,9 @@ import {
   WINDOW_CLOSE_CHANNEL,
   WINDOW_MINIMIZE_CHANNEL,
   WINDOW_TOGGLE_MAXIMIZE_CHANNEL,
+  WINDOW_SETTINGS_GET_CHANNEL,
+  WINDOW_SETTINGS_SET_CHANNEL,
+  CLIPBOARD_WRITE_TEXT_CHANNEL,
 } from "../src/shared/ipc-contract";
 import type { IpcSenderContext } from "../src/shared/ipc-security";
 
@@ -11,9 +14,10 @@ const ipcMock = vi.hoisted(() => ({
   on: vi.fn(),
   removeHandler: vi.fn(),
   removeAllListeners: vi.fn(),
+  writeText: vi.fn(),
 }));
 
-vi.mock("electron", () => ({ ipcMain: ipcMock }));
+vi.mock("electron", () => ({ ipcMain: ipcMock, clipboard: { writeText: ipcMock.writeText } }));
 
 import { registerIpcHandlers } from "../src/main/ipc";
 
@@ -64,5 +68,47 @@ describe("frameless window IPC", () => {
     expect(window.close).toHaveBeenCalledTimes(1);
     expect(window.maximize).toHaveBeenCalledTimes(1);
     expect(window.unmaximize).toHaveBeenCalledTimes(1);
+  });
+
+  it("restricts display and fullscreen settings to the trusted Renderer and validates updates", async () => {
+    const mainFrame = {};
+    const webContents = { mainFrame };
+    const window = { webContents };
+    const snapshot = { displays: [{ id: "2", label: "Pantalla 2", resolution: "1920 × 1080", primary: false }],
+      preferences: { displayId: "2", startFullscreen: true }, effectiveFullscreen: true,
+      effectiveDisplayId: "2", transitioning: false, transitionTargetFullscreen: null, transitionTargetDisplayId: null };
+    const update = vi.fn((preferences) => ({ ...snapshot, preferences, effectiveFullscreen: preferences.startFullscreen }));
+    registerIpcHandlers(() => window as never, async () => ({ available: false }), { get: () => snapshot, set: update });
+    const invokeHandler = (channel: string) =>
+      ipcMock.handle.mock.calls.find(([registeredChannel]) => registeredChannel === channel)?.[1] as (event: IpcSenderContext, value?: unknown) => unknown;
+    const trustedEvent = { sender: webContents, senderFrame: mainFrame };
+    const untrustedEvent = { sender: webContents, senderFrame: {} };
+    expect(await invokeHandler(WINDOW_SETTINGS_GET_CHANNEL)(trustedEvent)).toEqual(snapshot);
+    expect(await invokeHandler(WINDOW_SETTINGS_SET_CHANNEL)(trustedEvent, { displayId: "2", startFullscreen: false }))
+      .toEqual({ ...snapshot, preferences: { displayId: "2", startFullscreen: false }, effectiveFullscreen: false });
+    expect(update).toHaveBeenCalledOnce();
+    expect(() => invokeHandler(WINDOW_SETTINGS_GET_CHANNEL)(untrustedEvent)).toThrow("untrusted_ipc_sender");
+    expect(() => invokeHandler(WINDOW_SETTINGS_SET_CHANNEL)(trustedEvent, { displayId: "2", startFullscreen: false, extra: true }))
+      .toThrow("invalid_window_preferences");
+    expect(update).toHaveBeenCalledOnce();
+  });
+
+  it("copies only bounded text from the trusted main frame", async () => {
+    const mainFrame = {};
+    const webContents = { mainFrame };
+    const window = { webContents };
+    registerIpcHandlers(() => window as never, async () => ({ available: false }));
+    const handler = ipcMock.handle.mock.calls.find(([channel]) => channel === CLIPBOARD_WRITE_TEXT_CHANNEL)?.[1] as
+      (event: IpcSenderContext, value: unknown) => unknown;
+    const trustedEvent = { sender: webContents, senderFrame: mainFrame };
+    const untrustedEvent = { sender: webContents, senderFrame: {} };
+    const detail = "Informe técnico asociado a este mensaje.";
+
+    expect(handler(trustedEvent, detail)).toBe(true);
+    expect(ipcMock.writeText).toHaveBeenCalledOnce();
+    expect(ipcMock.writeText).toHaveBeenCalledWith(detail);
+    expect(() => handler(trustedEvent, "x".repeat(20_001))).toThrow("invalid_clipboard_text");
+    expect(() => handler(untrustedEvent, "no copiar")).toThrow("untrusted_ipc_sender");
+    expect(ipcMock.writeText).toHaveBeenCalledOnce();
   });
 });

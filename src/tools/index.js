@@ -7,6 +7,7 @@ import { spotifyRegistrations } from './spotify.js';
 import { whatsappRegistrations } from '../integrations/whatsapp/index.js';
 import { speechRegistrations } from '../speech/index.js';
 import { communicationsRegistrations } from '../communications/tools.js';
+import { lifeguardRegistrations } from './lifeguard.js';
 import {
     closeWindowRegistration,
     focusWindowRegistration,
@@ -67,6 +68,7 @@ const localRegistrations = [
     ...whatsappRegistrations,
     ...speechRegistrations,
     ...communicationsRegistrations,
+    ...lifeguardRegistrations,
     ...spotifyRegistrations,
 ].map(registration => ({
     ...registration,
@@ -139,6 +141,10 @@ export async function executeTool(name, args, context) {
     }
 
     const permission = checkToolPermission(registration, context?.permissionPolicy);
+    try {
+        context?.diagnostic?.('tool_permission', { tool: name, permission: permission.permission,
+            allowed: permission.allowed, reason: permission.reason });
+    } catch { /* Diagnostics must not change tool authorization or execution. */ }
 
     if (!permission.allowed) {
         return {

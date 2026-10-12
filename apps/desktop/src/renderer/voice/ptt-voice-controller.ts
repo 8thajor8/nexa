@@ -9,6 +9,7 @@ export type PttVoiceStatus = "idle" | "starting" | "listening" | "finishing" | "
 
 export interface PttVoiceSnapshot {
   readonly status: PttVoiceStatus;
+  readonly canStart: boolean;
   readonly sessionId?: string;
   readonly requestId?: string;
   readonly turnId?: string;
@@ -16,6 +17,18 @@ export interface PttVoiceSnapshot {
   readonly language?: string | null;
   readonly error?: { readonly code: string; readonly message: string };
 }
+
+/** Minimal controller surface consumed by the Renderer UI. */
+export interface PttVoiceControllerPort {
+  readonly getSnapshot: () => PttVoiceSnapshot;
+  readonly subscribe: (listener: () => void) => () => void;
+  start(): Promise<void>;
+  finish(language?: string): Promise<void>;
+  cancel(): Promise<void>;
+  recoverMainCancellation(target?: "preferred" | "start" | "finish"): Promise<void>;
+}
+
+type PttVoiceSnapshotState = Omit<PttVoiceSnapshot, "canStart">;
 
 export interface PttCapturePort {
   start(): Promise<{ sessionId: string; requestId: string }>;
@@ -66,11 +79,11 @@ function pendingTextLength(envelope: VoiceEventEnvelope): number {
 }
 
 /** Coordinates one microphone capture instance and the allowlisted Voice event stream. */
-export class PttVoiceController {
+export class PttVoiceController implements PttVoiceControllerPort {
   private readonly capture: PttCapturePort;
   private readonly listeners = new Set<() => void>();
   private readonly unsubscribeVoice: () => void;
-  private snapshot: PttVoiceSnapshot = { status: "idle" };
+  private snapshot: PttVoiceSnapshot = { status: "idle", canStart: true };
   private activeSession: ActiveSession | null = null;
   private lastSequence = 0;
   private pendingFinishEvents: VoiceEventEnvelope[] = [];
@@ -103,9 +116,7 @@ export class PttVoiceController {
   };
 
   async start(): Promise<void> {
-    if (this.destroyed || this.startInFlight || this.finishInFlight || this.cancelInFlight
-      || this.capture.mainCancellationPending || this.activeSession) return;
-    if (!["idle", "error", "transcript-ready"].includes(this.snapshot.status)) return;
+    if (!this.isStartAllowed(this.snapshot.status)) return;
 
     const operation = ++this.operation;
     this.startInFlight = true;
@@ -127,6 +138,8 @@ export class PttVoiceController {
       if (!this.destroyed && this.cancelRequestedDuringStart) {
         this.cancelRequestedDuringStart = false;
         this.settleCancelledState();
+      } else if (!this.destroyed) {
+        this.refreshAvailability();
       }
     }
   }
@@ -178,6 +191,7 @@ export class PttVoiceController {
       }
     } finally {
       this.finishInFlight = false;
+      this.refreshAvailability();
     }
   }
 
@@ -217,7 +231,10 @@ export class PttVoiceController {
     })();
     this.cancelInFlight = task;
     try { await task; }
-    finally { if (this.cancelInFlight === task) this.cancelInFlight = null; }
+    finally {
+      if (this.cancelInFlight === task) this.cancelInFlight = null;
+      this.refreshAvailability();
+    }
   }
 
   async recoverMainCancellation(target: "preferred" | "start" | "finish" = "preferred"): Promise<void> {
@@ -289,7 +306,10 @@ export class PttVoiceController {
       const expectedRequestId = session.finishRequestId ?? session.startRequestId;
       if (envelope.requestId !== expectedRequestId) return;
       this.activeSession = null;
-      if (["transcript-ready", "error", "cancelling", "recovery-required", "recovering"].includes(this.snapshot.status)) return;
+      if (["transcript-ready", "error", "cancelling", "recovery-required", "recovering"].includes(this.snapshot.status)) {
+        this.refreshAvailability();
+        return;
+      }
       this.publish({ status: "error", sessionId: session.sessionId,
         error: { code: "voice_session_ended", message: "La sesión terminó antes de completar la transcripción." } });
       return;
@@ -350,9 +370,20 @@ export class PttVoiceController {
     this.pendingFinishOverflow = false;
   }
 
-  private publish(snapshot: PttVoiceSnapshot): void {
+  private publish(snapshot: PttVoiceSnapshotState): void {
     if (this.destroyed) return;
-    this.snapshot = snapshot;
+    this.snapshot = { ...snapshot, canStart: this.isStartAllowed(snapshot.status) };
     for (const listener of [...this.listeners]) listener();
+  }
+
+  private isStartAllowed(status: PttVoiceStatus): boolean {
+    return !this.destroyed && !this.startInFlight && !this.finishInFlight && !this.cancelInFlight
+      && !this.capture.mainCancellationPending && this.activeSession === null
+      && ["idle", "error", "transcript-ready"].includes(status);
+  }
+
+  private refreshAvailability(): void {
+    const canStart = this.isStartAllowed(this.snapshot.status);
+    if (canStart !== this.snapshot.canStart) this.publish(this.snapshot);
   }
 }

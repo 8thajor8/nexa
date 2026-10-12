@@ -50,7 +50,7 @@ export async function initializeEmptyMemoryStore({ storePath, now = () => new Da
 }
 
 export async function openMemoryBackend({ backend, storePath, loadLegacy = loadMemory,
-    repositoryFactory = createJsonMemoryRepository, now } = {}) {
+    repositoryFactory = createJsonMemoryRepository, now, organicMemoryAuthorizationFactory = null } = {}) {
     if (backend === 'memory1') return { backend, memory: await loadLegacy(), close: async () => {} };
     if (backend !== 'memory2') throw publicStartupError('memory_backend_invalid');
     await initializeEmptyMemoryStore({ storePath, ...(now ? { now } : {}) });
@@ -58,7 +58,8 @@ export async function openMemoryBackend({ backend, storePath, loadLegacy = loadM
     try {
         await repository.open();
         return { backend, repository, memory: { user: {}, preferences: {}, facts: [] },
-            service: createMemoryService({ repository, ...(now ? { now } : {}) }),
+            service: createMemoryService({ repository, ...(now ? { now } : {}),
+                organicMemoryAuthorizationFactory }),
             contextProvider: createMemoryContextProvider({ repository }),
             close: () => repository.close() };
     } catch (error) {

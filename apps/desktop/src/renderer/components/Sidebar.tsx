@@ -27,7 +27,7 @@ function NavIcon({ name }: { name: IconName }) {
   return <svg aria-hidden="true" className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
 
-export function Sidebar() {
+export function Sidebar({ onOpenSettings = () => undefined, showSettings = true }: { onOpenSettings?: () => void; showSettings?: boolean }) {
   return (
     <aside className="sidebar" aria-label="Navegación principal">
       <div className="brand-lockup">
@@ -35,12 +35,23 @@ export function Sidebar() {
       </div>
 
       <nav className="primary-nav" aria-label="Secciones, lista desplazable" tabIndex={0}>
-        {navigation.map((item) => {
+        {navigation.filter(item => showSettings || item.icon !== "settings").map((item) => {
           const contents = <><NavIcon name={item.icon} /><span className="nav-label">{item.label}</span>{!item.active && <span className="nav-soon">PRONTO</span>}<HolographicFrame variant="navigation" /></>;
           return item.active ? (
             <div className="nav-item nav-item--active" key={item.label} aria-current="page" aria-label={item.label}>
               {contents}
             </div>
+          ) : item.icon === "settings" ? (
+            <button
+              className="nav-item nav-item--settings"
+              key={item.label}
+              type="button"
+              onClick={onOpenSettings}
+              aria-label="Abrir Settings"
+              title="Configuración de Nexa Desktop"
+            >
+              {contents}
+            </button>
           ) : (
             <button
               className="nav-item nav-item--future"

@@ -88,10 +88,10 @@ describe("PttVoiceController", () => {
     expect(harness.createCapture).toHaveBeenCalledOnce();
     expect(harness.capture.start).not.toHaveBeenCalled();
     expect(harness.eventListeners.size).toBe(1);
-    expect(harness.controller.getSnapshot()).toEqual({ status: "idle" });
+    expect(harness.controller.getSnapshot()).toEqual({ status: "idle", canStart: true });
 
     await harness.controller.start();
-    expect(harness.controller.getSnapshot()).toEqual({ status: "listening", sessionId: "session-1" });
+    expect(harness.controller.getSnapshot()).toEqual({ status: "listening", sessionId: "session-1", canStart: false });
     expect(harness.capture.start).toHaveBeenCalledOnce();
   });
 
@@ -114,6 +114,25 @@ describe("PttVoiceController", () => {
     finishAck.resolve({ ok: true, accepted: true, requestId: "finish-1", sessionId: "session-1" });
     await finishing;
     expect(harness.controller.getSnapshot()).toMatchObject({ status: "processing", sessionId: "session-1", requestId: "finish-1" });
+  });
+
+  it("publishes start availability only when the same internal start guards allow a session", async () => {
+    const harness = makeHarness();
+    const initial = harness.controller.getSnapshot();
+    expect(initial.canStart).toBe(true);
+    expect(harness.controller.getSnapshot()).toBe(initial);
+
+    const startGate = deferred<{ sessionId: string; requestId: string }>();
+    harness.capture.start.mockReturnValueOnce(startGate.promise);
+    const starting = harness.controller.start();
+    expect(harness.controller.getSnapshot().canStart).toBe(false);
+    const pendingSnapshot = harness.controller.getSnapshot();
+    expect(harness.controller.getSnapshot()).toBe(pendingSnapshot);
+    await harness.controller.start();
+    expect(harness.capture.start).toHaveBeenCalledOnce();
+    startGate.resolve({ sessionId: "session-1", requestId: "start-1" });
+    await starting;
+    expect(harness.controller.getSnapshot()).toMatchObject({ status: "listening", canStart: false });
   });
 
   it("buffers a bounded sequence of Voice events that arrive before the finish ACK", async () => {
@@ -222,7 +241,7 @@ describe("PttVoiceController", () => {
     expect(harness.capture.start).toHaveBeenCalledOnce();
     await harness.controller.recoverMainCancellation("preferred");
     expect(harness.capture.recoverMainCancellation).toHaveBeenCalledWith("preferred");
-    expect(harness.controller.getSnapshot()).toEqual({ status: "idle" });
+    expect(harness.controller.getSnapshot()).toEqual({ status: "idle", canStart: true });
     await harness.controller.start();
     expect(harness.capture.start).toHaveBeenCalledTimes(2);
   });
@@ -240,7 +259,7 @@ describe("PttVoiceController", () => {
     expect(harness.controller.getSnapshot()).toMatchObject({ status: "recovery-required" });
     capture.recoverError = undefined;
     await harness.controller.recoverMainCancellation("start");
-    expect(harness.controller.getSnapshot()).toEqual({ status: "idle" });
+    expect(harness.controller.getSnapshot()).toEqual({ status: "idle", canStart: true });
   });
 
   it("handles consecutive sessions and does not let a prior session event replace the new state", async () => {
@@ -290,8 +309,12 @@ describe("PttVoiceController", () => {
     harness.emit(makeEvent("voice.transcribing", 1));
     harness.emit(makeEvent("voice.error", 2));
     expect(harness.controller.getSnapshot().status).toBe("error");
+    expect(harness.controller.getSnapshot().canStart).toBe(false);
+    const activeErrorSnapshot = harness.controller.getSnapshot();
     harness.emit(makeEvent("voice.session.ended", 3, { turnId: undefined }));
     expect(harness.controller.getSnapshot().status).toBe("error");
+    expect(harness.controller.getSnapshot().canStart).toBe(true);
+    expect(harness.controller.getSnapshot()).not.toBe(activeErrorSnapshot);
     await harness.controller.start();
     expect(harness.capture.start).toHaveBeenCalledTimes(2);
     expect(harness.controller.getSnapshot()).toMatchObject({ status: "listening", sessionId: "session-2" });
@@ -350,14 +373,23 @@ describe("PttVoiceController", () => {
 
     await harness.controller.cancel();
     expect(harness.controller.getSnapshot().status).toBe("recovery-required");
+    expect(harness.controller.getSnapshot().canStart).toBe(false);
     await harness.controller.start();
     expect(capture.start).toHaveBeenCalledOnce();
 
     capture.cancelError = undefined;
     await harness.controller.recoverMainCancellation("finish");
     expect(harness.controller.getSnapshot().status).toBe("idle");
+    expect(harness.controller.getSnapshot().canStart).toBe(true);
     await harness.controller.start();
     expect(capture.start).toHaveBeenCalledTimes(2);
+  });
+
+  it("publishes retry availability after a capture error without retaining a session", async () => {
+    const harness = makeHarness();
+    harness.capture.start.mockRejectedValueOnce(Object.assign(new Error("device denied"), { code: "permission_denied" }));
+    await harness.controller.start();
+    expect(harness.controller.getSnapshot()).toMatchObject({ status: "error", canStart: true });
   });
 
   it("notifies and removes subscribers exactly once", async () => {

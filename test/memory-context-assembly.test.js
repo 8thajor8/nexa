@@ -85,6 +85,16 @@ test('only singular first-person self references orient Self; plural references 
     assert.equal((await repository.readSnapshot()).revision, current.revision);
 });
 
+test('natural first-person preference questions retrieve owner Memory2 without an explicit memory command', async () => {
+    const { repository, add } = fixture();
+    add({ subject: { type: 'owner' }, predicate: 'user.preference.editor',
+        object: { type: 'text', value: 'Mi editor habitual es Windsurf.' } });
+    const provider = providerFor(repository);
+    const result = outputOf(await provider.read({ message: '¿Qué editor uso normalmente?' }));
+    assert.equal(result.orientation.mode, 'self');
+    assert.deepEqual(result.assertions.map(item => item.object.value), ['Mi editor habitual es Windsurf.']);
+});
+
 test('recent continuity uses only a unique verified entity from bounded prior user turns', async () => {
     const { repository, add } = fixture();
     add({ subject: { type: 'entity', entity_type: 'person', id: coti }, object: { type: 'text', value: 'Synthetic architecture plan.' } });

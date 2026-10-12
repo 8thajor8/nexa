@@ -1,5 +1,6 @@
 import { availableToolsMock, recentActivityMock, systemStatusMock } from "../data/dashboard-mock";
 import { HolographicFrame } from "./HolographicFrame";
+import type { SpotifyLiveStatus, SpotifyPlaybackControl } from "../../shared/ipc-contract";
 
 function ActivityGlyph({ icon }: { icon: (typeof recentActivityMock)[number]["icon"] }) {
   if (icon === "window") return <svg viewBox="0 0 20 20"><rect x="3" y="4" width="14" height="12" rx="1.5" /><path d="M3 7h14" /></svg>;
@@ -16,7 +17,54 @@ function ModuleHeading({ id, title, label }: { id: string; title: string; label:
   );
 }
 
-export function DashboardModules({ assistantState }: { assistantState: string }) {
+interface DashboardModulesProps {
+  assistantState: string;
+  spotifyStatus?: SpotifyLiveStatus;
+  spotifyBusyAction?: SpotifyPlaybackControl | null;
+  spotifyError?: string | null;
+  onSpotifyControl?: (action: SpotifyPlaybackControl) => void;
+  onOpenSpotifyTrack?: (url: string) => void;
+}
+
+function SpotifyMiniPlayer({ status, busyAction, error, onControl, onOpenTrack }: {
+  status: SpotifyLiveStatus; busyAction: SpotifyPlaybackControl | null; error: string | null;
+  onControl?: (action: SpotifyPlaybackControl) => void; onOpenTrack?: (url: string) => void;
+}) {
+  const currentAction: SpotifyPlaybackControl = status.state === "playing" ? "pause" : "play";
+  const stateLabel: Record<SpotifyLiveStatus["state"], string> = {
+    loading: "Actualizando", playing: "Conectado · reproduciendo", paused: "Conectado · en pausa", no_track: "Conectado",
+    not_connected: "Sin conectar", no_device: "Sin dispositivo", unavailable: "No disponible",
+  };
+  const disabled = !status.controlsEnabled || busyAction !== null;
+  return (
+    <section className="spotify-mini-player" aria-label="Reproductor de Spotify" aria-busy={busyAction !== null}>
+      {status.track?.imageUrl
+        ? <img className="spotify-mini-player__artwork" src={status.track.imageUrl} alt="" referrerPolicy="no-referrer" />
+        : <div className="spotify-mini-player__artwork spotify-mini-player__artwork--empty" aria-label="Carátula no disponible">♫</div>}
+      <div className="spotify-mini-player__meta">
+        <span className={`spotify-mini-player__state spotify-mini-player__state--${status.state}`}>
+          {busyAction ? "Actualizando…" : stateLabel[status.state]}
+        </span>
+        <strong title={status.track?.name ?? undefined}>{status.track?.name ?? (status.state === "not_connected" ? "Conectá Spotify desde el chat" : "Nada está sonando")}</strong>
+        <span title={status.track?.artists.join(", ")}>{status.track?.artists.join(", ") ?? "Esperando estado de Spotify"}</span>
+        {status.track?.spotifyUrl && <button type="button" className="spotify-mini-player__open" aria-label="Abrir pista en Spotify"
+          onClick={() => onOpenTrack?.(status.track!.spotifyUrl!)}>Abrir en Spotify ↗</button>}
+      </div>
+      <div className="spotify-mini-player__controls" aria-label="Controles de reproducción">
+        <button type="button" aria-label="Pista anterior" title="Anterior" disabled={disabled} onClick={() => onControl?.("previous")}>|◀</button>
+        <button type="button" className="spotify-mini-player__primary" aria-label={currentAction === "pause" ? "Pausar Spotify" : "Reanudar Spotify"}
+          title={currentAction === "pause" ? "Pausar" : "Reproducir"} disabled={disabled} onClick={() => onControl?.(currentAction)}>
+          {busyAction === currentAction ? "…" : currentAction === "pause" ? "Ⅱ" : "▶"}
+        </button>
+        <button type="button" aria-label="Pista siguiente" title="Siguiente" disabled={disabled} onClick={() => onControl?.("next")}>▶|</button>
+      </div>
+      {(error || status.message) && <small className="spotify-mini-player__notice" role={error ? "alert" : undefined}>{error ?? status.message}</small>}
+    </section>
+  );
+}
+
+export function DashboardModules({ assistantState, spotifyStatus, spotifyBusyAction = null, spotifyError = null,
+  onSpotifyControl, onOpenSpotifyTrack }: DashboardModulesProps) {
   return (
     <section className="dashboard-modules" aria-label="Módulos del Command Center">
       <section className="dashboard-module surface-panel" aria-labelledby="activity-title">
@@ -47,10 +95,12 @@ export function DashboardModules({ assistantState }: { assistantState: string })
         </ul>
       </section>
 
-      <section className="dashboard-module surface-panel" aria-labelledby="system-title">
+      <section className="dashboard-module dashboard-module--system surface-panel" aria-labelledby="system-title">
         <HolographicFrame />
-        <ModuleHeading id="system-title" title="Estado del sistema" label="DEMO" />
-        <ul className="system-list" aria-label="Indicadores de demostración">
+        <ModuleHeading id="system-title" title="Estado del sistema" label="SPOTIFY" />
+        {spotifyStatus && <SpotifyMiniPlayer status={spotifyStatus} busyAction={spotifyBusyAction} error={spotifyError}
+          onControl={onSpotifyControl} onOpenTrack={onOpenSpotifyTrack} />}
+        <ul className="system-list" aria-label="Otros indicadores del sistema">
           {systemStatusMock.map((item) => {
             const isAssistant = item.valueKind === "assistant";
             const value = isAssistant ? assistantState : item.value;
@@ -64,7 +114,7 @@ export function DashboardModules({ assistantState }: { assistantState: string })
             );
           })}
         </ul>
-        <p className="system-disclaimer">Sin métricas de rendimiento ni monitorización real.</p>
+        <p className="system-disclaimer">Los demás indicadores son demostrativos.</p>
       </section>
     </section>
   );

@@ -1,0 +1,184 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { classifySystemDiagnosticRequest, createOperationalDiagnostics,
+    createTechnicalDiagnosticReport, formatMemoryDiagnostics, formatSystemStatus, formatToolCatalog } from '../src/core/system-diagnostics.js';
+
+test('classifies supported Spanish system and memory questions without matching ordinary recall prompts', () => {
+    assert.equal(classifySystemDiagnosticRequest('¿Qué sistema de memoria estás usando?'), 'status');
+    assert.equal(classifySystemDiagnosticRequest('¿Tenés Memory2 activo?'), 'status');
+    assert.equal(classifySystemDiagnosticRequest('¿Qué herramientas tenés disponibles?'), 'tool_catalog');
+    assert.equal(classifySystemDiagnosticRequest('Nexa, diagnosticá tu memoria'), 'memory');
+    assert.equal(classifySystemDiagnosticRequest('¿Está funcionando Memory2?'), 'memory');
+    assert.equal(classifySystemDiagnosticRequest('¿Por qué no recordaste mi editor favorito?'), 'memory');
+    assert.equal(classifySystemDiagnosticRequest('Preparame un informe técnico completo para soporte sobre tu última recuperación de memoria'), 'technical_memory');
+    assert.equal(classifySystemDiagnosticRequest('¿Qué editor de código prefiero?'), null);
+    assert.equal(classifySystemDiagnosticRequest('Dame el diagnóstico técnico de Voice'), 'technical_voice');
+    assert.equal(classifySystemDiagnosticRequest('¿Cuál es el estado de PTT?'), 'technical_voice');
+});
+
+test('Voice diagnostics retain bounded safe stage metadata and omit conversation, audio, and credentials', () => {
+    const diagnostics = createOperationalDiagnostics();
+    diagnostics.recordVoiceOperation({ requestId: '00000000-0000-4000-8000-000000000001', stage: 'identity_processing', state: 'error',
+        errorCode: 'voice_identity_browser_unavailable', durationMs: 17, model: 'gpt-4o-mini-tts', voice: 'nova',
+        identityProfile: 'nova-portena', identityProcessing: true,
+        durations: { synthesisMs: 800, identityProcessingMs: 17, identityBrowserStartupMs: 900,
+            identityRendererPreparationMs: 120, identityDspSetupMs: 40, identityDspProcessingMs: 7000,
+            identityAudioCaptureWaitMs: 6800, identityPostProcessingMs: 15, audioReadyMs: 10300, audioPreparationMs: 2 },
+        transcript: 'private utterance', text: 'private response', apiKey: 'secret' });
+    const report = JSON.parse(createTechnicalDiagnosticReport(diagnostics.snapshot(), 'voice'));
+    assert.equal(report.component, 'voice');
+    assert.equal(report.voice.last.stage, 'identity_processing');
+    assert.equal(report.voice.last.errorCode, 'voice_identity_browser_unavailable');
+    assert.equal(report.voice.last.errorDescription, 'Browser local de procesamiento de identidad vocal no disponible');
+    assert.equal(report.voice.last.durations.synthesisMs, 800);
+    assert.equal(report.voice.last.durations.identityBrowserStartupMs, 900);
+    assert.equal(report.voice.last.durations.identityAudioCaptureWaitMs, 6800);
+    assert.equal(report.voice.last.durations.audioReadyMs, 10300);
+    assert.equal(report.voice.last.model, 'gpt-4o-mini-tts');
+    assert.doesNotMatch(JSON.stringify(report), /private utterance|private response|secret|"apiKey"|"transcript"|C:\\Users\\/iu);
+    for (let index = 0; index < 12; index++) diagnostics.recordVoiceOperation({ requestId: `req-${index}`, stage: 'playback', state: 'success' });
+    assert.equal(diagnostics.snapshot().voice.recent.length, 8);
+});
+
+test('diagnostic evidence is bounded, in-memory and retained when later reports are requested', () => {
+    const diagnostics = createOperationalDiagnostics({ runtimeId: 'runtime-test-1', memoryMode: 'memory2-readonly' });
+    diagnostics.setMemoryStatus({ backend: 'memory2', storeType: 'Memory 2 Schema v5', initialized: true,
+        available: true, retrievalEnabled: true, schemaValidation: 'validated' });
+    const first = diagnostics.recordMemoryRetrieval({ operationId: 'op-test-1', requestId: 'request-test-1',
+        mode: 'memory2-readonly', backend: 'memory2', readStatus: 'success', assertionCount: 1,
+        relationCount: 0, matchCount: 1, contextDelivered: true });
+    const snapshot = diagnostics.snapshot();
+    assert.equal(snapshot.lastMemoryRetrieval.operationId, first.operationId);
+    assert.equal(snapshot.operations.length, 1);
+    assert.match(formatMemoryDiagnostics(snapshot), /contexto se incluyó en la solicitud al modelo/u);
+    const report = formatMemoryDiagnostics(snapshot, { technical: true });
+    assert.match(report, /MEMORY_CONTEXT_DELIVERED_USAGE_UNKNOWN/u);
+    assert.match(report, /Uso por el modelo.*unknown/u);
+    assert.doesNotMatch(report, /C:\\Users\\|OPENAI_API_KEY|token/iu);
+    for (let index = 0; index < 20; index++) diagnostics.recordMemoryRetrieval({
+        operationId: `op-${index}`, readStatus: 'success', matchCount: 0, contextDelivered: false,
+    });
+    assert.equal(diagnostics.snapshot().operations.length, 12);
+    assert.equal(diagnostics.snapshot().lastMemoryRetrieval.operationId, 'op-19');
+});
+
+test('diagnostics distinguish missing retrieval, no match and read errors', () => {
+    const diagnostics = createOperationalDiagnostics({ memoryMode: 'memory1' });
+    assert.match(formatMemoryDiagnostics(diagnostics.snapshot(), { technical: true }), /MEMORY_NO_RETRIEVAL/u);
+    diagnostics.recordMemoryRetrieval({ readStatus: 'success', matchCount: 0, contextDelivered: false });
+    assert.match(formatMemoryDiagnostics(diagnostics.snapshot()), /no encontró recuerdos/u);
+    diagnostics.recordMemoryRetrieval({ readStatus: 'error', errorCode: 'memory_store_changed' });
+    const report = formatMemoryDiagnostics(diagnostics.snapshot(), { technical: true });
+    assert.match(report, /MEMORY_READ_FAILED/u);
+    assert.match(report, /memory_store_changed/u);
+    assert.doesNotMatch(report, /secret-value|C:\\Users\\/iu);
+});
+
+test('system status separates registered and available tools and reports unknown states honestly', () => {
+    const diagnostics = createOperationalDiagnostics({ memoryMode: 'memory2-confirmed-write' });
+    const snapshot = { ...diagnostics.snapshot(), tools: { registered: ['open_app', 'spotify_play'], available: ['open_app'] } };
+    const simple = formatSystemStatus(snapshot);
+    assert.match(simple, /Memory2 en modo de escritura confirmada/u);
+    assert.match(simple, /todavía no inicializado/u);
+    assert.doesNotMatch(simple, /open_app|spotify_play/u);
+    const technical = formatSystemStatus(snapshot, { technical: true });
+    assert.match(technical, /Herramientas registradas \(2\)/u);
+    assert.match(technical, /Herramientas habilitadas \(1\)/u);
+    assert.match(technical, /Disponibilidad:\*\* unknown/u);
+});
+
+test('memory status answers only about memory and catalog requests are grouped from registered tools', () => {
+    const snapshot = { runtime: { id: 'runtime-test', state: 'active' },
+        memory: { mode: 'memory2-confirmed-write', backend: 'memory2', storeType: 'Memory 2 Schema v5',
+            initialized: false, available: null, retrievalEnabled: null, schemaValidation: 'unknown', lastError: null },
+        tools: { registered: ['spotify_play', 'spotify_next', 'open_app', 'mystery_tool'],
+            available: ['spotify_play', 'open_app'], definitions: [{ id: 'mystery_tool', description: 'Unknown actual tool description' }] },
+        lastMemoryRetrieval: null };
+    assert.equal(classifySystemDiagnosticRequest('¿Qué sistema de memoria estás usando?'), 'status');
+    const status = formatSystemStatus(snapshot);
+    assert.match(status, /Estado de mi memoria/u);
+    assert.doesNotMatch(status, /spotify_play|mystery_tool|herramientas disponibles/u);
+    assert.equal(classifySystemDiagnosticRequest('¿Qué herramientas tenés disponibles?'), 'tool_catalog');
+    const all = formatToolCatalog(snapshot);
+    assert.match(all.text, /Música y Spotify/u);
+    assert.match(all.text, /Computadora y aplicaciones/u);
+    assert.doesNotMatch(all.text, /spotify_play|mystery_tool/u);
+    assert.equal(all.tools.find((tool) => tool.id === 'mystery_tool').name, 'mystery_tool');
+    assert.equal(all.tools.find((tool) => tool.id === 'mystery_tool').connected, 'unknown');
+    assert.doesNotMatch(all.technicalDetail, /Unknown actual tool description/u);
+    const spotify = formatToolCatalog(snapshot, { category: 'Música y Spotify' });
+    assert.match(spotify.text, /Herramientas de Spotify/u);
+    assert.doesNotMatch(spotify.text, /Computadora y aplicaciones/u);
+    const unavailableSpotify = formatToolCatalog({ ...snapshot, tools: { ...snapshot.tools, available: ['open_app'] } },
+        { category: 'Música y Spotify' });
+    assert.match(unavailableSpotify.text, /No tengo herramientas de Spotify habilitadas/u);
+});
+
+test('technical diagnostic report is structured, correlated, and omits arbitrary sensitive fields', () => {
+    const report = JSON.parse(createTechnicalDiagnosticReport({ runtime: { id: 'runtime-1' }, memory: {
+        backend: 'memory2', mode: 'memory2-readonly', storeType: 'Memory 2 Schema v5', initialized: true,
+        schemaValidation: 'validated', retrievalEnabled: true, lastError: null, secret: 'do-not-copy',
+    }, tools: { registered: ['open_app'], available: ['open_app'] }, lastMemoryRetrieval: {
+        operationId: 'op-1', requestId: 'req-1', backend: 'memory2', mode: 'memory2-readonly',
+        readStatus: 'success', matchCount: 1, contextDelivered: true, privatePayload: 'do-not-copy',
+    } }, 'system'));
+    assert.equal(report.operationId, 'op-1');
+    assert.equal(report.contextDelivered, true);
+    assert.equal(report.tools[0].id, 'open_app');
+    assert.equal(report.tools[0].enabled, true);
+    assert.equal(JSON.stringify(report).includes('do-not-copy'), false);
+});
+
+test('memory diagnostics distinguish confirmed-write availability and an explicit request without a proposal', () => {
+    const diagnostics = createOperationalDiagnostics({ memoryMode: 'memory2-confirmed-write' });
+    diagnostics.setMemoryStatus({ backend: 'memory2', mode: 'memory2-confirmed-write', storeType: 'Memory 2 Schema v5',
+        initialized: true, available: true, retrievalEnabled: true, confirmedWriteAvailability: 'available' });
+    diagnostics.recordMemoryChange({ requestId: 'request-write-1', operation: 'remember', intentDetected: true,
+        proposalGenerated: false, confirmationRequested: false, confirmation: 'not_required', persisted: 'no',
+        result: 'unknown', errorCode: 'memory_request_not_recognized', proposalText: 'private synthetic value' });
+    const snapshot = diagnostics.snapshot();
+    const human = formatMemoryDiagnostics(snapshot);
+    assert.match(human, /Memory2 está activado para guardar recuerdos con confirmación/u);
+    assert.match(human, /no llegó a generar una propuesta/u);
+    assert.match(human, /No se guardó ningún recuerdo/u);
+    const technical = JSON.parse(createTechnicalDiagnosticReport(snapshot, 'memory'));
+    assert.equal(technical.confirmedWriteAvailability, 'available');
+    assert.equal(technical.lastMemoryChange.intentDetected, true);
+    assert.equal(technical.lastMemoryChange.proposalGenerated, false);
+    assert.equal(technical.lastMemoryChange.confirmationRequested, false);
+    assert.equal(technical.lastMemoryChange.persisted, 'no');
+    assert.equal(technical.lastMemoryChange.errorCode, 'memory_request_not_recognized');
+    assert.equal(Object.hasOwn(technical, 'tools'), false, 'memory detail must not dump the full tool catalog');
+    assert.doesNotMatch(JSON.stringify(technical), /private synthetic value|proposalText/u);
+});
+
+test('unobserved write activity remains unknown instead of being reported as a failed write', () => {
+    const diagnostics = createOperationalDiagnostics({ memoryMode: 'memory2-confirmed-write' });
+    diagnostics.setMemoryStatus({ confirmedWriteAvailability: 'available' });
+    const report = formatMemoryDiagnostics(diagnostics.snapshot());
+    assert.match(report, /Todavía no hay una recuperación contextual registrada/u);
+    assert.doesNotMatch(report, /solicitud no llegó|No se guardó ningún recuerdo/u);
+});
+
+test('technical memory report exposes only an allowlisted synthetic store identity', () => {
+    const diagnostics = createOperationalDiagnostics({ memoryMode: 'memory2-confirmed-write' });
+    diagnostics.setMemoryStatus({ storeIdentity: 'synthetic_memory_write_01' });
+    const report = JSON.parse(createTechnicalDiagnosticReport(diagnostics.snapshot(), 'memory'));
+    assert.equal(report.storeIdentity, 'synthetic_memory_write_01');
+
+    diagnostics.setMemoryStatus({ storeIdentity: 'C:\\Users\\private\\memory.json' });
+    const redacted = JSON.parse(createTechnicalDiagnosticReport(diagnostics.snapshot(), 'memory'));
+    assert.equal(redacted.storeIdentity, 'unknown');
+    assert.doesNotMatch(JSON.stringify(redacted), /C:\\\\Users|private|memory\.json/u);
+});
+
+test('memory diagnostics summarize update confirmation state without retaining proposed content', () => {
+    const diagnostics = createOperationalDiagnostics({ memoryMode: 'memory2-confirmed-write' });
+    diagnostics.recordMemoryChange({ requestId: 'request-update-1', operation: 'update', candidateState: 'found',
+        candidateCount: 1, confirmation: 'pending', result: 'unknown', proposedValue: 'private synthetic value' });
+    const snapshot = diagnostics.snapshot();
+    const report = formatMemoryDiagnostics(snapshot, { technical: true });
+    assert.match(report, /Último cambio de memoria:\*\* update; mecanismo=unknown; intérprete_invocado=unknown; interpretación=unknown; validación_Runtime=unknown; intención=unknown; aceptada=unknown; propuesta=unknown; aclaración=unknown; confirmación solicitada=unknown; estado=pending; persistido=unknown; resultado=unknown/u);
+    assert.doesNotMatch(report, /private synthetic value|proposedValue|C:\\Users\\/iu);
+    assert.match(formatMemoryDiagnostics(snapshot), /pendiente de tu confirmación/u);
+});

@@ -1,14 +1,20 @@
+import type { PttVoiceStatus } from "../voice/ptt-voice-controller";
 import { HolographicFrame } from "./HolographicFrame";
 
 const futureModes = ["Sidebar", "Mini Presence", "Renderizador externo"];
 
-export function PresencePanel() {
+interface PresencePanelProps {
+  status: PttVoiceStatus;
+  statusLabel: string;
+}
+
+export function PresencePanel({ status, statusLabel }: PresencePanelProps) {
   return (
-    <aside className="presence-panel surface-panel" aria-labelledby="presence-title" data-renderer-slot="presence">
+    <aside className="presence-panel surface-panel" aria-labelledby="presence-title" data-renderer-slot="presence" data-voice-state={status}>
       <HolographicFrame />
       <header className="panel-heading presence-heading">
         <h2 id="presence-title">Nexa Presence</h2>
-        <span className="presence-state"><span /> RESERVADO</span>
+        <span className={`presence-state presence-state--${status}`} aria-label={`Estado de voz: ${statusLabel}`}><span /> {statusLabel}</span>
       </header>
 
       <div className="presence-viewport" data-renderer-mode="external" aria-label="Contenedor vacío para el renderizador Presence">
@@ -22,6 +28,7 @@ export function PresencePanel() {
           <span className="presence-empty-mark" aria-hidden="true"><span /><span /></span>
           <strong>Sin visualización</strong>
           <span className="presence-placeholder-copy">El renderizador se conectará en una etapa posterior.</span>
+          <span className="presence-voice-status" aria-hidden="true">{statusLabel}</span>
         </div>
         <span className="viewport-coordinate viewport-coordinate--top">NEXA / P-01</span>
         <span className="viewport-coordinate viewport-coordinate--bottom">SLOT DISPONIBLE</span>
@@ -31,7 +38,6 @@ export function PresencePanel() {
         <div className="presence-architecture-heading"><span>MODALIDADES PREVISTAS</span><span>FUTURO</span></div>
         <ul>{futureModes.map((mode) => <li key={mode}><span className="mode-marker" aria-hidden="true" />{mode}</li>)}</ul>
       </section>
-
     </aside>
   );
 }

@@ -8,6 +8,9 @@ import type {
   VoicePttFinishResponse,
   VoicePttStartRequest,
   VoicePttStartResponse,
+  VoiceSpeechCancelRequest,
+  VoiceSpeechCancelResponse,
+  VoiceSpeechEvent,
 } from "./ipc-contract.js";
 
 export const MAX_VOICE_PTT_AUDIO_BYTES = 1_048_576;
@@ -92,6 +95,31 @@ export function isVoicePttFinishRequest(value: unknown): value is VoicePttFinish
 export function isVoicePttCancelRequest(value: unknown): value is VoicePttCancelRequest {
   return isPlainRecord(value) && hasExactKeys(value, ["requestId", "sessionId", "targetRequestId"])
     && isVoiceId(value.requestId) && isVoiceId(value.sessionId) && isVoiceId(value.targetRequestId);
+}
+
+export function isVoiceSpeechCancelRequest(value: unknown): value is VoiceSpeechCancelRequest {
+  return isPlainRecord(value) && hasExactKeys(value, ["requestId"]) && isVoiceId(value.requestId);
+}
+
+export function isVoiceSpeechEvent(value: unknown): value is VoiceSpeechEvent {
+  if (!isPlainRecord(value) || !isVoiceId(value.requestId)) return false;
+  if (value.state === "preparing" || value.state === "speaking" || value.state === "completed" || value.state === "cancelled") {
+    return hasExactKeys(value, ["requestId", "state"]);
+  }
+  return value.state === "error" && hasExactKeys(value, ["requestId", "state", "error"])
+    && isPlainRecord(value.error) && hasExactKeys(value.error, ["code"])
+    && ["voice_speech_generation_failed", "voice_speech_playback_failed", "voice_speech_playback_timeout",
+      "voice_speech_start_timeout", "voice_speech_stop_failed", "voice_speech_stop_timeout", "voice_speech_busy",
+      "voice_speech_degraded", "voice_speech_too_long", "voice_audio_storage_unavailable", "voice_tts_generation_failed",
+      "voice_tts_response_invalid", "voice_audio_processing_failed", "voice_audio_storage_failed",
+      "voice_identity_browser_unavailable"].includes(String(value.error.code));
+}
+
+export function isVoiceSpeechCancelResponse(value: unknown): value is VoiceSpeechCancelResponse {
+  if (!isPlainRecord(value) || !isVoiceId(value.requestId)) return false;
+  if (value.ok === true) return hasExactKeys(value, ["ok", "requestId", "cancelled"]) && typeof value.cancelled === "boolean";
+  return value.ok === false && hasExactKeys(value, ["ok", "requestId", "error"])
+    && (value.error === "request_not_found" || value.error === "operation_failed");
 }
 
 function isVoicePttEvent(value: unknown): value is VoicePttEvent {

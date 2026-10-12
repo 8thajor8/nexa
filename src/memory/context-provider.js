@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { createMemoryRetriever, resolveEntityMentions, scoreMemoryRecordRelevance } from './retrieval.js';
+import { createMemoryRetriever, hasMemoryRelevanceTerms, resolveEntityMentions, scoreMemoryRecordRelevance } from './retrieval.js';
 import { RELATION_PREDICATES } from './relation-predicates.js';
 import { isEntityName } from './entities.js';
 
@@ -9,7 +9,8 @@ const MAX_CONTINUITY_TURNS = 4;
 const MAX_CONTINUITY_CHARS = 1000;
 const CONTINUATION_CUE = /(?:algo relacionado|algo sobre eso|sobre eso|al respecto|respecto a eso|en ese tema|related to that|something related|about that|that topic|same topic)/iu;
 const TEMPORAL_CUE = /(?:\ben\s+|\bdurante\s+|\bel\s+|\bon\s+|\bin\s+|\bas of\s+)(\d{4}(?:-\d{2}(?:-\d{2})?)?)(?![\d-])/giu;
-const SELF_CUE = /(?:^|[^\p{L}\p{N}_])(?:yo|mí|mi|mis|me|i|my|mine)(?=$|[^\p{L}\p{N}_])/iu;
+const OWNER_REFERENCE_CUE = /(?:^|[^\p{L}\p{N}_])(?:(?:el|la)\s+(?:usuario|usuaria|persona\s+usuaria|titular|propietario|propietaria|dueño|dueña)(?:\s+de\s+(?:la\s+)?cuenta)?|(?:the\s+)?(?:user|account\s+owner))(?=$|[^\p{L}\p{N}_])/iu;
+const SELF_CUE = /(?:^|[^\p{L}\p{N}_])(?:yo|mí|mi|mis|me|prefiero|uso|utilizo|i|my|mine)(?=$|[^\p{L}\p{N}_])/iu;
 const compareText = (a, b) => a < b ? -1 : a > b ? 1 : 0;
 
 function temporalIntent(message) {
@@ -26,7 +27,7 @@ function selfReference(message) {
     if (typeof message !== 'string') return false;
     const unquoted = message.replace(/```[\s\S]*?```/gu, ' ')
         .replace(/"[^"]*"|'[^']*'|“[^”]*”|‘[^’]*’/gu, ' ');
-    return SELF_CUE.test(unquoted);
+    return SELF_CUE.test(unquoted) || OWNER_REFERENCE_CUE.test(unquoted);
 }
 
 function resolveSafely(text, snapshot) {
@@ -165,7 +166,8 @@ function assertOptions({ repository, maxAssertions, maxRelations, maxCharacters,
 /** Fresh, selective and bounded Memory 2 context. Memory1 does not use this provider. */
 export function createMemoryContextProvider({ repository, maxRecords = 20, maxAssertions = maxRecords,
     maxRelations = 10, maxCharacters = 12000, maxPerEntityPredicate = 3,
-    maxRelationsPerEntity = 3, now = () => new Date().toISOString() } = {}) {
+    maxRelationsPerEntity = 3, matchSpecificSelfQueries = false, now = () => new Date().toISOString() } = {}) {
+    if (typeof matchSpecificSelfQueries !== 'boolean') throw new TypeError('memory_context_options_invalid');
     assertOptions({ repository, maxAssertions, maxRelations, maxCharacters, maxPerEntityPredicate, maxRelationsPerEntity, now });
     let generation = 0, lastDigest = null;
     return Object.freeze({
@@ -196,7 +198,12 @@ export function createMemoryContextProvider({ repository, maxRecords = 20, maxAs
                 ? await retriever.knowledgeValidAt(query, validTime)
                 : await retriever.currentKnowledge(query);
             const seedIds = selected.seedEntityIds;
-            const rows = rankedRows(selected, seedIds, query.relevanceText);
+            let rows = rankedRows(selected, seedIds, query.relevanceText);
+            if (matchSpecificSelfQueries && orientation.includeSelf && hasMemoryRelevanceTerms(message)) {
+                // A specific self/owner question must return only topic-matching records;
+                // broad memory questions retain the existing complete-context behavior.
+                rows = rows.filter(row => row.textRelevance > 0);
+            }
             const entityById = new Map(selected.entities.map(entity => [entity.id, entity]));
             const payload = { authority: 'data_only', trust: { authority: 'data_only' },
                 snapshot: { storeId: selected.metadata.storeId, revision: selected.metadata.revision, digest: selected.metadata.digest },

@@ -14,6 +14,17 @@ const windowsPath = (root, ...parts) => root
     : null;
 
 const maxListedProcesses = 100;
+const whitelistedAppAliases = new Map([
+    ['calculadora', 'calculator'],
+    ['calculadora de windows', 'calculator'],
+    ['calculadora windows', 'calculator'],
+    ['windows calculator', 'calculator'],
+    ['google chrome', 'chrome'],
+    ['explorador', 'explorer'],
+    ['explorador de archivos', 'explorer'],
+    ['file explorer', 'explorer'],
+    ['windows explorer', 'explorer'],
+]);
 
 export const openAppTool = {
     type: 'function',
@@ -104,6 +115,7 @@ export async function openApp({
     environment = process.env,
     catalogPath,
     loadCatalog = loadAppCatalog,
+    diagnostic = () => {},
 } = {}) {
     if (platform !== 'win32') {
         return failure('unsupported_platform', 'open_app solo está disponible en Windows.');
@@ -111,8 +123,13 @@ export async function openApp({
 
     const requestedName = typeof args?.app === 'string' ? args.app.trim() : '';
     const normalizedName = normalizeAppName(requestedName);
+    const whitelistName = whitelistedAppAliases.get(normalizedName) ?? normalizedName;
+
+    try { diagnostic('windows_app_resolution_started', { tool: 'open_app', appQuery: normalizedName.slice(0, 120) }); } catch {}
 
     if (!normalizedName || /[\\/:]/u.test(requestedName)) {
+        try { diagnostic('windows_app_resolution', { tool: 'open_app', appQuery: normalizedName.slice(0, 120),
+            resolution: 'invalid_name', target: 'none' }); } catch {}
         return failure('app_not_found', 'No se encontró esa aplicación en el catálogo local.');
     }
 
@@ -125,6 +142,10 @@ export async function openApp({
     } catch {
         // Un catálogo que no se puede leer no impide usar la whitelist explícita.
     }
+
+    try { diagnostic('windows_app_resolution', { tool: 'open_app', appQuery: normalizedName.slice(0, 120),
+        resolution: resolved?.status ?? 'catalog_unavailable',
+        target: resolved?.targetType ?? (windowsAppWhitelist[whitelistName]?.length ? 'whitelist' : 'none') }); } catch {}
 
     if (resolved?.status === 'ambiguous') {
         return {
@@ -139,13 +160,20 @@ export async function openApp({
 
     if (resolved?.status === 'found') {
         appName = resolved.app.displayName ?? resolved.app.name;
+        const launchStartedAt = Date.now();
+        try { diagnostic('windows_launch_attempt', { tool: 'open_app', target: resolved.targetType }); } catch {}
         try {
             await launchResolvedApp(resolved.app, resolved.targetType, {
                 environment,
                 launchProcess,
             });
+            try { diagnostic('windows_launch_accepted', { tool: 'open_app', target: resolved.targetType,
+                durationMs: Date.now() - launchStartedAt }); } catch {}
             return { success: true, app: appName, message: `Se inició ${appName}.` };
-        } catch {
+        } catch (error) {
+            try { diagnostic('windows_launch_failed', { tool: 'open_app', target: resolved.targetType,
+                durationMs: Date.now() - launchStartedAt, errorName: error?.name ?? 'Error',
+                errorCode: typeof error?.code === 'string' ? error.code : null }); } catch {}
             return failure('app_launch_failed', `No se pudo iniciar ${appName}. Revisá que esté instalada.`);
         }
     }
@@ -154,7 +182,7 @@ export async function openApp({
         return failure('app_not_found', 'La aplicación encontrada no tiene un destino de inicio confiable.');
     }
 
-    const appTargets = windowsAppWhitelist[normalizedName]?.map(item => ({
+    const appTargets = windowsAppWhitelist[whitelistName]?.map(item => ({
         executable: item.executable,
         args: [...item.args],
     })) ?? [];
@@ -163,14 +191,21 @@ export async function openApp({
     }
 
     for (const appTarget of appTargets) {
+        const launchStartedAt = Date.now();
+        try { diagnostic('windows_launch_attempt', { tool: 'open_app', target: 'whitelist' }); } catch {}
         try {
             await launchProcess(appTarget.executable, [...appTarget.args]);
+            try { diagnostic('windows_launch_accepted', { tool: 'open_app', target: 'whitelist',
+                durationMs: Date.now() - launchStartedAt }); } catch {}
             return {
                 success: true,
                 app: appName,
                 message: `Se inició ${appName}.`,
             };
-        } catch {
+        } catch (error) {
+            try { diagnostic('windows_launch_failed', { tool: 'open_app', target: 'whitelist',
+                durationMs: Date.now() - launchStartedAt, errorName: error?.name ?? 'Error',
+                errorCode: typeof error?.code === 'string' ? error.code : null }); } catch {}
             // Probar la siguiente ruta permitida para la misma aplicación.
         }
     }

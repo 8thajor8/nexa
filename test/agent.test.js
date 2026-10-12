@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createAgent } from '../src/core/agent.js';
+import { executeTool } from '../src/tools/index.js';
 
 function functionCall(name, args, callId = `${name}-call`) {
     return { type: 'function_call', name, arguments: JSON.stringify(args), call_id: callId };
@@ -143,4 +144,166 @@ test('agent passes the exact current user message and a stable private session i
     assert.equal(contexts.length, 1);
     assert.equal(contexts[0].userMessage, 'confirmar envío action_0123456789abcdef0123456789abcdef');
     assert.match(contexts[0].sessionId, /^[0-9a-f-]{36}$/u);
+});
+
+test('agent reports a Spotify skip from the Runtime result without asking the model to invent a second status', async () => {
+    const { agent, requests } = await makeAgent({
+        responses: [toolResponse(functionCall('spotify_next', {}, 'spotify-next-once')), finalResponse('Spotify aceptó la orden.')],
+        execute: async () => ({ success: true, action: 'next', accepted: true, outcome: 'accepted', confirmed: true }),
+    });
+    assert.equal(await agent.run('adelanta cancion'), 'Spotify aceptó la orden de avanzar. Estoy actualizando el estado de reproducción.');
+    assert.equal(await agent.run('¿Qué pasó?'), 'Spotify aceptó la orden.');
+    assert.equal(requests.length, 2);
+    assert.ok(requests[1].input.some((item) => item.role === 'assistant'
+        && item.content === 'Spotify aceptó la orden de avanzar. Estoy actualizando el estado de reproducción.'));
+});
+
+test('Spotify dispatcher result and user-facing response preserve accepted and rejected outcomes with safe correlation', async () => {
+    for (const scenario of [
+        { status: 204, expectedOutcome: 'provider_accepted', expectedText: 'Spotify aceptó la orden de volver a la pista anterior. Estoy actualizando el estado de reproducción.' },
+        { status: 400, expectedOutcome: 'rejected', expectedText: 'Spotify no pudo completar la solicitud.' },
+    ]) {
+        const traces = [];
+        const client = { request: async (_endpoint, options = {}) => {
+            if (scenario.status !== 204) {
+                options.onResponse?.(scenario.status);
+                throw Object.assign(new Error('provider response'), { code: 'spotify_api_error', status: scenario.status });
+            }
+            options.onResponse?.(scenario.status);
+            return null;
+        } };
+        const { agent } = await makeAgent({
+            responses: [toolResponse(functionCall('spotify_previous', {}, `call-${scenario.status}`)), finalResponse('ignored model answer')],
+            execute: (name, args, context) => executeTool(name, args, { ...context, client }),
+            logger: (event, details) => traces.push({ event, details }),
+        });
+        assert.equal(await agent.run('Volvé a la canción anterior.', 'direct_user', { requestId: `desktop-${scenario.status}` }), scenario.expectedText);
+        assert.ok(traces.some(({ event, details }) => event === 'spotify_provider_response'
+            && details.requestId === `desktop-${scenario.status}` && details.httpStatus === scenario.status));
+        assert.ok(traces.some(({ event, details }) => event === 'spotify_runtime_outcome'
+            && details.requestId === `desktop-${scenario.status}` && details.outcome === scenario.expectedOutcome
+            && details.httpStatus === (scenario.status === 204 ? null : scenario.status)));
+        assert.ok(traces.some(({ event, details }) => event === 'spotify_response_presented'
+            && details.requestId === `desktop-${scenario.status}` && details.outcome === scenario.expectedOutcome));
+        assert.equal(JSON.stringify(traces).includes('provider response'), false);
+    }
+});
+
+test('agent returns the single truthful Spotify warning after an uncertain track skip', async () => {
+    const warning = 'Spotify no permitió verificar si cambió la pista. No se repetirá la orden para evitar saltar otra canción.';
+    const { agent, requests } = await makeAgent({
+        responses: [toolResponse(functionCall('spotify_next', {}, 'spotify-next-uncertain'))],
+        execute: async () => ({ success: false, error: { code: 'spotify_action_outcome_uncertain', message: warning } }),
+    });
+    assert.equal(await agent.run('adelanta cancion'), warning);
+    assert.equal(requests.length, 1);
+});
+
+test('agent prevents a duplicate Spotify skip in the same tool batch after an uncertain result', async () => {
+    let executions = 0;
+    const { agent } = await makeAgent({
+        responses: [{ output: [
+            functionCall('spotify_next', {}, 'spotify-next-first'),
+            functionCall('spotify_next', {}, 'spotify-next-duplicate'),
+        ], output_text: '' }],
+        execute: async () => { executions++; return { success: false, outcome: 'uncertain', error: { code: 'spotify_action_outcome_uncertain', message: 'No se repetirá la orden para evitar saltar otra canción.' } }; },
+    });
+    const answer = await agent.run('adelanta cancion');
+    assert.equal(executions, 1);
+    assert.match(answer, /No se repetirá la orden/u);
+});
+
+test('Desktop authorization errors do not send CLI instructions to the model', async () => {
+    let authorization;
+    const { agent, requests } = await makeAgent({
+        responses: [
+            toolResponse(functionCall('search_emails', { query: 'reunión' })),
+            finalResponse('Conectá Microsoft desde Nexa Desktop.'),
+        ],
+        execute: async () => ({ success: false, error: {
+            code: 'email_not_connected', message: 'Ejecutá npm run connect:microsoft para conectar la cuenta.',
+        } }),
+    });
+    await agent.run('Buscá el último correo.', 'untrusted', {
+        requestId: '00000000-0000-4000-8000-000000000001',
+        onAuthorizationRequired: requirement => { authorization = requirement; },
+    });
+    const toolOutput = requests[1].input.find(item => item.type === 'function_call_output');
+    const serialized = toolOutput.output;
+    assert.deepEqual(authorization, {
+        provider: 'microsoft', state: 'not_connected', reason: 'email_not_connected', canConnect: true, retrySafe: true,
+    });
+    assert.doesNotMatch(serialized, /npm run|terminal|connect:microsoft/iu);
+    assert.match(serialized, /necesita conectarse desde la acción disponible en Nexa Desktop/u);
+});
+
+test('Desktop chat reports a Spotify HTTP 403 as provider rejection, not proven missing authorization', async () => {
+    let authorization;
+    const message = 'Spotify rechazó la acción (HTTP 403); puede deberse a permisos, cuenta o una restricción del proveedor.';
+    const { agent } = await makeAgent({
+        responses: [toolResponse(functionCall('spotify_play', { query: '', type: 'track' }))],
+        execute: async () => ({ success: false, status: 403, outcome: 'rejected',
+            error: { code: 'spotify_forbidden', message } }),
+    });
+    const answer = await agent.run('poné play', 'typed', { onAuthorizationRequired: value => { authorization = value; } });
+    assert.equal(answer, message);
+    assert.equal(authorization, undefined);
+    assert.doesNotMatch(answer, /no concedió los permisos necesarios/u);
+});
+
+test('Desktop chat truthfully reports observed playback after first Play with unknown previous state', async () => {
+    let authorization;
+    const message = 'Spotify está reproduciendo';
+    const { agent } = await makeAgent({
+        responses: [toolResponse(functionCall('spotify_play', { query: '', type: 'track' }))],
+        execute: async () => ({ success: false, outcome: 'uncertain', verification: 'target_state_observed',
+            verificationEvidence: { before: null, after: { playing: true } },
+            error: { code: 'spotify_action_outcome_uncertain', message } }),
+    });
+    const answer = await agent.run('poné play', 'typed', { onAuthorizationRequired: value => { authorization = value; } });
+    assert.equal(answer, message);
+    assert.equal(authorization, undefined);
+});
+
+test('CLI authorization errors retain their existing provider instructions', async () => {
+    const { agent, requests } = await makeAgent({
+        responses: [
+            toolResponse(functionCall('search_emails', { query: 'reunión' })),
+            finalResponse('Conectá Microsoft para continuar.'),
+        ],
+        execute: async () => ({ success: false, error: {
+            code: 'email_not_connected', message: 'Ejecutá npm run connect:microsoft para conectar la cuenta.',
+        } }),
+    });
+    await agent.run('Buscá el último correo.');
+    const toolOutput = requests[1].input.find(item => item.type === 'function_call_output');
+    assert.match(toolOutput.output, /npm run connect:microsoft/u);
+});
+
+test('Desktop Now Playing card keeps Spotify metadata out of the model and replaces contradictory final prose', async () => {
+    const cardEvents = [];
+    const { agent, requests } = await makeAgent({
+        responses: [
+            toolResponse(functionCall('spotify_get_current_track', {})),
+            finalResponse('Spotify dice que está sonando algo, pero no me pasó el nombre de la canción.'),
+            finalResponse('Ahora puedo continuar.'),
+        ],
+        execute: async () => ({ success: true, playing: true, track: {
+            name: 'Alohomora', artists: ['Pogo'], imageUrl: 'https://i.scdn.co/image/album',
+            spotifyUrl: 'https://open.spotify.com/track/abc123',
+        } }),
+    });
+
+    const response = await agent.run('¿Qué está sonando en Spotify?', 'untrusted', {
+        onSpotifyNowPlaying: card => cardEvents.push(card),
+    });
+
+    assert.deepEqual(cardEvents, [{ name: 'Alohomora', artists: ['Pogo'], imageUrl: 'https://i.scdn.co/image/album',
+        spotifyUrl: 'https://open.spotify.com/track/abc123', playing: true }]);
+    assert.equal(response, 'Spotify está mostrando la reproducción actual en la tarjeta.');
+    const toolOutput = requests[1].input.find(item => item.type === 'function_call_output');
+    assert.deepEqual(JSON.parse(toolOutput.output), { success: true, playing: true, trackAvailable: true });
+    assert.equal(response.includes('Alohomora'), false);
+    await agent.run('¿Y ahora?');
+    assert.equal(JSON.stringify(requests[2].input).includes('no me pasó el nombre de la canción'), false);
 });

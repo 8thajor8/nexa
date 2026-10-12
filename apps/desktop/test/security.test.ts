@@ -27,15 +27,22 @@ describe("Electron security configuration", () => {
       sandbox: true, webSecurity: true, allowRunningInsecureContent: false,
     });
   });
+  it("passes the isolated renderer signal only when Main explicitly supplies it", () => {
+    expect(createSecureWebPreferences("preload.cjs")).not.toHaveProperty("additionalArguments");
+    expect(createSecureWebPreferences("preload.cjs", ["--nexa-renderer-isolated"]).additionalArguments)
+      .toEqual(["--nexa-renderer-isolated"]);
+  });
   it("uses restrictive production and loopback-only development policies", () => {
     const productionPolicy = createContentSecurityPolicy(false);
     const developmentPolicy = createContentSecurityPolicy(true);
     expect(productionPolicy).toContain("default-src 'self'");
     expect(productionPolicy).toContain("object-src 'none'");
+    expect(productionPolicy).toContain("img-src 'self' data: https://i.scdn.co");
+    expect(productionPolicy).not.toMatch(/img-src 'self' data: https:;/u);
     expect(productionPolicy).not.toContain("unsafe-inline");
     expect(productionPolicy).not.toContain("127.0.0.1");
-    expect(developmentPolicy).toContain("127.0.0.1:5173");
-    expect(developmentPolicy).toContain("ws://127.0.0.1:5173");
+    expect(developmentPolicy).toContain("127.0.0.1:5174");
+    expect(developmentPolicy).toContain("ws://127.0.0.1:5174");
     expect(developmentPolicy).not.toContain("unsafe-eval");
   });
   it("allows only the configured entry point", () => {
@@ -43,18 +50,18 @@ describe("Electron security configuration", () => {
     expect(isAllowedNavigation("https://example.com", "file:///app/dist/index.html")).toBe(false);
   });
   it("accepts only the exact local Vite URL in development", () => {
-    expect(isExpectedViteDevServerUrl("http://127.0.0.1:5173")).toBe(true);
-    expect(isExpectedViteDevServerUrl("http://127.0.0.1:5173/")).toBe(true);
-    expect(selectRendererEntryPoint(false, "http://127.0.0.1:5173", "dist/index.html"))
-      .toEqual({ kind: "url", url: "http://127.0.0.1:5173" });
+    expect(isExpectedViteDevServerUrl("http://127.0.0.1:5174")).toBe(true);
+    expect(isExpectedViteDevServerUrl("http://127.0.0.1:5174/")).toBe(true);
+    expect(selectRendererEntryPoint(false, "http://127.0.0.1:5174", "dist/index.html"))
+      .toEqual({ kind: "url", url: "http://127.0.0.1:5174" });
   });
   it.each([
     "https://example.com",
-    "http://localhost:5173",
-    "http://127.0.0.1:5174",
-    "http://user:pass@127.0.0.1:5173",
-    "http://127.0.0.1:5173/other",
-    "http://127.0.0.1:5173/?unexpected=1",
+    "http://localhost:5174",
+    "http://127.0.0.1:5173",
+    "http://user:pass@127.0.0.1:5174",
+    "http://127.0.0.1:5174/other",
+    "http://127.0.0.1:5174/?unexpected=1",
     "not a url",
   ])("rejects unsafe or malformed development URL %s", (url) => {
     expect(isExpectedViteDevServerUrl(url)).toBe(false);

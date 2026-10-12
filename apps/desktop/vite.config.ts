@@ -29,7 +29,7 @@ function contentSecurityPolicyPlugin(): Plugin {
 
 export default defineConfig({
   plugins: [react(), tailwindcss(), contentSecurityPolicyPlugin()],
-  server: { host: "127.0.0.1", port: 5173, strictPort: true },
+  server: { host: "127.0.0.1", port: 5174, strictPort: true },
   build: { outDir: "dist", emptyOutDir: true },
-  test: { environment: "node", include: ["test/**/*.test.ts"], clearMocks: true },
+  test: { environment: "node", include: ["test/**/*.test.{ts,tsx}"], clearMocks: true },
 });

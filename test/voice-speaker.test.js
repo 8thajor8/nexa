@@ -60,6 +60,23 @@ test('speaker emits sanitized generation and playback errors', async () => {
     assert.equal(playbackEvents[0].phase, 'speaking');
 });
 
+test('speaker preserves the verified SpeechService processing failure and safe stage timings', async () => {
+    const speaker = createVoiceSpeaker({ idFactory: () => 'turn-diagnostic', speechService: {
+        async generate() { return { success: false, error: { code: 'voice_identity_browser_unavailable', message: 'internal path must not escape' } }; },
+        getLastMetrics() { return { failureStage: 'identity_processing', model: 'gpt-4o-mini-tts', voice: 'nova',
+            identityProfile: 'nova-portena', identityProcessing: true, synthesisMs: 93, identityProcessingMs: 4,
+            storageInitializationMs: 1, apiKey: 'secret' }; },
+        async play() { throw new Error('must not play'); },
+        async removeTemporary() { return true; },
+    } });
+    const events = [];
+    speaker.on('voice.speech.error', event => events.push(event));
+    await assert.rejects(speaker.speak('respuesta sintética'), error => error.code === 'voice_identity_browser_unavailable');
+    assert.equal(events[0].diagnostics.stage, 'identity_processing');
+    assert.equal(events[0].diagnostics.metrics.synthesisMs, 93);
+    assert.doesNotMatch(JSON.stringify(events[0]), /internal path|apiKey|secret|respuesta sintética/u);
+});
+
 test('cancellation during synthesis returns promptly and ignores late output', async () => {
     const pendingGeneration = deferred();
     let playCalls = 0;

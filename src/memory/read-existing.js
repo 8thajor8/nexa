@@ -140,7 +140,7 @@ export async function openExistingMemory2Reader({ storePath } = {}) {
             },
         });
 
-        const facade = createMemory2ReadOnly({ repository });
+        const facade = createMemory2ReadOnly({ repository, matchSpecificSelfQueries: true });
         const result = Object.create(null);
         Object.defineProperties(result, {
             readContext: { enumerable: true, value: options => {

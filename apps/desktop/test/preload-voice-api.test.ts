@@ -28,6 +28,7 @@ async function loadPreload() {
   return mocks.exposed as {
     voice: {
       ptt: { start: (request: unknown) => Promise<unknown>; finish: (request: unknown) => Promise<unknown>; cancel: (request: unknown) => Promise<unknown> };
+      speech: { cancel: (request: unknown) => Promise<unknown>; onEvent: (listener: (event: unknown) => void) => () => void };
       onEvent: (listener: (event: unknown) => void) => () => void;
     };
     [key: string]: unknown;
@@ -39,8 +40,9 @@ describe("Voice preload API", () => {
 
   it("exposes only narrow Voice methods and invokes fixed channels with validated requests", async () => {
     const api = await loadPreload();
-    expect(Object.keys(api.voice).sort()).toEqual(["onEvent", "ptt"]);
+    expect(Object.keys(api.voice).sort()).toEqual(["onEvent", "ptt", "speech"]);
     expect(Object.keys(api.voice.ptt).sort()).toEqual(["cancel", "finish", "start"]);
+    expect(Object.keys(api.voice.speech).sort()).toEqual(["cancel", "onEvent"]);
     expect(api).not.toHaveProperty("ipcRenderer");
     expect(api).not.toHaveProperty("send");
 
@@ -58,6 +60,24 @@ describe("Voice preload API", () => {
       .resolves.toMatchObject({ cancelled: true });
     expect(mocks.invoke).toHaveBeenLastCalledWith("voice:ptt:cancel", { requestId: "cancel-1", sessionId: "session-1", targetRequestId: "finish-1" });
     expect(mocks.invoke).toHaveBeenCalledTimes(3);
+  });
+
+  it("exposes correlated speech cancellation and filters malformed playback events", async () => {
+    const api = await loadPreload();
+    const request = { requestId: "00000000-0000-4000-8000-000000000061" };
+    mocks.invoke.mockResolvedValueOnce({ ok: true, requestId: request.requestId, cancelled: true });
+    await expect(api.voice.speech.cancel(request)).resolves.toEqual({ ok: true, requestId: request.requestId, cancelled: true });
+    expect(mocks.invoke).toHaveBeenLastCalledWith("voice:speech:cancel", request);
+
+    const received = vi.fn();
+    const unsubscribe = api.voice.speech.onEvent(received);
+    const listener = mocks.on.mock.calls.find(([channel]) => channel === "voice:speech:event")?.[1] as (_event: unknown, payload: unknown) => void;
+    listener({}, { requestId: "invalid", state: "not-a-speech-state" });
+    listener({}, { requestId: request.requestId, state: "completed" });
+    expect(received).toHaveBeenCalledOnce();
+    expect(received).toHaveBeenCalledWith({ requestId: request.requestId, state: "completed" });
+    unsubscribe();
+    expect(mocks.removeListener).toHaveBeenCalledWith("voice:speech:event", listener);
   });
 
   it("rejects invalid requests and malformed responses without invoking arbitrary IPC", async () => {

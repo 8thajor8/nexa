@@ -9,18 +9,23 @@ import {
   PttMicrophoneCapture,
   resamplePttAudio,
 } from "../src/renderer/audio/ptt-microphone-capture";
+import { createPttVoiceController, createSpeechRecognizer } from "../../../src/voice/index.js";
 
 const offlineInputs: Float32Array[] = [];
+const offlineConfigurations: Array<{ channels: number; frames: number; outputSampleRate: number; inputSampleRate?: number }> = [];
 
-function offlineContext(_channels: number, length: number, _sampleRate: number) {
+function offlineContext(channels: number, length: number, outputSampleRate: number) {
+  const configuration = { channels, frames: length, outputSampleRate };
+  offlineConfigurations.push(configuration);
   return {
     destination: {},
-    createBuffer(channels: number, frames: number) {
+    createBuffer(inputChannels: number, frames: number, inputSampleRate: number) {
+      configuration.inputSampleRate = inputSampleRate;
       const data = new Float32Array(frames);
       return {
         copyToChannel: (source: Float32Array) => data.set(source),
         getChannelData: () => data,
-        numberOfChannels: channels,
+        numberOfChannels: inputChannels,
         length: frames,
       };
     },
@@ -42,7 +47,11 @@ function offlineContext(_channels: number, length: number, _sampleRate: number) 
   };
 }
 
-function makeAudioHarness(sampleRate = 48_000) {
+function makeAudioHarness(sampleRate = 48_000, options: {
+  getDeviceId?: () => string | null;
+  onSelectedDeviceUnavailable?: () => void;
+  getUserMedia?: (constraints: MediaStreamConstraints) => Promise<MediaStream>;
+} = {}) {
   const trackListeners = new Map<string, () => void>();
   const track = {
     stop: vi.fn(),
@@ -52,6 +61,7 @@ function makeAudioHarness(sampleRate = 48_000) {
     getTracks: () => [track],
     getAudioTracks: () => [track],
   } as unknown as MediaStream;
+  const getUserMedia = vi.fn(options.getUserMedia ?? (async () => stream));
   const processor = {
     onaudioprocess: null as ((event: AudioProcessingEvent) => void) | null,
     connect: vi.fn(), disconnect: vi.fn(),
@@ -88,7 +98,9 @@ function makeAudioHarness(sampleRate = 48_000) {
   } as unknown as VoiceDesktopApi;
   let id = 0;
   const capture = new PttMicrophoneCapture(voice, {
-    mediaDevices: { getUserMedia: vi.fn(async () => stream) },
+    mediaDevices: { getUserMedia },
+    getDeviceId: options.getDeviceId,
+    onSelectedDeviceUnavailable: options.onSelectedDeviceUnavailable,
     createAudioContext: () => context as never,
     createOfflineAudioContext: offlineContext as never,
     createRequestId: () => `request-${++id}`,
@@ -106,11 +118,50 @@ function makeAudioHarness(sampleRate = 48_000) {
   };
   const emit = (event: VoiceEventEnvelope) => { for (const listener of [...events]) listener(event); };
   return { capture, voice, stream, track, context, processor, source, mute, calls, emitInput, emit,
-    disconnect: () => trackListeners.get("ended")?.() };
+    disconnect: () => trackListeners.get("ended")?.(), getUserMedia };
+}
+
+function decodePcm16MonoWav(wav: Uint8Array) {
+  const view = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
+  const ascii = (start: number, length: number) => String.fromCharCode(...wav.subarray(start, start + length));
+  const dataLength = view.getUint32(40, true);
+  return {
+    valid: ascii(0, 4) === "RIFF" && view.getUint32(4, true) === wav.byteLength - 8
+      && ascii(8, 4) === "WAVE" && ascii(12, 4) === "fmt " && view.getUint32(16, true) === 16
+      && ascii(36, 4) === "data" && dataLength === wav.byteLength - 44,
+    encoding: view.getUint16(20, true),
+    channels: view.getUint16(22, true),
+    sampleRate: view.getUint32(24, true),
+    byteRate: view.getUint32(28, true),
+    blockAlign: view.getUint16(32, true),
+    bitsPerSample: view.getUint16(34, true),
+    dataLength,
+    duration: dataLength / (PTT_SAMPLE_RATE * 2),
+    samples: Array.from({ length: dataLength / 2 }, (_, index) => view.getInt16(44 + index * 2, true) / 32768),
+  };
+}
+
+function repeatedAt48k(targetSamples: number[]) {
+  return new Float32Array(targetSamples.flatMap((sample) => [sample, sample, sample]));
+}
+
+function signalMetrics(samples: readonly number[]) {
+  const peak = samples.reduce((maximum, sample) => Math.max(maximum, Math.abs(sample)), 0);
+  const rms = Math.sqrt(samples.reduce((sum, sample) => sum + sample * sample, 0) / samples.length);
+  const maxStep = samples.slice(1).reduce((maximum, sample, index) => Math.max(maximum, Math.abs(sample - samples[index])), 0);
+  return { peak, rms, maxStep };
+}
+
+function expectValidPcm16Wav(decoded: ReturnType<typeof decodePcm16MonoWav>) {
+  expect(decoded).toMatchObject({
+    valid: true, encoding: 1, channels: 1, sampleRate: 16_000, byteRate: 32_000,
+    blockAlign: 2, bitsPerSample: 16, dataLength: decoded.samples.length * 2,
+    duration: decoded.samples.length / 16_000,
+  });
 }
 
 describe("PTT microphone capture and WAV encoding", () => {
-  beforeEach(() => { offlineInputs.length = 0; });
+  beforeEach(() => { offlineInputs.length = 0; offlineConfigurations.length = 0; });
 
   it("encodes valid mono PCM16 WAV with the required sample rate and byte limits", () => {
     const wav = encodePcm16MonoWav(new Float32Array([-1, 0, 1]));
@@ -136,6 +187,161 @@ describe("PTT microphone capture and WAV encoding", () => {
     expect(samples.length).toBe(2);
     expect([...samples]).toEqual([0, 0]);
     expect(offlineInputs.at(-1)).toEqual(new Float32Array(6));
+  });
+
+  it("preserves known mono amplitudes and block order through capture, resampling, WAV encoding, and fake Voice STT", async () => {
+    const harness = makeAudioHarness();
+    const providerAudio: Buffer[] = [];
+    const voiceEvents: Record<string, unknown>[] = [];
+    const envelopes: Record<string, unknown>[] = [];
+    const voiceController = createPttVoiceController({
+      sessionId: "synthetic-session",
+      recognizer: createSpeechRecognizer({ provider: { async transcribe(input: { audio: Buffer }) {
+        providerAudio.push(Buffer.from(input.audio));
+        return { text: "synthetic transcript", language: "es" };
+      } } }),
+    });
+    let startRequestId = "";
+    let finishRequestId = "";
+    let sequence = 0;
+    let transcription: Promise<unknown> | undefined;
+    voiceController.subscribe((event: Record<string, unknown>) => {
+      voiceEvents.push(event);
+      const requestId = event.type === "voice.session.started" ? startRequestId : finishRequestId;
+      const envelope = { requestId, sessionId: event.sessionId, ...(typeof event.turnId === "string" ? { turnId: event.turnId } : {}), sequence: ++sequence, event };
+      envelopes.push(envelope);
+      harness.emit(envelope as unknown as VoiceEventEnvelope);
+    });
+    harness.voice.ptt.start = async (request: { requestId: string }) => {
+      startRequestId = request.requestId;
+      const result = voiceController.start();
+      return { ok: true as const, requestId: request.requestId, sessionId: result.sessionId };
+    };
+    harness.voice.ptt.finish = async (request: { requestId: string; sessionId: string; audio: Uint8Array; format: "wav"; language?: string }) => {
+      finishRequestId = request.requestId;
+      harness.calls.finish.push({ ...request, audio: new Uint8Array(request.audio) });
+      transcription = voiceController.transcribe({ audio: request.audio, format: request.format, ...(request.language ? { language: request.language } : {}) });
+      return { ok: true as const, accepted: true as const, requestId: request.requestId, sessionId: request.sessionId };
+    };
+
+    await harness.capture.start();
+    const firstBlock = [0.125, 0.25, -0.25, 0.5].flatMap((sample) => [sample, sample, sample]);
+    const secondBlock = [-0.5, -0.125, 0.375, 0.0625].flatMap((sample) => [sample, sample, sample]);
+    harness.emitInput(new Float32Array(firstBlock));
+    harness.emitInput(new Float32Array(secondBlock));
+    await harness.capture.finish("es");
+    const result = await transcription;
+    const sent = harness.calls.finish[0] as { audio: Uint8Array };
+    const decoded = decodePcm16MonoWav(sent.audio);
+    const expected = [...firstBlock.filter((_, i) => i % 3 === 0), ...secondBlock.filter((_, i) => i % 3 === 0)];
+    const metrics = signalMetrics(decoded.samples);
+
+    expect(decoded).toMatchObject({ valid: true, encoding: 1, channels: 1, sampleRate: 16_000, byteRate: 32_000, blockAlign: 2, bitsPerSample: 16 });
+    expect(sent.audio.byteLength).toBe(44 + expected.length * 2);
+    expect(decoded.duration).toBe(expected.length / 16_000);
+    expect(decoded.samples).toHaveLength(expected.length);
+    decoded.samples.forEach((sample, index) => expect(Math.abs(sample - expected[index])).toBeLessThanOrEqual(1 / 32768));
+    expect([...offlineInputs.at(-1)!]).toEqual([...firstBlock, ...secondBlock]);
+    expect(offlineConfigurations.at(-1)).toEqual({ channels: 1, frames: 8, outputSampleRate: 16_000, inputSampleRate: 48_000 });
+    expect(metrics.peak).toBeCloseTo(0.5, 4);
+    expect(metrics.rms).toBeCloseTo(Math.sqrt(0.80078125 / 8), 4);
+    expect(metrics.maxStep).toBeCloseTo(1, 4);
+    expect(providerAudio).toHaveLength(1);
+    expect(Buffer.compare(providerAudio[0], Buffer.from(sent.audio))).toBe(0);
+    expect(result).toMatchObject({ sessionId: "synthetic-session", text: "synthetic transcript", language: "es" });
+    const finalEnvelope = envelopes.find((envelope) => (envelope.event as { type?: string }).type === "voice.transcript.final");
+    expect(finalEnvelope).toMatchObject({ requestId: "request-2", sessionId: "synthetic-session", sequence: expect.any(Number) });
+    expect(typeof finalEnvelope?.turnId).toBe("string");
+    expect((finalEnvelope?.event as { text?: string }).text).toBe("synthetic transcript");
+    expect(voiceEvents.map((event) => event.type)).toContain("voice.transcript.final");
+    voiceController.end();
+  });
+
+  it("downmixes identical stereo channels without changing amplitude and documents phase cancellation", async () => {
+    const identical = makeAudioHarness();
+    await identical.capture.start();
+    const values = [0.125, 0.25, 0.375, 0.5];
+    const stereo = repeatedAt48k(values);
+    identical.emitInput(stereo, new Float32Array(stereo));
+    await identical.capture.finish();
+    const decoded = decodePcm16MonoWav((identical.calls.finish[0] as { audio: Uint8Array }).audio);
+    expectValidPcm16Wav(decoded);
+    expect([...offlineInputs.at(-1)!]).toEqual([...repeatedAt48k(values)]);
+    expect(decoded.duration).toBe(4 / 16_000);
+    expect(decoded.samples).toHaveLength(4);
+    decoded.samples.forEach((sample, index) => expect(Math.abs(sample - values[index])).toBeLessThanOrEqual(1 / 32768));
+    expect(signalMetrics(decoded.samples).peak).toBeCloseTo(0.5, 4);
+    expect(signalMetrics(decoded.samples).rms).toBeCloseTo(Math.sqrt(0.46875 / 4), 4);
+    expect(offlineConfigurations.at(-1)).toEqual({ channels: 1, frames: 4, outputSampleRate: 16_000, inputSampleRate: 48_000 });
+
+    const opposite = makeAudioHarness();
+    await opposite.capture.start();
+    const left = repeatedAt48k(new Array(12).fill(0.4));
+    opposite.emitInput(left, new Float32Array(left.length).fill(-0.4));
+    await opposite.capture.finish();
+    const cancelled = decodePcm16MonoWav((opposite.calls.finish[0] as { audio: Uint8Array }).audio);
+    expectValidPcm16Wav(cancelled);
+    expect([...offlineInputs.at(-1)!]).toEqual(new Array(left.length).fill(0));
+    expect(cancelled.duration).toBe(12 / 16_000);
+    expect(cancelled.samples).toHaveLength(12);
+    expect(cancelled.samples).toEqual(new Array(12).fill(0));
+    expect(signalMetrics(cancelled.samples)).toEqual({ peak: 0, rms: 0, maxStep: 0 });
+  });
+
+  it("keeps deliberate silence as a valid WAV with zero acoustic energy", async () => {
+    const harness = makeAudioHarness();
+    await harness.capture.start();
+    harness.emitInput(new Float32Array(48).fill(0));
+    await harness.capture.finish();
+    const decoded = decodePcm16MonoWav((harness.calls.finish[0] as { audio: Uint8Array }).audio);
+    expectValidPcm16Wav(decoded);
+    expect(decoded.valid).toBe(true);
+    expect(decoded.duration).toBe(16 / 16_000);
+    expect(decoded.samples).toEqual(new Array(16).fill(0));
+    expect([...offlineInputs.at(-1)!]).toEqual(new Array(48).fill(0));
+    expect(offlineConfigurations.at(-1)).toEqual({ channels: 1, frames: 16, outputSampleRate: 16_000, inputSampleRate: 48_000 });
+    expect(signalMetrics(decoded.samples)).toEqual({ peak: 0, rms: 0, maxStep: 0 });
+  });
+
+  it("requests the selected input with an exact deviceId while preserving audio constraints", async () => {
+    const harness = makeAudioHarness(48_000, { getDeviceId: () => "device-42" });
+    await harness.capture.start();
+    expect(harness.getUserMedia).toHaveBeenCalledOnce();
+    expect(harness.getUserMedia.mock.calls[0][0]).toEqual({
+      audio: { deviceId: { exact: "device-42" }, channelCount: { ideal: 1 }, echoCancellation: true, noiseSuppression: true },
+      video: false,
+    });
+    await harness.capture.cancel();
+  });
+
+  it("falls back to the system default if the selected device disappears between enumeration and capture", async () => {
+    const fallbackNotice = vi.fn();
+    let fallbackStream: MediaStream;
+    const harness = makeAudioHarness(48_000, {
+      getDeviceId: () => "disconnected-device",
+      onSelectedDeviceUnavailable: fallbackNotice,
+      getUserMedia: vi.fn()
+        .mockRejectedValueOnce(Object.assign(new Error(), { name: "NotFoundError" }))
+        .mockImplementationOnce(async () => fallbackStream),
+    });
+    fallbackStream = harness.stream;
+    await harness.capture.start();
+    expect(harness.getUserMedia).toHaveBeenCalledTimes(2);
+    expect((harness.getUserMedia.mock.calls[0][0].audio as MediaTrackConstraints).deviceId).toEqual({ exact: "disconnected-device" });
+    expect(harness.getUserMedia.mock.calls[1][0]).toEqual({
+      audio: { channelCount: { ideal: 1 }, echoCancellation: true, noiseSuppression: true }, video: false,
+    });
+    expect(fallbackNotice).toHaveBeenCalledOnce();
+    await harness.capture.cancel();
+  });
+
+  it("does not retry with the default after a permission denial for a selected device", async () => {
+    const harness = makeAudioHarness(48_000, {
+      getDeviceId: () => "device-42",
+      getUserMedia: vi.fn(async () => { throw Object.assign(new Error(), { name: "NotAllowedError" }); }),
+    });
+    await expect(harness.capture.start()).rejects.toMatchObject({ code: "permission_denied" });
+    expect(harness.getUserMedia).toHaveBeenCalledOnce();
   });
 
   it("enforces maximum duration and WAV size", async () => {

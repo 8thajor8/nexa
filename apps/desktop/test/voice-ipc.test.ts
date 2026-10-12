@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   VOICE_EVENT_CHANNEL,
+  VOICE_SPEECH_EVENT_CHANNEL,
   VOICE_PTT_CANCEL_CHANNEL,
   VOICE_PTT_FINISH_CHANNEL,
   VOICE_PTT_START_CHANNEL,
@@ -16,13 +17,15 @@ vi.mock("electron", () => ({ ipcMain: ipcMock }));
 
 import {
   cleanupVoiceWindow,
+  cancelVoiceSpeech,
   registerVoiceWindowNavigation,
   registerVoiceIpcHandlers,
   registerVoiceMicrophonePermissions,
   removeVoiceIpcHandlers,
+  speakVoiceResponse,
 } from "../src/main/voice-ipc";
 
-const RENDERER_URL = "http://127.0.0.1:5173";
+const RENDERER_URL = "http://127.0.0.1:5174";
 
 function createWindow(id: string, url = RENDERER_URL + "/") {
   const mainFrame = { url };
@@ -140,6 +143,90 @@ describe("Electron Main Voice IPC", () => {
   beforeEach(() => {
     removeVoiceIpcHandlers();
     vi.clearAllMocks();
+  });
+
+  it("synthesizes only through the Main-owned speaker and emits request-correlated playback states", async () => {
+    const window = createWindow("speech");
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    let nextTurnId = "";
+    const speaker = {
+      speak: vi.fn(async (text: string, options: { style: string; persist: boolean }) => {
+        const event = { turnId: nextTurnId };
+        listeners.get("voice.speaking")?.(event);
+        listeners.get("voice.speech.completed")?.(event);
+        expect(text).toBe("Hola, soy Nexa.");
+        expect(options).toEqual({ style: "normal", persist: false });
+        return { completed: true as const };
+      }),
+      cancel: vi.fn(() => true),
+      on: vi.fn((type: string, listener: (event: Record<string, unknown>) => void) => {
+        listeners.set(type, listener);
+        return () => listeners.delete(type);
+      }),
+    };
+    let idFactory = () => "";
+    const api = { createVoiceSpeaker: vi.fn((options: { idFactory: () => string }) => {
+      idFactory = options.idFactory;
+      return speaker;
+    }) };
+    speaker.speak.mockImplementation(async (text, options) => {
+      nextTurnId = idFactory();
+      const event = { turnId: nextTurnId };
+      listeners.get("voice.speaking")?.(event);
+      listeners.get("voice.speech.completed")?.(event);
+      expect(text).toBe("Hola, soy Nexa.");
+      expect(options).toEqual({ style: "normal", persist: false });
+      return { completed: true as const };
+    });
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never);
+
+    await speakVoiceResponse(window as never, "00000000-0000-4000-8000-000000000051", "Hola, soy Nexa.");
+
+    expect(api.createVoiceSpeaker).toHaveBeenCalledOnce();
+    expect(speaker.speak).toHaveBeenCalledOnce();
+    expect(window.webContents.send.mock.calls.map(([, payload]) => payload)).toEqual([
+      { requestId: "00000000-0000-4000-8000-000000000051", state: "preparing" },
+      { requestId: "00000000-0000-4000-8000-000000000051", state: "speaking" },
+      { requestId: "00000000-0000-4000-8000-000000000051", state: "completed" },
+    ]);
+    expect(cancelVoiceSpeech(window as never, "user", "00000000-0000-4000-8000-000000000051")).toBe(false);
+  });
+
+  it("cancels only the active correlated speech request", async () => {
+    const window = createWindow("speech-cancel");
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    let finishSpeech: ((value: null) => void) | undefined;
+    let turnId = "";
+    let idFactory = () => "";
+    const speaker = {
+      speak: vi.fn(() => {
+        turnId = idFactory();
+        return new Promise<null>((resolve) => { finishSpeech = resolve; });
+      }),
+      cancel: vi.fn(() => {
+        listeners.get("voice.speech.cancelled")?.({ turnId });
+        finishSpeech?.(null);
+        return true;
+      }),
+      on: vi.fn((type: string, listener: (event: Record<string, unknown>) => void) => {
+        listeners.set(type, listener);
+        return () => listeners.delete(type);
+      }),
+    };
+    const api = { createVoiceSpeaker: vi.fn((options: { idFactory: () => string }) => {
+      idFactory = options.idFactory;
+      return speaker;
+    }) };
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never);
+    const requestId = "00000000-0000-4000-8000-000000000052";
+    const operation = speakVoiceResponse(window as never, requestId, "Respuesta.");
+    await vi.waitFor(() => expect(speaker.speak).toHaveBeenCalledOnce());
+
+    expect(cancelVoiceSpeech(window as never, "user", "00000000-0000-4000-8000-000000000099")).toBe(false);
+    expect(cancelVoiceSpeech(window as never, "user", requestId)).toBe(true);
+    expect(speaker.cancel).toHaveBeenCalledWith("user");
+    expect(window.webContents.send).toHaveBeenCalledWith(VOICE_SPEECH_EVENT_CHANNEL, { requestId, state: "preparing" });
+    await operation;
   });
 
   it("subscribes before start and returns a correlated session with synchronous Voice events", async () => {
@@ -310,7 +397,7 @@ describe("Electron Main Voice IPC", () => {
     const handler = ipcMock.handlers.get(VOICE_PTT_START_CHANNEL)!;
     const otherWindow = createWindow("other");
     await expect(handler(trustedEvent(otherWindow), { requestId: "spoof" })).rejects.toThrow("untrusted_voice_ipc_sender");
-    await expect(handler({ sender: window.webContents, senderFrame: { url: "http://127.0.0.1:5174/" } }, { requestId: "wrong-origin" }))
+    await expect(handler({ sender: window.webContents, senderFrame: { url: "http://127.0.0.1:5173/" } }, { requestId: "wrong-origin" }))
       .rejects.toThrow("untrusted_voice_ipc_sender");
     await expect(handler({ sender: window.webContents, senderFrame: { url: `${RENDERER_URL}/`, isMainFrame: false } }, { requestId: "wrong-frame" }))
       .rejects.toThrow("untrusted_voice_ipc_sender");
@@ -384,7 +471,7 @@ describe("Electron Main Voice IPC", () => {
       url: RENDERER_URL + "/#section", isMainFrame: true, isSameDocument: true,
     });
     window.emitWebContents("did-start-navigation", {
-      url: "http://127.0.0.1:5173/child", isMainFrame: false, isSameDocument: false,
+      url: "http://127.0.0.1:5174/child", isMainFrame: false, isSameDocument: false,
     });
 
     expect(voice.controllers[0].end).not.toHaveBeenCalled();
@@ -474,30 +561,95 @@ describe("Electron Main Voice IPC", () => {
 
   it("grants microphone permission only to the trusted main frame and denies video or other origins", () => {
     const window = createWindow("one");
+    const otherWindow = createWindow("two");
     const permissionSession = {
       setPermissionCheckHandler: vi.fn(), setPermissionRequestHandler: vi.fn(),
     };
     registerVoiceMicrophonePermissions(permissionSession as never, () => window as never, RENDERER_URL);
     const check = permissionSession.setPermissionCheckHandler.mock.calls[0][0] as (...args: unknown[]) => boolean;
     const request = permissionSession.setPermissionRequestHandler.mock.calls[0][0] as (...args: unknown[]) => void;
+    const requestResult = (webContents: unknown, permission: string, details: unknown) => {
+      const callback = vi.fn();
+      request(webContents, permission, callback, details);
+      return callback.mock.lastCall?.[0];
+    };
     expect(check(window.webContents, "media", RENDERER_URL, {
       isMainFrame: true, requestingUrl: `${RENDERER_URL}/`, mediaType: "audio",
     })).toBe(true);
-    expect(check(window.webContents, "media", "http://127.0.0.1:5174", {
-      isMainFrame: true, requestingUrl: "http://127.0.0.1:5174/", mediaType: "audio",
+    expect(check(window.webContents, "media", `${RENDERER_URL}/`, {
+      isMainFrame: true, requestingUrl: `${RENDERER_URL}/`, securityOrigin: `${RENDERER_URL}/`, mediaType: "audio",
+    })).toBe(true);
+    expect(check(window.webContents, "media", "http://127.0.0.1:5173", {
+      isMainFrame: true, requestingUrl: "http://127.0.0.1:5173/", mediaType: "audio",
     })).toBe(false);
     expect(check(window.webContents, "media", RENDERER_URL, {
       isMainFrame: false, requestingUrl: `${RENDERER_URL}/`, mediaType: "audio",
     })).toBe(false);
 
-    const callback = vi.fn();
-    request(window.webContents, "media", callback, {
+    expect(check(window.webContents, "media", RENDERER_URL, {
+      isMainFrame: true, requestingUrl: `${RENDERER_URL}/`,
+      securityOrigin: "http://127.0.0.1:5173", mediaType: "audio",
+    })).toBe(false);
+    for (const requestingOrigin of [
+      "http://localhost:5174", "https://127.0.0.1:5174", "http://127.0.0.1:5173",
+      "http://example.invalid:5174", "null", "not an origin", "http://user:pass@127.0.0.1:5174",
+      "http://127.0.0.1:5174/extra", "http://127.0.0.1:5174/?query", "http://127.0.0.1:5174/#fragment",
+      "http://127.0.0.1:5174/?", "http://127.0.0.1:5174/#",
+    ]) {
+      expect(check(window.webContents, "media", requestingOrigin, {
+        isMainFrame: true, requestingUrl: `${RENDERER_URL}/`, mediaType: "audio",
+      }), requestingOrigin).toBe(false);
+    }
+
+    expect(requestResult(window.webContents, "media", {
+      isMainFrame: true, requestingUrl: `${RENDERER_URL}/`, mediaTypes: ["audio"],
+    })).toBe(true);
+    expect(requestResult(window.webContents, "media", {
       isMainFrame: true, requestingUrl: `${RENDERER_URL}/`, securityOrigin: RENDERER_URL, mediaTypes: ["audio"],
-    });
-    expect(callback).toHaveBeenLastCalledWith(true);
-    request(window.webContents, "media", callback, {
-      isMainFrame: true, requestingUrl: `${RENDERER_URL}/`, securityOrigin: RENDERER_URL, mediaTypes: ["audio", "video"],
-    });
-    expect(callback).toHaveBeenLastCalledWith(false);
+    })).toBe(true);
+    expect(requestResult(window.webContents, "media", {
+      isMainFrame: true, requestingUrl: `${RENDERER_URL}/`, securityOrigin: `${RENDERER_URL}/`, mediaTypes: ["audio"],
+    })).toBe(true);
+    expect(requestResult(window.webContents, "media", {
+      isMainFrame: true, requestingUrl: `${RENDERER_URL}/`, securityOrigin: "http://127.0.0.1:5173", mediaTypes: ["audio"],
+    })).toBe(false);
+    for (const securityOrigin of [
+      "http://localhost:5174", "https://127.0.0.1:5174", "http://127.0.0.1:5173",
+      "http://example.invalid:5174", "null", "not an origin", "http://user:pass@127.0.0.1:5174",
+      "http://127.0.0.1:5174/extra", "http://127.0.0.1:5174/?query", "http://127.0.0.1:5174/#fragment",
+      "http://127.0.0.1:5174/?", "http://127.0.0.1:5174/#",
+    ]) {
+      expect(requestResult(window.webContents, "media", {
+        isMainFrame: true, requestingUrl: `${RENDERER_URL}/`, securityOrigin, mediaTypes: ["audio"],
+      }), securityOrigin).toBe(false);
+    }
+    expect(requestResult(window.webContents, "media", {
+      isMainFrame: true, requestingUrl: "http://127.0.0.1:5173/", mediaTypes: ["audio"],
+    })).toBe(false);
+    expect(requestResult(window.webContents, "media", {
+      isMainFrame: true, requestingUrl: `${RENDERER_URL}/unexpected`, mediaTypes: ["audio"],
+    })).toBe(false);
+    expect(requestResult(window.webContents, "media", {
+      isMainFrame: true, requestingUrl: "http://[invalid", mediaTypes: ["audio"],
+    })).toBe(false);
+    expect(requestResult(window.webContents, "media", {
+      isMainFrame: true, mediaTypes: ["audio"],
+    })).toBe(false);
+    expect(requestResult(window.webContents, "media", {
+      isMainFrame: false, requestingUrl: `${RENDERER_URL}/`, mediaTypes: ["audio"],
+    })).toBe(false);
+    expect(requestResult(otherWindow.webContents, "media", {
+      isMainFrame: true, requestingUrl: `${RENDERER_URL}/`, mediaTypes: ["audio"],
+    })).toBe(false);
+    expect(requestResult(window.webContents, "camera", {
+      isMainFrame: true, requestingUrl: `${RENDERER_URL}/`, mediaTypes: ["audio"],
+    })).toBe(false);
+    expect(requestResult(window.webContents, "media", {
+      isMainFrame: true, requestingUrl: `${RENDERER_URL}/`, mediaTypes: ["video"],
+    })).toBe(false);
+    expect(requestResult(window.webContents, "media", {
+      isMainFrame: true, requestingUrl: `${RENDERER_URL}/`, mediaTypes: ["audio", "video"],
+    })).toBe(false);
   });
+
 });

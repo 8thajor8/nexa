@@ -8,7 +8,7 @@ function functionTool(name, description, properties) {
 }
 const nullableMailbox = { type: ['string', 'null'], description: 'Buzón validado o null para el personal.' };
 const prepareEmailTool = functionTool('prepare_email',
-    'Prepara un correo y devuelve una vista previa completa. Nunca envía. Mostrá la vista previa y pedí al usuario la frase exacta de confirmación indicada por la tool.',
+    'Prepara un correo y devuelve una vista previa completa. Nunca envía. Mostrá la vista previa y preguntá naturalmente «¿Lo envío?». En el siguiente mensaje directo, resolvé la respuesta con resolve_pending_action; no uses confirm_pending_action salvo que el usuario haya escrito literalmente su frase exacta de compatibilidad.',
     {
         mailbox: nullableMailbox,
         to: { type: 'array', items: { type: 'string', format: 'email', maxLength: 254 }, minItems: 1, maxItems: 20 },
@@ -17,7 +17,7 @@ const prepareEmailTool = functionTool('prepare_email',
         body: { type: 'string', minLength: 1, maxLength: 20000 },
     });
 const prepareReplyTool = functionTool('prepare_email_reply',
-    'Prepara una respuesta al mensaje identificado por una referencia opaca de Nexa. Mantiene el hilo Graph y nunca envía. Mostrá la vista previa completa y pedí confirmación fresca.',
+    'Prepara una respuesta al mensaje identificado por una referencia opaca de Nexa. Mantiene el hilo Graph y nunca envía. Mostrá la vista previa completa y preguntá naturalmente «¿Lo envío?». En el siguiente mensaje directo, resolvé la respuesta con resolve_pending_action.',
     {
         emailId: { type: 'string', minLength: 1, maxLength: 64 },
         body: { type: 'string', minLength: 1, maxLength: 20000 },

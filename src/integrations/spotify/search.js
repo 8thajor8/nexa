@@ -74,7 +74,7 @@ export function spotifyFailure(error) {
         spotify_config_missing: 'Falta SPOTIFY_CLIENT_ID o la configuración de Spotify en .env.',
         spotify_config_invalid: 'La Redirect URI de Spotify no coincide con la configuración local esperada.',
         spotify_reauthorization_required: 'La autorización de Spotify venció. Volvé a autorizar Nexa.',
-        spotify_scope_or_premium_required: 'Spotify requiere scopes adicionales o una cuenta Premium para esta operación.',
+        spotify_forbidden: 'Spotify rechazó la acción (HTTP 403); puede deberse a permisos, cuenta o una restricción del proveedor.',
         spotify_no_device: 'No hay un dispositivo Spotify disponible; abrí Spotify o activá un dispositivo Connect.',
         spotify_rate_limited: 'Spotify pidió reducir la frecuencia de solicitudes. Probá de nuevo más tarde.',
         spotify_network_error: 'No se pudo conectar con Spotify. Revisá la conexión e intentá de nuevo.',
@@ -85,6 +85,7 @@ export function spotifyFailure(error) {
     return {
         success: false,
         error: { code, message: messages[code] ?? 'Spotify no pudo completar la solicitud.' },
+        ...(Number.isInteger(error?.status) ? { status: error.status } : {}),
         ...(error?.retryAfter ? { retryAfter: Number(error.retryAfter) || null } : {}),
     };
 }

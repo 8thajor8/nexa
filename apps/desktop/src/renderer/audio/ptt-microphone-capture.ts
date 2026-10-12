@@ -44,6 +44,8 @@ export interface PttOfflineAudioContextLike {
 
 export interface PttCaptureDependencies {
   mediaDevices?: Pick<MediaDevices, "getUserMedia">;
+  getDeviceId?: () => string | null;
+  onSelectedDeviceUnavailable?: () => void;
   createAudioContext?: () => PttAudioContextLike;
   createOfflineAudioContext?: (channels: number, length: number, sampleRate: number) => PttOfflineAudioContextLike;
   createRequestId?: () => string;
@@ -87,7 +89,9 @@ interface PendingMainCancellation {
 }
 
 function browserMediaDevices(): Pick<MediaDevices, "getUserMedia"> {
-  if (!globalThis.navigator?.mediaDevices?.getUserMedia) throw new PttCaptureError("microphone_unavailable");
+  if (!globalThis.navigator?.mediaDevices?.getUserMedia) {
+    throw new PttCaptureError("microphone_unavailable");
+  }
   return globalThis.navigator.mediaDevices;
 }
 
@@ -213,6 +217,8 @@ function concatenate(chunks: readonly Float32Array[], frameCount: number): Float
 export class PttMicrophoneCapture {
   private readonly voice: VoiceDesktopApi;
   private readonly mediaDevices: Pick<MediaDevices, "getUserMedia">;
+  private readonly getDeviceId: () => string | null;
+  private readonly onSelectedDeviceUnavailable?: () => void;
   private readonly makeAudioContext: () => PttAudioContextLike;
   private readonly makeOfflineAudioContext: PttCaptureDependencies["createOfflineAudioContext"];
   private readonly createRequestId: () => string;
@@ -227,6 +233,8 @@ export class PttMicrophoneCapture {
   constructor(voice: VoiceDesktopApi, dependencies: PttCaptureDependencies = {}) {
     this.voice = voice;
     this.mediaDevices = dependencies.mediaDevices ?? browserMediaDevices();
+    this.getDeviceId = dependencies.getDeviceId ?? (() => null);
+    this.onSelectedDeviceUnavailable = dependencies.onSelectedDeviceUnavailable;
     this.makeAudioContext = dependencies.createAudioContext ?? browserAudioContext;
     this.makeOfflineAudioContext = dependencies.createOfflineAudioContext;
     this.createRequestId = dependencies.createRequestId ?? defaultRequestId;
@@ -248,9 +256,22 @@ export class PttMicrophoneCapture {
       state.sampleRate = state.context.sampleRate;
       await state.context.resume();
       if (state.cancelled) throw new PttCaptureError("capture_cancelled");
-      const stream = await this.mediaDevices.getUserMedia({
-        audio: { channelCount: { ideal: 1 }, echoCancellation: true, noiseSuppression: true }, video: false,
-      });
+      let stream: MediaStream;
+      const selectedDeviceId = this.getDeviceId();
+      const audioConstraints: MediaTrackConstraints = {
+        channelCount: { ideal: 1 }, echoCancellation: true, noiseSuppression: true,
+        ...(selectedDeviceId ? { deviceId: { exact: selectedDeviceId } } : {}),
+      };
+      try {
+        stream = await this.mediaDevices.getUserMedia({ audio: audioConstraints, video: false });
+      } catch (error) {
+        const name = error && typeof error === "object" && "name" in error ? String(error.name) : "";
+        if (!selectedDeviceId || !["NotFoundError", "OverconstrainedError"].includes(name)) throw error;
+        this.onSelectedDeviceUnavailable?.();
+        stream = await this.mediaDevices.getUserMedia({
+          audio: { channelCount: { ideal: 1 }, echoCancellation: true, noiseSuppression: true }, video: false,
+        });
+      }
       if (state.cancelled) {
         for (const track of stream.getTracks()) track.stop();
         throw new PttCaptureError("capture_cancelled");

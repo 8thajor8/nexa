@@ -1,5 +1,6 @@
 export interface SecureWebPreferences {
   preload: string;
+  additionalArguments?: string[];
   nodeIntegration: false;
   contextIsolation: true;
   sandbox: true;
@@ -16,14 +17,15 @@ export const FRAMELESS_WINDOW_OPTIONS = {
   closable: true,
 } as const;
 
-export function createSecureWebPreferences(preload: string): SecureWebPreferences {
+export function createSecureWebPreferences(preload: string, additionalArguments: string[] = []): SecureWebPreferences {
   return {
     preload, nodeIntegration: false, contextIsolation: true, sandbox: true,
     webSecurity: true, allowRunningInsecureContent: false,
+    ...(additionalArguments.length > 0 ? { additionalArguments: [...additionalArguments] } : {}),
   };
 }
 
-export const EXPECTED_VITE_DEV_SERVER_URL = "http://127.0.0.1:5173";
+export const EXPECTED_VITE_DEV_SERVER_URL = "http://127.0.0.1:5174";
 
 export type RendererEntryPoint =
   | { kind: "file"; filePath: string }
@@ -36,7 +38,7 @@ export function isExpectedViteDevServerUrl(value: string): boolean {
     const url = new URL(value);
     return url.protocol === "http:" &&
       url.hostname === "127.0.0.1" &&
-      url.port === "5173" &&
+      url.port === "5174" &&
       url.username === "" &&
       url.password === "" &&
       url.pathname === "/" &&
@@ -78,18 +80,18 @@ export function loadRendererEntryPoint(
 
 export function createContentSecurityPolicy(development: boolean): string {
   const developmentScriptSources = development
-    ? " http://127.0.0.1:5173 'unsafe-inline'" : "";
+    ? " http://127.0.0.1:5174 'unsafe-inline'" : "";
   const developmentStyleSources = development
-    ? " http://127.0.0.1:5173 'unsafe-inline'" : "";
+    ? " http://127.0.0.1:5174 'unsafe-inline'" : "";
   const developmentConnections = development
-    ? " http://127.0.0.1:5173 ws://127.0.0.1:5173" : "";
+    ? " http://127.0.0.1:5174 ws://127.0.0.1:5174" : "";
 
   return [
     "default-src 'self'", "base-uri 'self'", "object-src 'none'",
     "frame-ancestors 'none'", "form-action 'self'",
     "script-src 'self'" + developmentScriptSources,
     "style-src 'self'" + developmentStyleSources,
-    "img-src 'self' data:", "font-src 'self'",
+    "img-src 'self' data: https://i.scdn.co", "font-src 'self'",
     "connect-src 'self'" + developmentConnections,
   ].join("; ");
 }

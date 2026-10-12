@@ -14,6 +14,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.electron.json && tsc --noEmit -p tsconfig.preload.json && tsc --noEmit -p tsconfig.tools.json",
     "test": "vitest run",
     "start": "electron .",
+    "preview:spotify-callback": "node scripts/spotify-callback-preview.mjs",
     "smoke:distribution": "node scripts/smoke-distribution.mjs"
   },
   "dependencies": {
@@ -22,12 +23,15 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "4.3.3",
+    "@testing-library/dom": "10.4.2",
+    "@testing-library/react": "16.3.3",
     "@types/node": "^22.19.0",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "6.1.2",
     "electron": "44.7.0",
     "esbuild": "0.28.2",
+    "jsdom": "26.1.0",
     "tailwindcss": "4.3.3",
     "typescript": "5.9.3",
     "vite": "8.3.4",

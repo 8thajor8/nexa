@@ -4,8 +4,10 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { config as loadDotEnv } from 'dotenv';
 import { createCliAgent } from '../src/core/cli-agent.js';
-import { resolveCliMemoryMode } from '../src/config.js';
+import { createConversationRuntime } from '../src/core/conversation-runtime.js';
+import { resolveCliMemoryMode, resolveRuntimeMemoryOptions } from '../src/config.js';
 
 const timestamp = '2026-10-10T12:00:00.000Z';
 const fixture = {
@@ -49,6 +51,76 @@ test('CLI mode defaults to Memory1 and accepts explicit modes while rejecting un
     assert.equal(resolveCliMemoryMode('memory2-readonly'), 'memory2-readonly');
     assert.equal(resolveCliMemoryMode('memory2'), 'memory2');
     assert.throws(() => resolveCliMemoryMode('memory2-read-write'), /NEXA_MEMORY_BACKEND/u);
+    assert.throws(() => resolveCliMemoryMode('memory2-confirmed-write'), /NEXA_MEMORY_BACKEND/u,
+        'the temporary Desktop write mode is not exposed as a general CLI or environment mode');
+});
+
+test('Desktop Runtime memory options are resolved from the environment at composition time', () => {
+    assert.deepEqual(resolveRuntimeMemoryOptions({}), { memoryMode: 'memory1', storePath: undefined });
+    assert.throws(() => resolveRuntimeMemoryOptions({ NEXA_MEMORY_BACKEND: 'memory2-typo' }), /NEXA_MEMORY_BACKEND/u);
+
+    const originalBackend = process.env.NEXA_MEMORY_BACKEND;
+    const originalStorePath = process.env.NEXA_MEMORY2_STORE_PATH;
+    try {
+        process.env.NEXA_MEMORY_BACKEND = 'memory2-readonly';
+        process.env.NEXA_MEMORY2_STORE_PATH = path.resolve('synthetic-memory-v5.json');
+        assert.deepEqual(resolveRuntimeMemoryOptions(), {
+            memoryMode: 'memory2-readonly', storePath: path.resolve('synthetic-memory-v5.json'),
+        });
+    } finally {
+        if (originalBackend === undefined) delete process.env.NEXA_MEMORY_BACKEND;
+        else process.env.NEXA_MEMORY_BACKEND = originalBackend;
+        if (originalStorePath === undefined) delete process.env.NEXA_MEMORY2_STORE_PATH;
+        else process.env.NEXA_MEMORY2_STORE_PATH = originalStorePath;
+    }
+});
+
+test('Desktop Runtime composes explicit read-only Memory2 after dotenv loading and preserves a synthetic store', async () => {
+    await withStore(async ({ storePath, bytes }) => {
+        const envDirectory = await mkdtemp(path.join(os.tmpdir(), 'nexa-desktop-memory-env-'));
+        const envPath = path.join(envDirectory, '.env');
+        const originalBackend = process.env.NEXA_MEMORY_BACKEND;
+        const originalStorePath = process.env.NEXA_MEMORY2_STORE_PATH;
+        let runtime;
+        try {
+            delete process.env.NEXA_MEMORY_BACKEND;
+            delete process.env.NEXA_MEMORY2_STORE_PATH;
+            await writeFile(envPath,
+                `NEXA_MEMORY_BACKEND=memory2-readonly\nNEXA_MEMORY2_STORE_PATH="${storePath.replaceAll('\\', '/')}"\n`,
+                'utf8');
+            const loaded = loadDotEnv({ path: envPath, override: false, quiet: true });
+            assert.equal(loaded.error, undefined);
+
+            const memoryOptions = resolveRuntimeMemoryOptions();
+            assert.equal(memoryOptions.memoryMode, 'memory2-readonly');
+            assert.equal(path.resolve(memoryOptions.storePath), path.resolve(storePath));
+
+            const requests = [];
+            runtime = createConversationRuntime({ ...memoryOptions, agentOptions: {
+                ask: async request => {
+                    requests.push(structuredClone(request));
+                    return completed('Contexto sintético leído.');
+                },
+            } });
+            const conversationId = runtime.createConversation();
+            const result = await runtime.sendMessage({ conversationId, requestId: 'desktop-m2-readonly',
+                text: 'mi nota', source: 'typed' });
+
+            assert.equal(result.status, 'completed');
+            assert.ok(requests[0].input.some(item => item.type === 'function_call_output'
+                && item.output.includes('Synthetic only fixture value.')));
+            assert.equal(requests[0].tools.some(tool => ['remember', 'forget', 'create_person',
+                'create_relation', 'correct_relation', 'forget_relation'].includes(tool.name)), false);
+            assert.deepEqual(await readFile(storePath), bytes);
+        } finally {
+            if (runtime) await runtime.close();
+            if (originalBackend === undefined) delete process.env.NEXA_MEMORY_BACKEND;
+            else process.env.NEXA_MEMORY_BACKEND = originalBackend;
+            if (originalStorePath === undefined) delete process.env.NEXA_MEMORY2_STORE_PATH;
+            else process.env.NEXA_MEMORY2_STORE_PATH = originalStorePath;
+            await rm(envDirectory, { recursive: true, force: true });
+        }
+    });
 });
 
 test('invalid CLI mode fails at composition instead of falling back to Memory1', async () => {
