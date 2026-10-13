@@ -11,6 +11,17 @@ import { screenMemorySecret } from './secret-screening.js';
 
 const processOwners = new Map();
 
+function processLiveness(pid) {
+    try {
+        process.kill(pid, 0);
+        return 'alive';
+    } catch (error) {
+        if (error?.code === 'ESRCH') return 'dead';
+        if (error?.code === 'EPERM') return 'alive';
+        return 'unknown';
+    }
+}
+
 /**
  * Explicit path only; no import-time I/O, directory creation, initialization or
  * migration. A caller must provision a valid store before open().
@@ -21,7 +32,7 @@ const processOwners = new Map();
  * Rename replacement is atomic on supported local filesystems, not a promise of
  * power-loss durability on every filesystem. The destination is never unlinked.
  */
-export function createJsonMemoryRepository({ storePath, fileSystem = {}, now = () => new Date().toISOString() } = {}) {
+export function createJsonMemoryRepository({ storePath, fileSystem = {}, now = () => new Date().toISOString(), isProcessAlive = processLiveness } = {}) {
     if (typeof storePath !== 'string' || !path.isAbsolute(storePath)) throw new MemoryRepositoryError('memory_repository_invalid');
     const fs = { ...nativeFs, ...fileSystem };
     let destination;
@@ -78,6 +89,59 @@ export function createJsonMemoryRepository({ storePath, fileSystem = {}, now = (
         } finally {
             if (processOwners.get(ownerKey) === token) processOwners.delete(ownerKey);
         }
+    }
+    async function readLockOwner(candidatePath) {
+        const info = await fs.lstat(candidatePath);
+        if (!info.isFile() || info.isSymbolicLink()) return null;
+        const owner = JSON.parse(await fs.readFile(candidatePath, 'utf8'));
+        if (!Number.isSafeInteger(owner?.pid) || owner.pid <= 0 || typeof owner.token !== 'string' || owner.token.length === 0) return null;
+        return { pid: owner.pid, token: owner.token };
+    }
+    async function restoreLockClaim(claimPath) {
+        try {
+            // link() is atomic and fails rather than replacing a lock another process created.
+            await fs.link(claimPath, lockPath);
+            await fs.unlink(claimPath);
+            return true;
+        } catch { return false; }
+    }
+    async function reclaimOrphanedLock() {
+        let observed;
+        try { observed = await readLockOwner(lockPath); }
+        catch { return false; }
+        if (!observed) return false;
+        let liveness;
+        try { liveness = isProcessAlive(observed.pid); }
+        catch { return false; }
+        // Permission errors and unknown process states fail closed. Only ESRCH is reclaimable.
+        if (liveness !== 'dead') return false;
+
+        const claimPath = `${lockPath}.recovery-${randomUUID()}`;
+        try { await fs.rename(lockPath, claimPath); }
+        catch { return false; }
+
+        let claimed;
+        try { claimed = await readLockOwner(claimPath); }
+        catch {
+            await restoreLockClaim(claimPath);
+            return false;
+        }
+        if (!claimed || claimed.pid !== observed.pid || claimed.token !== observed.token) {
+            await restoreLockClaim(claimPath);
+            return false;
+        }
+        try { liveness = isProcessAlive(claimed.pid); }
+        catch { liveness = 'unknown'; }
+        if (liveness !== 'dead') {
+            await restoreLockClaim(claimPath);
+            return false;
+        }
+        try { await fs.unlink(claimPath); }
+        catch {
+            await restoreLockClaim(claimPath);
+            return false;
+        }
+        return true;
     }
     function assertUnchanged(current) {
         if (current.store.store_id !== published.snapshot.store_id || current.store.revision !== published.revision || current.digest !== published.digest) {
@@ -174,7 +238,14 @@ export function createJsonMemoryRepository({ storePath, fileSystem = {}, now = (
                 // Read before locking so missing/corrupt stores never create lockfiles.
                 await readDisk();
                 try { handle = await fs.open(lockPath, 'wx', 0o600); created = true; }
-                catch (cause) { throw new MemoryRepositoryError(cause?.code === 'EEXIST' ? 'memory_store_locked' : 'memory_persist_failed', { cause }); }
+                catch (cause) {
+                    if (cause?.code !== 'EEXIST') throw new MemoryRepositoryError('memory_persist_failed', { cause });
+                    if (!await reclaimOrphanedLock()) throw new MemoryRepositoryError('memory_store_locked', { cause });
+                    try { handle = await fs.open(lockPath, 'wx', 0o600); created = true; }
+                    catch (retryCause) {
+                        throw new MemoryRepositoryError(retryCause?.code === 'EEXIST' ? 'memory_store_locked' : 'memory_persist_failed', { cause: retryCause });
+                    }
+                }
                 await handle.writeFile(JSON.stringify({ pid: process.pid, token }) + '\n', 'utf8');
                 await handle.sync();
                 await handle.close();

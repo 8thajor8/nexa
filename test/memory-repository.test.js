@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createJsonMemoryRepository } from '../src/memory/json-repository.js';
 import { MemoryRepositoryError, contentDigest } from '../src/memory/repository.js';
@@ -179,15 +179,71 @@ test('another process cannot acquire a held lock', async t => {
     const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', script, f.storePath], { windowsHide: true });
     assert.equal(stdout, 'memory_store_locked');
 });
-test('stale locks are never stolen and close preserves a replaced ownership token', async t => {
+test('confirmed orphaned lock is reclaimed without changing memory bytes', async t => {
     const f = await setup(t); const lockPath = f.storePath + '.lock';
-    await fs.writeFile(lockPath, JSON.stringify({ pid: 99999999, token: 'old-owner' }));
+    const memoryBefore = await fs.readFile(f.storePath);
+    const orphanPid = 999999999;
+    await fs.writeFile(lockPath, JSON.stringify({ pid: orphanPid, token: 'synthetic-old-owner' }) + '\n');
+    const repo = f.create({ isProcessAlive: pid => pid === orphanPid ? 'dead' : 'alive' });
+    await repo.open();
+    assert.deepEqual(await fs.readFile(f.storePath), memoryBefore);
+    const replacement = JSON.parse(await fs.readFile(lockPath, 'utf8'));
+    assert.equal(replacement.pid, process.pid);
+    assert.notEqual(replacement.token, 'synthetic-old-owner');
+    await repo.close();
+    assert.deepEqual(await fs.readdir(f.directory), ['memory-v2.json']);
+});
+test('active or indeterminate lock owners are never reclaimed', async t => {
+    const f = await setup(t); const lockPath = f.storePath + '.lock';
+    for (const liveness of ['alive', 'unknown']) {
+        const lockBytes = JSON.stringify({ pid: 999999999, token: `synthetic-${liveness}` }) + '\n';
+        await fs.writeFile(lockPath, lockBytes);
+        const repo = f.create({ isProcessAlive: () => liveness });
+        await assert.rejects(repo.open(), code('memory_store_locked'));
+        assert.equal(await fs.readFile(lockPath, 'utf8'), lockBytes);
+        await fs.unlink(lockPath);
+    }
+    const malformed = '{not-json';
+    await fs.writeFile(lockPath, malformed);
     await assert.rejects(f.repo.open(), code('memory_store_locked'));
-    assert.equal(JSON.parse(await fs.readFile(lockPath)).token, 'old-owner');
+    assert.equal(await fs.readFile(lockPath, 'utf8'), malformed);
     await fs.unlink(lockPath); await f.repo.open();
     await fs.writeFile(lockPath, JSON.stringify({ pid: process.pid, token: 'replacement-owner' }));
     await assert.rejects(f.repo.close(), code('memory_lock_lost'));
     assert.equal(JSON.parse(await fs.readFile(lockPath)).token, 'replacement-owner');
+});
+test('concurrent processes recover an orphan with at most one lock owner', async t => {
+    const f = await setup(t); const lockPath = f.storePath + '.lock';
+    const memoryBefore = await fs.readFile(f.storePath);
+    await fs.writeFile(lockPath, JSON.stringify({ pid: 999999999, token: 'synthetic-orphan' }) + '\n');
+    const moduleUrl = new URL('../src/memory/json-repository.js', import.meta.url).href;
+    const script = `import { createJsonMemoryRepository } from ${JSON.stringify(moduleUrl)};
+        const repo = createJsonMemoryRepository({ storePath: process.argv[1] });
+        try { await repo.open(); process.stdout.write('opened\\n'); await new Promise(resolve => process.stdin.once('data', resolve)); await repo.close(); }
+        catch (error) { process.stdout.write((error?.code || 'unexpected_error') + '\\n'); }`;
+    const children = [0, 1].map(() => spawn(process.execPath, ['--input-type=module', '-e', script, f.storePath], {
+        windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
+    }));
+    const exits = children.map(child => new Promise((resolve, reject) => {
+        child.once('error', reject);
+        child.once('exit', code => code === 0 ? resolve() : reject(new Error(`child exit ${code}`)));
+    }));
+    const waitForLine = child => new Promise((resolve, reject) => {
+        let output = '';
+        child.stdout.on('data', chunk => {
+            output += chunk.toString('utf8');
+            const newline = output.indexOf('\n');
+            if (newline >= 0) resolve(output.slice(0, newline).trim());
+        });
+        child.once('error', reject);
+        child.once('exit', code => reject(new Error(`child exited before result (${code})`)));
+    });
+    const outcomes = await Promise.all(children.map(waitForLine));
+    assert.deepEqual(outcomes.sort(), ['memory_store_locked', 'opened']);
+    for (const child of children) child.stdin.end('release');
+    await Promise.all(exits);
+    assert.deepEqual(await fs.readFile(f.storePath), memoryBefore);
+    assert.deepEqual(await fs.readdir(f.directory), ['memory-v2.json']);
 });
 test('lock ownership is verified before mutation', async t => {
     const f = await setup(t); const snap = await f.repo.open();
