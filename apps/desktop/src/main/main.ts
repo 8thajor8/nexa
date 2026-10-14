@@ -65,6 +65,7 @@ import {
   speakVoiceResponse,
   markVoiceResponseDispatched,
   releaseVoiceDuckingExcept,
+  continueVoiceDuckingForRequest,
   releaseVoiceDuckingForRequest,
   registerVoiceWindowNavigation,
   registerVoiceIpcHandlers,
@@ -226,6 +227,7 @@ const desktopAudioDucking = createAudioSessionDucking({ diagnostics: (event, det
     ["stage", "code", "component", "endpointRole", "errorStage", "sessionCount", "enumeratedSessions", "activeSessions", "excludedOwnedSessions", "excludedSystemSessions",
       "attemptedSessions", "changedSessions", "spotifySessionsFound", "spotifySessionsAttempted", "spotifySessionsChanged",
       "spotifyPreflightSkipped", "spotifyFailureStage", "spotifyFailureHResult",
+      "endReason",
       "failedSessions", "failureStage", "failureHResult", "errorName", "errorCode"].includes(key)
     && (value === null || ["string", "number", "boolean"].includes(typeof value))));
   const line = `[nexa-desktop] ${JSON.stringify({ area: "voice_audio", event: traceEvent,
@@ -770,9 +772,10 @@ function installWebContentsGuards(): void {
     registerChatIpcHandlers(() => mainWindow, () => conversationRuntime, ipcMain, (event, details) => {
       writeSafeTrace("chat_ipc", event, details);
     }, {
-      onNewInteraction: (requestId) => {
+      onNewInteraction: (requestId, source) => {
         cancelVoiceSpeech(mainWindow as never, "superseded");
-        releaseVoiceDuckingExcept(requestId);
+        if (source === "voice") continueVoiceDuckingForRequest(requestId);
+        else releaseVoiceDuckingExcept(requestId);
       },
       onVoiceRequestTerminal: (requestId) => { releaseVoiceDuckingForRequest(requestId); },
       onVoiceResponse: (window, requestId, response) => { void speakVoiceResponse(window as never, requestId, response); },

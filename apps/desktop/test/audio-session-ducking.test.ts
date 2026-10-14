@@ -70,6 +70,30 @@ describe("Main Windows audio session ducking", () => {
     expect(windowsAudio.restore).toHaveBeenCalledWith(windowsAudio.sessions);
   });
 
+  it("retains original levels through three turns and ignores stale end events", async () => {
+    const windowsAudio = adapter([snapshot("spotify", 0.7), snapshot("browser", 0.35)]);
+    const diagnostics = vi.fn();
+    const controller = createAudioSessionDucking({ platform: "win32", adapter: windowsAudio, diagnostics });
+    await controller.begin("ptt-1");
+    for (const [previous, next] of [["ptt-1", "chat-1"], ["chat-1", "followup-2"],
+      ["followup-2", "chat-2"], ["chat-2", "followup-3"], ["followup-3", "chat-3"]]) {
+      controller.transfer(previous, next);
+      await controller.end(previous, "completed");
+      expect(windowsAudio.restore).not.toHaveBeenCalled();
+    }
+    expect(windowsAudio.duck).toHaveBeenCalledOnce();
+    expect(windowsAudio.sessions.map((item) => item.originalVolume)).toEqual([0.7, 0.35]);
+    expect(windowsAudio.sessions[0].duckedVolume).toBeCloseTo(0.14);
+    expect(windowsAudio.sessions[1].duckedVolume).toBeCloseTo(0.07);
+    await controller.end("chat-3", "followup_expired");
+    await controller.end("chat-3", "stop");
+    expect(controller.transfer("chat-3", "late-turn")).toBe(false);
+    expect(windowsAudio.restore).toHaveBeenCalledOnce();
+    expect(windowsAudio.restore).toHaveBeenCalledWith(windowsAudio.sessions);
+    expect(diagnostics).toHaveBeenCalledWith("restored", expect.objectContaining({ endReason: "followup_expired" }));
+    expect(diagnostics).toHaveBeenCalledWith("stale", expect.objectContaining({ code: "end_owner_not_found" }));
+  });
+
   it("keeps a new interaction from being restored by an older request", async () => {
     const windowsAudio = adapter();
     const controller = createAudioSessionDucking({ platform: "win32", adapter: windowsAudio });

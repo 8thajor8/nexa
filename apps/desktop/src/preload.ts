@@ -31,6 +31,7 @@ import {
   WINDOW_SETTINGS_CHANGED_CHANNEL,
   VOICE_EVENT_CHANNEL,
   VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL,
+  VOICE_DUCKING_END_CHANNEL,
   VOICE_SPEECH_CANCEL_CHANNEL,
   VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL,
   VOICE_SPEECH_EVENT_CHANNEL,
@@ -51,6 +52,7 @@ import { isWeatherCurrentStatus, isWeatherLocation } from "./shared/weather-ipc-
 import { isWindowPreferences, isWindowSettingsSnapshot } from "./shared/window-settings-validation";
 import {
   isVoiceEventEnvelope,
+  isVoiceId,
   isVoicePttCancelRequest,
   isVoicePttCancelResponse,
   isVoicePttFinishRequest,
@@ -165,6 +167,15 @@ const api: NexaDesktopApi = {
     async recordFollowupDiagnostic(request) {
       if (!isVoiceFollowupDiagnosticRequest(request)) throw new Error("invalid_voice_followup_diagnostic_request");
       return await ipcRenderer.invoke(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL, request) === true;
+    },
+    async endDucking(requestId, reason = "completed") {
+      if (!isVoiceId(requestId)) {
+        throw new Error("invalid_voice_ducking_request_id");
+      }
+      if (!["completed", "followup_expired", "stop", "error"].includes(reason)) throw new Error("invalid_voice_ducking_end_reason");
+      const response: unknown = await ipcRenderer.invoke(VOICE_DUCKING_END_CHANNEL, { requestId, reason });
+      if (typeof response !== "boolean") throw new Error("invalid_voice_ducking_end_response");
+      return response;
     },
     speech: {
       async acknowledge(request) {

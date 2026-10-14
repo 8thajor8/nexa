@@ -14,6 +14,7 @@ import {
   VOICE_PTT_START_CHANNEL,
   VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL,
   VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL,
+  VOICE_DUCKING_END_CHANNEL,
   type VoiceEventEnvelope,
   type VoiceIpcErrorCode,
   type VoicePttEvent,
@@ -38,6 +39,7 @@ import {
 import { isTrustedIpcSender } from "../shared/ipc-security.js";
 import { randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
+import type { AudioDuckingEndReason } from "./audio-session-ducking.js";
 
 export interface VoiceRecognizer {
   transcribe(input: { audio: Buffer; format: string; language?: string; signal: AbortSignal }): Promise<{
@@ -93,6 +95,7 @@ interface ActiveVoiceSession {
   turnRequestIds: Map<string, string>;
   eventRequestIdOverride: string | null;
   transcriptionStartedAt: number | null;
+  transcriptFinal: boolean;
   cancelled: boolean;
   retired: boolean;
 }
@@ -100,8 +103,8 @@ interface ActiveVoiceSession {
 type LoadPublicVoiceApi = () => Promise<PublicVoiceApi>;
 export interface VoiceAudioDuckingPort {
   begin(requestId: string): Promise<void>;
-  transfer(previousRequestId: string, nextRequestId: string): void;
-  end(requestId: string): Promise<void>;
+  transfer(previousRequestId: string, nextRequestId: string): boolean | void;
+  end(requestId: string, reason?: AudioDuckingEndReason): Promise<void>;
   endExcept(requestId: string | null): Promise<void>;
   close(): Promise<void>;
 }
@@ -139,22 +142,37 @@ function recordVoice(event: VoiceDiagnosticEvent): void {
   try { recordVoiceDiagnostic?.(event); } catch { /* Diagnostics never affect Voice. */ }
 }
 
-function releaseVoiceDucking(window: VoiceIpcWindow, requestId?: string): void {
+function releaseVoiceDucking(window: VoiceIpcWindow, requestId?: string, reason: AudioDuckingEndReason = "completed"): void {
   const activeRequestId = duckingRequestByWindow.get(window);
   if (!activeRequestId || (requestId !== undefined && requestId !== activeRequestId)) return;
   duckingRequestByWindow.delete(window);
-  void configuredAudioDucking?.end(activeRequestId).catch(() => undefined);
+  void configuredAudioDucking?.end(activeRequestId, reason).catch(() => undefined);
+}
+
+function transferVoiceDucking(window: VoiceIpcWindow, requestId: string): boolean {
+  const previous = duckingRequestByWindow.get(window);
+  if (!previous || previous === requestId) return Boolean(previous);
+  const transferred = configuredAudioDucking?.transfer(previous, requestId);
+  if (transferred === false) void configuredAudioDucking?.begin(requestId).catch(() => undefined);
+  duckingRequestByWindow.set(window, requestId);
+  return true;
+}
+
+export function continueVoiceDuckingForRequest(requestId: string): void {
+  for (const window of duckingRequestByWindow.keys()) {
+    if (transferVoiceDucking(window, requestId)) return;
+  }
 }
 
 export function releaseVoiceDuckingForRequest(requestId: string): void {
   for (const [window, activeRequestId] of duckingRequestByWindow) {
-    if (activeRequestId === requestId) releaseVoiceDucking(window, requestId);
+    if (activeRequestId === requestId) releaseVoiceDucking(window, requestId, "error");
   }
 }
 
 export function releaseVoiceDuckingExcept(requestId: string | null): void {
   for (const [window, activeRequestId] of duckingRequestByWindow) {
-    if (activeRequestId !== requestId) releaseVoiceDucking(window, activeRequestId);
+    if (activeRequestId !== requestId) releaseVoiceDucking(window, activeRequestId, "superseded");
   }
   void configuredAudioDucking?.endExcept(requestId).catch(() => undefined);
 }
@@ -495,20 +513,20 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
   if (!window || window.isDestroyed() || !isVoiceId(requestId) || typeof text !== "string") return;
   const spokenText = prepareSpokenText(text);
   if (!spokenText.trim()) {
-    releaseVoiceDucking(window, requestId);
+    releaseVoiceDucking(window, requestId, "error");
     return;
   }
   if (spokenText.length > 3_000) {
     recordVoice({ requestId, stage: "synthesis", state: "error", errorCode: "voice_speech_too_long" });
     emitSpeechEvent(window, { requestId, state: "error", error: { code: "voice_speech_too_long" } });
-    releaseVoiceDucking(window, requestId);
+    releaseVoiceDucking(window, requestId, "error");
     return;
   }
   const loader = configuredVoiceApiLoader;
   if (!loader) {
     recordVoice({ requestId, stage: "synthesis", state: "error", errorCode: "voice_speech_generation_failed" });
     emitSpeechEvent(window, { requestId, state: "error", error: { code: "voice_speech_generation_failed" } });
-    releaseVoiceDucking(window, requestId);
+    releaseVoiceDucking(window, requestId, "error");
     return;
   }
   rememberSpeechTiming(requestId, { startedAt: performance.now() });
@@ -519,7 +537,7 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
     speechTimingByRequest.delete(requestId);
     recordVoice({ requestId, stage: "synthesis", state: "error", errorCode: "voice_speech_generation_failed" });
     emitSpeechEvent(window, { requestId, state: "error", error: { code: "voice_speech_generation_failed" } });
-    releaseVoiceDucking(window, requestId);
+    releaseVoiceDucking(window, requestId, "error");
     return;
   }
   recordVoice({ requestId, stage: "synthesis", state: "processing", durationMs: performance.now() - ownerPreparationStartedAt,
@@ -527,7 +545,7 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
   if (owner.stoppedRequestIds.has(requestId)) {
     speechTimingByRequest.delete(requestId);
     emitSpeechEvent(window, { requestId, state: "cancelled" });
-    releaseVoiceDucking(window, requestId);
+    releaseVoiceDucking(window, requestId, "stop");
     return;
   }
   if (owner.handledResponseRequestIds.has(requestId)) return;
@@ -578,7 +596,7 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
       speechTimingByRequest.delete(requestId);
       recordVoice({ requestId, stage: "synthesis", state: "error", errorCode, metrics: prepared?.metrics });
       emitSpeechEvent(window, { requestId, state: "error", error: { code: errorCode } });
-      releaseVoiceDucking(window, requestId);
+      releaseVoiceDucking(window, requestId, "error");
       return;
     }
     if (owner.activeKind === "acknowledgement" && owner.activeRequestId) {
@@ -598,7 +616,8 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
     owner.activeRequestId = requestId;
     owner.activeKind = "response";
     owner.nextTurnId = requestId;
-    try { await owner.speaker.speakPrepared(Buffer.from(prepared.audio)); }
+    let completed = false;
+    try { completed = (await owner.speaker.speakPrepared(Buffer.from(prepared.audio)))?.completed === true; }
     catch {
       speechTimingByRequest.delete(requestId);
       if (owner.activeRequestId === requestId) {
@@ -607,7 +626,7 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
       }
     } finally {
       if (owner.nextTurnId === requestId) owner.nextTurnId = null;
-      releaseVoiceDucking(window, requestId);
+      if (!completed) releaseVoiceDucking(window, requestId, "error");
     }
     return;
   }
@@ -628,7 +647,8 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
     metrics: { responseDispatchToSynthesisMs: speechTiming?.responseDispatchedAt === undefined ? null
       : Math.max(0, performance.now() - speechTiming.responseDispatchedAt) } });
   emitSpeechEvent(window, { requestId, state: "preparing" });
-  try { await owner.speaker.speak(spokenText, { style: "normal", persist: false }); }
+  let completed = false;
+  try { completed = (await owner.speaker.speak(spokenText, { style: "normal", persist: false }))?.completed === true; }
   catch {
     speechTimingByRequest.delete(requestId);
     if (owner.activeRequestId === requestId) {
@@ -637,7 +657,7 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
     }
   } finally {
     if (owner.nextTurnId === requestId) owner.nextTurnId = null;
-    releaseVoiceDucking(window, requestId);
+    if (!completed) releaseVoiceDucking(window, requestId, "error");
   }
 }
 
@@ -765,6 +785,7 @@ export function registerVoiceIpcHandlers(
   ipcMain.removeHandler(VOICE_SPEECH_CANCEL_CHANNEL);
   ipcMain.removeHandler(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL);
   ipcMain.removeHandler(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL);
+  ipcMain.removeHandler(VOICE_DUCKING_END_CHANNEL);
 
   ipcMain.handle(VOICE_PTT_START_CHANNEL, async (event: IpcMainInvokeEvent, payload: unknown) => {
     const window = getMainWindow();
@@ -774,9 +795,11 @@ export function registerVoiceIpcHandlers(
     if (activeSessions.has(window)) {
       return errorResponse(request.requestId, "request_conflict", "A PTT session is already active.");
     }
-    duckingRequestByWindow.set(window, request.requestId);
-    void configuredAudioDucking?.endExcept(request.requestId).catch(() => undefined);
-    void configuredAudioDucking?.begin(request.requestId).catch(() => undefined);
+    if (!transferVoiceDucking(window, request.requestId)) {
+      duckingRequestByWindow.set(window, request.requestId);
+      void configuredAudioDucking?.endExcept(request.requestId).catch(() => undefined);
+      void configuredAudioDucking?.begin(request.requestId).catch(() => undefined);
+    }
     cancelVoiceSpeech(window, "superseded");
 
     let state: ActiveVoiceSession | null = null;
@@ -793,7 +816,7 @@ export function registerVoiceIpcHandlers(
       state = {
         window, controller, unsubscribe: () => undefined, startRequestId: request.requestId,
         sessionId: "", finishRequestId: null, turnRequestIds: new Map(), eventRequestIdOverride: null,
-        cancelled: false, retired: false, transcriptionStartedAt: null,
+        cancelled: false, retired: false, transcriptionStartedAt: null, transcriptFinal: false,
       };
       activeSessions.set(window, state);
       state.unsubscribe = controller.subscribe((event) => {
@@ -803,15 +826,20 @@ export function registerVoiceIpcHandlers(
           if (voiceEvent.type === "voice.session.started") recordVoice({ requestId: state!.startRequestId, stage: "ptt", state: "started" });
           else if (voiceEvent.type === "voice.transcribing") recordVoice({ requestId: state!.finishRequestId ?? state!.startRequestId,
             stage: "transcription", state: "processing" });
-          else if (voiceEvent.type === "voice.transcript.final") recordVoice({ requestId: state!.turnRequestIds.get(voiceEvent.turnId) ?? state!.finishRequestId ?? state!.startRequestId,
+          else if (voiceEvent.type === "voice.transcript.final") {
+            state!.transcriptFinal = true;
+            recordVoice({ requestId: state!.turnRequestIds.get(voiceEvent.turnId) ?? state!.finishRequestId ?? state!.startRequestId,
             stage: "transcription", state: "success", durationMs: state!.transcriptionStartedAt === null ? null
               : performance.now() - state!.transcriptionStartedAt });
+          }
           else if (voiceEvent.type === "voice.error") recordVoice({ requestId: state!.turnRequestIds.get(voiceEvent.turnId) ?? state!.finishRequestId ?? state!.startRequestId,
             stage: "transcription", state: "error", errorCode: String(voiceEvent.error?.code ?? "VOICE_PTT_TRANSCRIPTION_FAILED"),
             durationMs: state!.transcriptionStartedAt === null ? null : performance.now() - state!.transcriptionStartedAt });
           else if (voiceEvent.type === "voice.cancelled") recordVoice({ requestId: state!.finishRequestId ?? state!.startRequestId,
             stage: "transcription", state: "cancelled", cancellation: String(voiceEvent.reason ?? "user") });
-          if (voiceEvent.type === "voice.error" || voiceEvent.type === "voice.cancelled") releaseVoiceDucking(window);
+          if (voiceEvent.type === "voice.error" || (voiceEvent.type === "voice.cancelled" && !state!.transcriptFinal)) {
+            releaseVoiceDucking(window, state!.finishRequestId ?? state!.startRequestId);
+          }
         }
       });
       const started = controller.start();
@@ -892,7 +920,7 @@ export function registerVoiceIpcHandlers(
     catch { cancelFailed = true; }
     finally {
       retireSession(state, request.requestId);
-      releaseVoiceDucking(window);
+      if (!state.transcriptFinal) releaseVoiceDucking(window, request.targetRequestId);
     }
     if (cancelFailed) {
       return errorResponse(request.requestId, "operation_failed", "Voice could not cancel the transcription.");
@@ -909,7 +937,7 @@ export function registerVoiceIpcHandlers(
     if (!isVoiceSpeechCancelRequest(payload)) throw new Error("invalid_voice_speech_cancel_request");
     const requestId = payload.requestId;
     const cancelled = cancelVoiceSpeech(window, "user", requestId);
-    if (cancelled) releaseVoiceDucking(window, requestId);
+    if (cancelled) releaseVoiceDucking(window, requestId, "stop");
     return cancelled ? { ok: true as const, requestId, cancelled: true as const }
       : { ok: false as const, requestId, error: "request_not_found" as const };
   });
@@ -928,6 +956,22 @@ export function registerVoiceIpcHandlers(
     if (!isVoiceFollowupDiagnosticRequest(payload)) throw new Error("invalid_voice_followup_diagnostic_request");
     recordVoice({ requestId: payload.requestId, stage: "followup", state: "success", durationMs: payload.durationMs,
       metrics: { followupOutcome: payload.outcome } });
+    return true;
+  });
+  ipcMain.handle(VOICE_DUCKING_END_CHANNEL, (event: IpcMainInvokeEvent, payload: unknown) => {
+    const window = getMainWindow();
+    if (!isTrustedVoiceSender(event, window, expectedRendererUrl)) throw new Error("untrusted_voice_ipc_sender");
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)
+      || Object.keys(payload).length !== 2 || !Object.hasOwn(payload, "requestId") || !Object.hasOwn(payload, "reason")) {
+      throw new Error("invalid_voice_ducking_end_request");
+    }
+    const request = payload as { requestId: unknown; reason: unknown };
+    if (!isVoiceId(request.requestId) || typeof request.reason !== "string"
+      || !["completed", "followup_expired", "stop", "error"].includes(request.reason)) {
+      throw new Error("invalid_voice_ducking_end_request");
+    }
+    if (duckingRequestByWindow.get(window) !== request.requestId) return false;
+    releaseVoiceDucking(window, request.requestId, request.reason as AudioDuckingEndReason);
     return true;
   });
 }
@@ -951,6 +995,7 @@ export function removeVoiceIpcHandlers(): void {
   ipcMain.removeHandler(VOICE_SPEECH_CANCEL_CHANNEL);
   ipcMain.removeHandler(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL);
   ipcMain.removeHandler(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL);
+  ipcMain.removeHandler(VOICE_DUCKING_END_CHANNEL);
   for (const [window, speech] of speechOwners) {
     cancelVoiceSpeech(window, "session_ended");
     for (const unsubscribe of speech.unsubscribe) { try { unsubscribe(); } catch { /* Listener cleanup is best-effort. */ } }

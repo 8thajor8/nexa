@@ -71,6 +71,8 @@ export class VoiceFollowupController {
   private sessionId: string | null = null;
   private startRequestId: string | null = null;
   private finishRequestId: string | null = null;
+  private duckingParentRequestId: string | null = null;
+  private duckingRequestId: string | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
   private durationTimer: ReturnType<typeof setTimeout> | null = null;
   private generation = 0;
@@ -83,6 +85,8 @@ export class VoiceFollowupController {
   private vadSpeechDetected = false;
   private pendingStart: Promise<Awaited<ReturnType<VoiceDesktopApi["ptt"]["start"]>>> | null = null;
   private stopInFlight: Promise<void> | null = null;
+  private endDuckingOnStop = false;
+  private duckingEndReason: "followup_expired" | "stop" | "error" = "stop";
   private prepared: { generation: number; promise: Promise<VadPort> } | null = null;
   private readonly listeners = new Set<() => void>();
   private unsubscribe: (() => void) | null = null;
@@ -127,7 +131,7 @@ export class VoiceFollowupController {
     });
   }
 
-  async open(): Promise<void> {
+  async open(parentRequestId?: string): Promise<void> {
     if (this.stopInFlight) await this.stopInFlight;
     if (this.active) return;
     if (!this.prepared) this.prepare();
@@ -144,6 +148,10 @@ export class VoiceFollowupController {
     this.notify();
     const requestId = crypto.randomUUID();
     this.startRequestId = requestId;
+    this.duckingParentRequestId = parentRequestId ?? null;
+    this.duckingRequestId = requestId;
+    this.endDuckingOnStop = false;
+    this.duckingEndReason = "stop";
     this.diagnose(requestId, "window_opened");
     let vadClaimed = false;
     let stage: VoiceFollowupFailure["stage"] = "main_session_start";
@@ -175,20 +183,24 @@ export class VoiceFollowupController {
       this.notify();
       this.windowDeadline = performance.now() + FOLLOWUP_WINDOW_MS;
       this.armWindowTimer(generation);
-      this.durationTimer = this.schedule(() => { void this.stop(); }, PTT_MAX_DURATION_SECONDS * 1_000);
+      this.durationTimer = this.schedule(() => { void this.stop("error"); }, PTT_MAX_DURATION_SECONDS * 1_000);
     } catch (error: unknown) {
       this.reportFailure(stage, error);
       this.pendingStart = null;
       if (!vadClaimed) await releasePrepared();
-      if (this.isCurrent(generation)) void this.stop();
+      if (this.isCurrent(generation)) void this.stop("error");
     }
   }
 
-  async stop(reason: "cancel" | "complete" = "cancel"): Promise<void> {
+  async stop(reason: "cancel" | "complete" | "expired" | "error" = "cancel"): Promise<void> {
     if (reason === "cancel" && this.active && this.startRequestId) {
       this.diagnose(this.startRequestId, "cancelled", performance.now() - this.followupStartedAt);
     }
-    if (reason === "cancel") this.completionAllowed = false;
+    if (reason !== "complete") {
+      this.completionAllowed = false;
+      this.endDuckingOnStop = true;
+      this.duckingEndReason = reason === "expired" ? "followup_expired" : reason === "error" ? "error" : "stop";
+    }
     if (this.stopInFlight) return this.stopInFlight;
     if (!this.active && !this.prepared) return;
     ++this.generation;
@@ -216,12 +228,24 @@ export class VoiceFollowupController {
       this.vad = null;
       const sessionId = this.sessionId;
       const targetRequestId = this.finishRequestId ?? this.startRequestId;
+      const duckingStartRequestId = this.startRequestId;
+      const duckingRequestId = this.duckingRequestId;
+      const duckingParentRequestId = this.duckingParentRequestId;
+      this.duckingRequestId = null;
+      this.duckingParentRequestId = null;
       this.sessionId = null;
       this.startRequestId = null;
       this.finishRequestId = null;
       this.finishing = false;
       try { await vad?.destroy(); } catch { /* Main cancellation still runs. */ }
       if (sessionId && targetRequestId) await this.cancelSession(sessionId, targetRequestId);
+      if (this.endDuckingOnStop) {
+        if (duckingRequestId) await this.voice.endDucking?.(duckingRequestId, this.duckingEndReason).catch(() => false);
+        if (duckingStartRequestId && duckingStartRequestId !== duckingRequestId) {
+          await this.voice.endDucking?.(duckingStartRequestId, this.duckingEndReason).catch(() => false);
+        }
+        if (duckingParentRequestId) await this.voice.endDucking?.(duckingParentRequestId, this.duckingEndReason).catch(() => false);
+      }
     })();
     this.stopInFlight = task;
     try { await task; } finally { if (this.stopInFlight === task) this.stopInFlight = null; }
@@ -241,25 +265,26 @@ export class VoiceFollowupController {
     this.vad = null;
     try { await vad?.pause(); await vad?.destroy(); } catch (error: unknown) {
       this.reportFailure("vad_finish", error);
-      await this.stop();
+      await this.stop("error");
       return;
     }
     if (!this.isCurrent(generation)) return;
     if (!audio.length || audio.length > PTT_MAX_DURATION_SECONDS * 16_000) {
       this.reportFailure("audio_validation");
-      await this.stop();
+      await this.stop("error");
       return;
     }
     const wav = encodePcm16MonoWav(audio);
     const requestId = crypto.randomUUID();
     this.finishRequestId = requestId;
+    this.duckingRequestId = requestId;
     this.diagnose(requestId, "transcription_submitted", performance.now() - this.followupStartedAt);
     try {
       const response = await this.voice.ptt.finish({ requestId, sessionId, audio: wav, format: "wav" });
-      if (!response.ok || response.requestId !== requestId || response.sessionId !== sessionId) await this.stop();
+      if (!response.ok || response.requestId !== requestId || response.sessionId !== sessionId) await this.stop("error");
     } catch (error: unknown) {
       this.reportFailure("stt_finish", error);
-      await this.stop();
+      await this.stop("error");
     }
     finally { wav.fill(0); audio.fill(0); }
   }
@@ -277,7 +302,7 @@ export class VoiceFollowupController {
         text: command, sessionId: envelope.sessionId, requestId: envelope.requestId, turnId: envelope.turnId,
       } : null;
       this.completionAllowed = Boolean(transcript);
-      void this.stop("complete").then(() => {
+      void this.stop(transcript ? "complete" : "error").then(() => {
         if (transcript && this.completionAllowed && this.generation === generation + 1) {
           this.completionAllowed = false;
           this.diagnose(transcript.requestId, "chat_submission_requested");
@@ -287,7 +312,7 @@ export class VoiceFollowupController {
     } else if (envelope.event.type === "voice.error" || envelope.event.type === "voice.cancelled"
       || envelope.event.type === "voice.session.ended") {
       if (envelope.event.type === "voice.error") this.diagnose(envelope.requestId, "transcription_error");
-      void this.stop();
+      void this.stop("error");
     }
   }
 
@@ -304,7 +329,7 @@ export class VoiceFollowupController {
   private armWindowTimer(generation: number): void {
     this.clearWindowTimer();
     const remaining = this.windowDeadline - performance.now();
-    if (remaining <= 0) { void this.stop(); return; }
+    if (remaining <= 0) { void this.stop("expired"); return; }
     this.timer = this.schedule(() => {
       if (!this.isCurrent(generation)) return;
       if (!this.vadSpeechDetected && this.startRequestId) {
@@ -312,7 +337,7 @@ export class VoiceFollowupController {
       } else if (this.startRequestId) {
         this.diagnose(this.startRequestId, "window_expired_after_speech", performance.now() - this.followupStartedAt);
       }
-      void this.stop();
+      void this.stop("expired");
     }, remaining);
   }
 

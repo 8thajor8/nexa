@@ -108,9 +108,11 @@ describe("Main chat IPC to Conversation Runtime", () => {
 
     await send(id("51"), "typed");
     expect(onNewInteraction).toHaveBeenCalledOnce();
+    expect(onNewInteraction).toHaveBeenNthCalledWith(1, id("51"), "typed");
     expect(onVoiceResponse).not.toHaveBeenCalled();
     await send(id("52"), "voice");
     expect(onNewInteraction).toHaveBeenCalledTimes(2);
+    expect(onNewInteraction).toHaveBeenNthCalledWith(2, id("52"), "voice");
     expect(onVoiceResponse).toHaveBeenCalledOnce();
     expect(onVoiceResponse).toHaveBeenCalledWith(h.window, id("52"), "respuesta voice");
   });

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   VOICE_EVENT_CHANNEL,
   VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL,
+  VOICE_DUCKING_END_CHANNEL,
   VOICE_SPEECH_EVENT_CHANNEL,
   VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL,
   VOICE_SPEECH_CANCEL_CHANNEL,
@@ -21,6 +22,7 @@ vi.mock("electron", () => ({ ipcMain: ipcMock }));
 import {
   cleanupVoiceWindow,
   cancelVoiceSpeech,
+  continueVoiceDuckingForRequest,
   registerVoiceWindowNavigation,
   registerVoiceIpcHandlers,
   markVoiceResponseDispatched,
@@ -188,8 +190,64 @@ describe("Electron Main Voice IPC", () => {
     expect(invoke(VOICE_PTT_CANCEL_CHANNEL, trustedEvent(window), {
       requestId: "stop-request", sessionId: started.sessionId, targetRequestId: "chat-request",
     })).toMatchObject({ ok: true, cancelled: true });
-    await vi.waitFor(() => expect(audioDucking.end).toHaveBeenCalledWith("chat-request"));
+    await vi.waitFor(() => expect(audioDucking.end).toHaveBeenCalledWith("chat-request", "completed"));
     expect(audioDucking.end).toHaveBeenCalledOnce();
+  });
+
+  it("retains one ducking lease across playback, follow-up, STT and the next spoken turn", async () => {
+    const window = createWindow("continuous-ducking");
+    const audioDucking = {
+      begin: vi.fn(async () => undefined), transfer: vi.fn(), end: vi.fn(async () => undefined),
+      endExcept: vi.fn(async () => undefined), close: vi.fn(async () => undefined),
+    };
+    const voice = makeVoiceFactory();
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    let idFactory = () => "";
+    const speaker = {
+      speak: vi.fn(async () => {
+        listeners.get("voice.speech.completed")?.({ turnId: idFactory() });
+        return { completed: true as const };
+      }),
+      cancel: vi.fn(() => false),
+      on: vi.fn((type: string, listener: (event: Record<string, unknown>) => void) => {
+        listeners.set(type, listener);
+        return () => listeners.delete(type);
+      }),
+    };
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL,
+      async () => ({ ...voice, createVoiceSpeaker: ({ idFactory: factory }: { idFactory: () => string }) => {
+        idFactory = factory; return speaker;
+      } }) as never, undefined, undefined, undefined, audioDucking);
+
+    const first = await startSession(window, "ptt-1");
+    finish(window, first.sessionId!, "stt-1");
+    voice.controllers[0].emit({ type: "voice.transcript.final", sessionId: first.sessionId, turnId: "turn-1",
+      timestamp: 1, text: "hola", language: "es" });
+    voice.controllers[0].resolvePending(null);
+    await Promise.resolve();
+    continueVoiceDuckingForRequest("chat-1");
+    await speakVoiceResponse(window as never, "chat-1", "Primera respuesta.");
+    expect(audioDucking.end).not.toHaveBeenCalled();
+
+    const followup = await startSession(window, "followup-2");
+    expect(audioDucking.transfer).toHaveBeenCalledWith("chat-1", "followup-2");
+    expect(invoke(VOICE_DUCKING_END_CHANNEL, trustedEvent(window), { requestId: "chat-1", reason: "completed" })).toBe(false);
+    finish(window, followup.sessionId!, "stt-2");
+    voice.controllers[1].emit({ type: "voice.transcript.final", sessionId: followup.sessionId, turnId: "turn-2",
+      timestamp: 2, text: "seguí", language: "es" });
+    invoke(VOICE_PTT_CANCEL_CHANNEL, trustedEvent(window), {
+      requestId: "cleanup-2", sessionId: followup.sessionId, targetRequestId: "stt-2",
+    });
+    continueVoiceDuckingForRequest("chat-2");
+    await speakVoiceResponse(window as never, "chat-2", "Segunda respuesta.");
+    expect(audioDucking.begin).toHaveBeenCalledOnce();
+    expect(audioDucking.end).not.toHaveBeenCalled();
+    expect(invoke(VOICE_DUCKING_END_CHANNEL, trustedEvent(window), { requestId: "chat-2", reason: "followup_expired" })).toBe(true);
+    expect(audioDucking.end).toHaveBeenCalledOnce();
+    expect(audioDucking.end).toHaveBeenCalledWith("chat-2", "followup_expired");
+    expect(invoke(VOICE_DUCKING_END_CHANNEL, trustedEvent(window), { requestId: "chat-2", reason: "stop" })).toBe(false);
+    expect(() => invoke(VOICE_DUCKING_END_CHANNEL, trustedEvent(window), { requestId: "chat-2", reason: "invalid" }))
+      .toThrow("invalid_voice_ducking_end_request");
   });
 
   it("synthesizes only through the Main-owned speaker and emits request-correlated playback states", async () => {

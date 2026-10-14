@@ -430,9 +430,12 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         setVoiceSpeechStatus(null);
         if (shouldFollowup) {
           setVoiceFollowupError(null);
-          void followup.open();
+          void followup.open(event.requestId);
         }
-        else void followup.stop();
+        else {
+          void followup.stop();
+          void window.nexaDesktop.voice.endDucking(event.requestId).catch(() => false);
+        }
       }
     });
   }, [followup]);

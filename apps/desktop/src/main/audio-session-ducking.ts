@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
 export const AUDIO_DUCKING_FACTOR = 0.2;
+export type AudioDuckingEndReason = "completed" | "followup_expired" | "stop" | "error" | "shutdown" | "superseded";
 const RESTORE_MATCH_TOLERANCE = 0.005;
 const MAX_BRIDGE_OUTPUT_BYTES = 256 * 1024;
 const BRIDGE_TIMEOUT_MS = 8_000;
@@ -37,8 +38,9 @@ export interface AudioDuckingAdapter {
 }
 
 export interface AudioDuckingDiagnostics {
-  (event: "requested" | "started" | "restored" | "failed", details: Readonly<{
+  (event: "requested" | "started" | "continued" | "ended" | "stale" | "restored" | "failed", details: Readonly<{
     stage: "duck" | "restore"; code: string; component?: "windows_core_audio"; endpointRole?: "default_render_multimedia";
+    endReason?: AudioDuckingEndReason;
     errorStage?: string; sessionCount?: number;
     enumeratedSessions?: number; activeSessions?: number; excludedOwnedSessions?: number; excludedSystemSessions?: number; attemptedSessions?: number;
     changedSessions?: number; spotifySessionsFound?: number; spotifySessionsAttempted?: number;
@@ -77,7 +79,7 @@ export function createAudioSessionDucking(options: {
   let queue: Promise<void> = Promise.resolve();
   let disposed = false;
 
-  const report = (event: "requested" | "started" | "restored" | "failed", details: Parameters<AudioDuckingDiagnostics>[1]) => {
+  const report = (event: "requested" | "started" | "continued" | "ended" | "stale" | "restored" | "failed", details: Parameters<AudioDuckingDiagnostics>[1]) => {
     try { diagnostics(event, details); }
     catch { /* Diagnostics never affect Voice. */ }
   };
@@ -87,7 +89,7 @@ export function createAudioSessionDucking(options: {
     return next;
   };
 
-  async function restoreIfIdle(): Promise<void> {
+  async function restoreIfIdle(endReason: AudioDuckingEndReason = "completed"): Promise<void> {
     if (leases.size > 0 || snapshots === null) return;
     const previous = snapshots;
     snapshots = null;
@@ -96,11 +98,11 @@ export function createAudioSessionDucking(options: {
       const result = await adapter.restore(previous);
       report(result.failedSessions > 0 ? "failed" : "restored", {
         stage: "restore", code: result.failedSessions > 0 ? "partial_restore" : "ok", component: "windows_core_audio",
-        sessionCount: previous.length, changedSessions: result.restored, failedSessions: result.failedSessions,
+        sessionCount: previous.length, changedSessions: result.restored, failedSessions: result.failedSessions, endReason,
       });
     } catch (error) {
       report("failed", { stage: "restore", code: safeOperationCode(error), component: "windows_core_audio",
-        errorStage: safeOperationStage(error), sessionCount: previous.length,
+        errorStage: safeOperationStage(error), sessionCount: previous.length, endReason,
         errorName: safeErrorName(error), errorCode: safeHResult(error) });
     }
   }
@@ -138,14 +140,24 @@ export function createAudioSessionDucking(options: {
     });
   }
 
-  function transfer(previousRequestId: string, nextRequestId: string): void {
-    if (previousRequestId === nextRequestId || !leases.delete(previousRequestId)) return;
+  function transfer(previousRequestId: string, nextRequestId: string): boolean {
+    if (previousRequestId === nextRequestId) return leases.has(previousRequestId);
+    if (!leases.delete(previousRequestId)) {
+      report("stale", { stage: "duck", code: "transfer_owner_not_found" });
+      return false;
+    }
     leases.add(nextRequestId);
+    report("continued", { stage: "duck", code: "owner_transferred" });
+    return true;
   }
 
-  async function end(requestId: string): Promise<void> {
-    leases.delete(requestId);
-    await enqueue(restoreIfIdle);
+  async function end(requestId: string, reason: AudioDuckingEndReason = "completed"): Promise<void> {
+    if (!leases.delete(requestId)) {
+      report("stale", { stage: "restore", code: "end_owner_not_found" });
+      return;
+    }
+    report("ended", { stage: "restore", code: "lease_released", endReason: reason });
+    await enqueue(() => restoreIfIdle(reason));
   }
 
   async function endExcept(requestId: string | null): Promise<void> {
@@ -156,7 +168,7 @@ export function createAudioSessionDucking(options: {
   async function close(): Promise<void> {
     disposed = true;
     leases.clear();
-    await enqueue(restoreIfIdle);
+    await enqueue(() => restoreIfIdle("shutdown"));
   }
 
   return Object.freeze({ begin, transfer, end, endExcept, close });

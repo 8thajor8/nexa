@@ -98,6 +98,7 @@ beforeEach(async () => {
       onEvent: vi.fn((listener) => { chatListeners.add(listener); return () => chatListeners.delete(listener); }),
     },
     voice: {
+      endDucking: vi.fn(async () => true),
       ptt: {
         start: vi.fn(async () => ({ ok: false, requestId: "unused", error: { code: "invalid_request", message: "unused" } })),
         finish: vi.fn(async () => ({ ok: false, requestId: "unused", error: { code: "invalid_request", message: "unused" } })),
@@ -396,6 +397,7 @@ describe("App PTT DOM integration", () => {
     }));
     act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "completed" })));
     await waitFor(() => expect(bridge.voice.ptt.start).toHaveBeenCalledOnce());
+    expect(bridge.voice.endDucking).not.toHaveBeenCalled();
     expect(await screen.findByText("Escuchando… Podés hablar.")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Detener interacción" })).toBeTruthy();
     act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "completed" })));

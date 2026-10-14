@@ -11,6 +11,7 @@ function harness(transcript = "Nexa, seguí contando") {
   const vad = { start: vi.fn(async () => undefined), pause: vi.fn(async () => undefined), destroy: vi.fn(async () => undefined) };
   const createVad = vi.fn(async (next: NonNullable<typeof callbacks>) => { callbacks = next; return vad; });
   const voice = {
+    endDucking: vi.fn(async () => true),
     onEvent: vi.fn((next: typeof listener) => { listener = next; return () => { listener = null; }; }),
     ptt: {
       start: vi.fn(async ({ requestId }: { requestId: string }) => ({ ok: true as const, requestId, sessionId: "session-1" })),
@@ -125,6 +126,7 @@ describe("bounded Voice follow-up", () => {
     expect(h.controller.getSnapshot()).toBe("idle");
     expect(h.vad.destroy).toHaveBeenCalledOnce();
     expect(h.voice.ptt.cancel).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(h.voice.endDucking).toHaveBeenCalledWith(expect.any(String), "followup_expired"));
     expect(h.voice.ptt.finish).not.toHaveBeenCalled();
     h.callbacks?.onSpeechRealStart();
     h.callbacks?.onSpeechEnd(new Float32Array(16_000));
@@ -137,6 +139,7 @@ describe("bounded Voice follow-up", () => {
     await h.speak();
     h.emit("¿Y mañana?");
     await vi.waitFor(() => expect(h.accepted).toHaveBeenCalledOnce());
+    expect(h.voice.endDucking).not.toHaveBeenCalled();
     h.emit("seguí");
     expect(h.accepted).toHaveBeenCalledOnce();
     await h.controller.open();
@@ -192,6 +195,7 @@ describe("bounded Voice follow-up", () => {
     await h.controller.open();
     await h.speak();
     await h.controller.stop();
+    expect(h.voice.endDucking).toHaveBeenCalledWith(expect.any(String), "stop");
     h.emit("Nexa, seguí");
     expect(h.accepted).not.toHaveBeenCalled();
     await h.controller.open();
@@ -215,6 +219,7 @@ describe("bounded Voice follow-up", () => {
     await stop;
     await Promise.resolve();
     expect(h.accepted).not.toHaveBeenCalled();
+    expect(h.voice.endDucking).toHaveBeenCalledWith(expect.any(String), "stop");
   });
 
   it("does not start duplicate capture sessions", async () => {

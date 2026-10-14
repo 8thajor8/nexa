@@ -30,6 +30,7 @@ async function loadPreload() {
       ptt: { start: (request: unknown) => Promise<unknown>; finish: (request: unknown) => Promise<unknown>; cancel: (request: unknown) => Promise<unknown> };
       speech: { acknowledge: (request: unknown) => Promise<unknown>; cancel: (request: unknown) => Promise<unknown>; onEvent: (listener: (event: unknown) => void) => () => void };
       onEvent: (listener: (event: unknown) => void) => () => void;
+      endDucking: (requestId: string, reason?: string) => Promise<boolean>;
     };
     [key: string]: unknown;
   };
@@ -40,7 +41,7 @@ describe("Voice preload API", () => {
 
   it("exposes only narrow Voice methods and invokes fixed channels with validated requests", async () => {
     const api = await loadPreload();
-    expect(Object.keys(api.voice).sort()).toEqual(["onEvent", "ptt", "speech"]);
+    expect(Object.keys(api.voice).sort()).toEqual(["endDucking", "onEvent", "ptt", "recordFollowupDiagnostic", "speech"]);
     expect(Object.keys(api.voice.ptt).sort()).toEqual(["cancel", "finish", "start"]);
     expect(Object.keys(api.voice.speech).sort()).toEqual(["acknowledge", "cancel", "onEvent"]);
     expect(api).not.toHaveProperty("ipcRenderer");
@@ -78,6 +79,15 @@ describe("Voice preload API", () => {
     expect(received).toHaveBeenCalledWith({ requestId: request.requestId, state: "completed" });
     unsubscribe();
     expect(mocks.removeListener).toHaveBeenCalledWith("voice:speech:event", listener);
+  });
+
+  it("ends only an identified ducking lease through fixed IPC with a bounded reason", async () => {
+    const api = await loadPreload();
+    mocks.invoke.mockResolvedValueOnce(true);
+    await expect(api.voice.endDucking("request-1")).resolves.toBe(true);
+    expect(mocks.invoke).toHaveBeenLastCalledWith("voice:ducking:end", { requestId: "request-1", reason: "completed" });
+    await expect(api.voice.endDucking("")).rejects.toThrow("invalid_voice_ducking_request_id");
+    await expect(api.voice.endDucking("request-1", "invalid" as never)).rejects.toThrow("invalid_voice_ducking_end_reason");
   });
 
   it("invokes only the fixed acknowledgement IPC with a correlated request", async () => {

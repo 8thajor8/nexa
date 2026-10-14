@@ -38,7 +38,7 @@ type Handler = (event: IpcMainInvokeEvent, payload: unknown) => unknown;
 type ChatDiagnostic = (event: string, details: Readonly<Record<string, string | number | boolean | null>>) => void;
 export type ChatCleanupOrigin = "navigation" | "window_closed" | "app_quit";
 export interface ChatVoiceHooks {
-  onNewInteraction?(requestId: string): void;
+  onNewInteraction?(requestId: string, source: "typed" | "voice"): void;
   onVoiceResponse?(window: ChatWindowContext, requestId: string, response: string): void;
   onVoiceRuntimeCompleted?(window: ChatWindowContext, requestId: string, durationMs: number): void;
   onVoiceResponseDispatched?(requestId: string): void;
@@ -141,7 +141,7 @@ export class ChatIpcService {
     const active: ActiveRequest = { window, request, terminal: false, cancelPending: false, startedAt: performance.now() };
     this.activeByRequest.set(request.requestId, active);
     if (request.source === "typed" || request.source === "voice") {
-      try { this.voiceHooks.onNewInteraction?.(request.requestId); } catch { /* Speech cancellation must not block chat. */ }
+      try { this.voiceHooks.onNewInteraction?.(request.requestId, request.source); } catch { /* Speech cancellation must not block chat. */ }
     }
     let operation: Promise<RuntimeMessageResult>;
     try {
