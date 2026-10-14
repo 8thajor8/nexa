@@ -687,6 +687,13 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--nexa-cyan);
 .settings-add-clock > button, .settings-weather-form > button { min-height: 34px; }
 .settings-add-clock > button:disabled, .settings-weather-form > button:disabled { cursor: not-allowed; opacity: .48; }
 .settings-weather-note strong { color: #cbefff; }
+.settings-restart-button, .settings-restart-actions button { min-height: 36px; padding: 0 13px; border: 1px solid rgba(78, 172, 238, .45); border-radius: 6px; background: rgba(13, 58, 94, .62); color: #dcf6ff; font-size: 10px; font-weight: 700; cursor: pointer; }
+.settings-restart-button { display: inline-flex; align-items: center; gap: 8px; margin-top: 12px; }
+.settings-restart-button:hover, .settings-restart-actions button:hover:not(:disabled) { border-color: rgba(94, 210, 255, .72); background: rgba(24, 82, 125, .7); }
+.settings-restart-confirmation { margin-top: 12px; color: #c9dfef; font-size: 11px; }
+.settings-restart-confirmation p { margin: 0 0 10px; }
+.settings-restart-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.settings-restart-actions button:disabled { opacity: .5; cursor: default; }
 .settings-dialog__footer { border-top: 1px solid rgba(105, 177, 247, .16); color: #8fa8c0; font-size: 9px; }
 .settings-dialog__footer button { min-height: 33px; padding: 0 14px; border: 1px solid rgba(78, 172, 238, .45); border-radius: 6px; background: rgba(13, 58, 94, .62); color: #dcf6ff; font-size: 10px; font-weight: 700; cursor: pointer; }
 .voice-input-settings-panel--inline { position: static; display: grid; width: 100%; gap: 8px; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; backdrop-filter: none; }

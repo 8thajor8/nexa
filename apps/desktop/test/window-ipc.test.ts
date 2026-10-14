@@ -6,6 +6,7 @@ import {
   WINDOW_SETTINGS_GET_CHANNEL,
   WINDOW_SETTINGS_SET_CHANNEL,
   CLIPBOARD_WRITE_TEXT_CHANNEL,
+  DESKTOP_RESTART_CHANNEL,
 } from "../src/shared/ipc-contract";
 import type { IpcSenderContext } from "../src/shared/ipc-security";
 
@@ -26,6 +27,20 @@ type IpcCallback = (event: IpcSenderContext) => unknown;
 describe("frameless window IPC", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it("accepts restart only from the trusted main frame with no arguments", () => {
+    const mainFrame = {};
+    const webContents = { mainFrame };
+    const restart = vi.fn(() => ({ ok: true as const, accepted: true as const }));
+    registerIpcHandlers(() => ({ webContents }) as never, async () => ({ available: false }), undefined, undefined, restart);
+    const handler = ipcMock.handle.mock.calls.find(([channel]) => channel === DESKTOP_RESTART_CHANNEL)?.[1] as
+      (event: IpcSenderContext, ...args: unknown[]) => unknown;
+    expect(() => handler({ sender: webContents, senderFrame: {} })).toThrow("untrusted_ipc_sender");
+    expect(() => handler({ sender: webContents, senderFrame: mainFrame }, "extra")).toThrow("invalid_restart_request");
+    expect(restart).not.toHaveBeenCalled();
+    expect(handler({ sender: webContents, senderFrame: mainFrame })).toEqual({ ok: true, accepted: true });
+    expect(restart).toHaveBeenCalledOnce();
   });
 
   it("validates the main frame and operates minimize, maximize/restore, and close", async () => {

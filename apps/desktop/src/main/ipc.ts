@@ -1,6 +1,7 @@
 import { clipboard, ipcMain, type BrowserWindow, type IpcMainEvent, type IpcMainInvokeEvent } from "electron";
 import {
   CLIPBOARD_WRITE_TEXT_CHANNEL,
+  DESKTOP_RESTART_CHANNEL,
   createPingResponse,
   GET_WALLPAPER_CHANNEL,
   PING_CHANNEL,
@@ -12,6 +13,7 @@ import {
   type WindowPreferences,
   type WindowSettingsSnapshot,
   type WallpaperResponse,
+  type DesktopRestartResponse,
 } from "../shared/ipc-contract.js";
 import { isTrustedIpcSender, runForTrustedIpcSender } from "../shared/ipc-security.js";
 import { isWindowPreferences } from "../shared/window-settings-validation.js";
@@ -21,10 +23,12 @@ export function registerIpcHandlers(
   getWallpaper: () => Promise<WallpaperResponse>,
   windowSettings?: { get: () => WindowSettingsSnapshot; set: (preferences: WindowPreferences) => WindowSettingsSnapshot | Promise<WindowSettingsSnapshot> },
   writeClipboardText: (text: string) => void = (text) => clipboard.writeText(text),
+  restartDesktop: () => DesktopRestartResponse = () => ({ ok: false, error: "restart_unavailable" }),
 ): void {
   ipcMain.removeHandler(PING_CHANNEL);
   ipcMain.removeHandler(GET_WALLPAPER_CHANNEL);
   ipcMain.removeHandler(CLIPBOARD_WRITE_TEXT_CHANNEL);
+  ipcMain.removeHandler(DESKTOP_RESTART_CHANNEL);
   ipcMain.removeHandler(WINDOW_TOGGLE_MAXIMIZE_CHANNEL);
   ipcMain.removeHandler(WINDOW_SETTINGS_GET_CHANNEL);
   ipcMain.removeHandler(WINDOW_SETTINGS_SET_CHANNEL);
@@ -45,6 +49,14 @@ export function registerIpcHandlers(
       }
       writeClipboardText(value);
       return true;
+    });
+  });
+  ipcMain.handle(DESKTOP_RESTART_CHANNEL, (event: IpcMainInvokeEvent, ...args: unknown[]) => {
+    const window = getMainWindow();
+    if (!window) throw new Error("window_unavailable");
+    return runForTrustedIpcSender(event, window, () => {
+      if (args.length !== 0) throw new Error("invalid_restart_request");
+      return restartDesktop();
     });
   });
   ipcMain.on(WINDOW_MINIMIZE_CHANNEL, (event: IpcMainEvent) => {

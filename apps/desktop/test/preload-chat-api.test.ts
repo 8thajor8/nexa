@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DESKTOP_RENDERER_ISOLATION_ARGUMENT } from "../src/shared/ipc-contract";
+import { DESKTOP_RENDERER_ISOLATION_ARGUMENT, DESKTOP_RESTART_CHANNEL } from "../src/shared/ipc-contract";
 
 const mocks = vi.hoisted(() => ({
   exposed: undefined as unknown,
@@ -22,6 +22,7 @@ type ChatApi = {
     onEvent(listener: (event: unknown) => void): () => void;
   };
   copyTechnicalDetail(text: string): Promise<boolean>;
+  restartDesktop(): Promise<unknown>;
   authorization: {
     connect(request: unknown): Promise<unknown>;
     cancel(request: unknown): Promise<unknown>;
@@ -41,6 +42,15 @@ async function loadPreload(): Promise<ChatApi> {
 describe("chat preload allowlist", () => {
   beforeEach(() => { vi.resetModules(); vi.clearAllMocks(); });
   afterEach(() => { process.argv = originalArgv; });
+
+  it("uses a fixed restart channel and validates Main's response", async () => {
+    const api = await loadPreload();
+    mocks.invoke.mockResolvedValueOnce({ ok: true, accepted: true });
+    await expect(api.restartDesktop()).resolves.toEqual({ ok: true, accepted: true });
+    expect(mocks.invoke).toHaveBeenLastCalledWith(DESKTOP_RESTART_CHANNEL);
+    mocks.invoke.mockResolvedValueOnce({ ok: true, accepted: true, extra: true });
+    await expect(api.restartDesktop()).rejects.toThrow("invalid_restart_response");
+  });
 
   it("exposes the Main-provided isolated mode synchronously without IPC", async () => {
     process.argv = [...originalArgv, DESKTOP_RENDERER_ISOLATION_ARGUMENT];

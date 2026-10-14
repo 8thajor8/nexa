@@ -1,6 +1,7 @@
 import { contextBridge, ipcRenderer } from "electron";
 import {
   GET_WALLPAPER_CHANNEL,
+  DESKTOP_RESTART_CHANNEL,
   CLIPBOARD_WRITE_TEXT_CHANNEL,
   AUTHORIZATION_CANCEL_CHANNEL,
   AUTHORIZATION_CONNECT_CHANNEL,
@@ -19,6 +20,7 @@ import {
   isDesktopMemoryModeResult,
   isDesktopMemoryModeStatus,
   isPingResponse,
+  isDesktopRestartResponse,
   isWallpaperResponse,
   PING_CHANNEL,
   WINDOW_CLOSE_CHANNEL,
@@ -98,6 +100,11 @@ const api: NexaDesktopApi = {
   },
   closeWindow() {
     ipcRenderer.send(WINDOW_CLOSE_CHANNEL);
+  },
+  async restartDesktop() {
+    const response: unknown = await ipcRenderer.invoke(DESKTOP_RESTART_CHANNEL);
+    if (!isDesktopRestartResponse(response)) throw new Error("invalid_restart_response");
+    return response;
   },
   windowSettings: {
     async get() {

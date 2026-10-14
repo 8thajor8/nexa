@@ -20,10 +20,12 @@ import { authorizeSpotify } from "../../../../src/integrations/spotify/auth.js";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { registerIpcHandlers } from "./ipc.js";
+import { createDesktopRestartController, DEV_RESTART_EXIT_CODE } from "./restart.js";
 import { registerChatNavigationHandlers } from "./chat-navigation.js";
 import { isAllowedNavigation, isTrustedIpcSender } from "../shared/ipc-security.js";
 import {
   GET_WALLPAPER_CHANNEL,
+  DESKTOP_RESTART_CHANNEL,
   PING_CHANNEL,
   WINDOW_CLOSE_CHANNEL,
   WINDOW_MINIMIZE_CHANNEL,
@@ -241,6 +243,8 @@ const rendererEntryPoint = selectRendererEntryPoint(
 const rendererEntryPointUrl = rendererEntryPoint.kind === "url"
   ? rendererEntryPoint.url
   : pathToFileURL(rendererEntryPoint.filePath).href;
+const desktopRestart = createDesktopRestartController(app, app.isPackaged,
+  rendererEntryPoint.kind === "url" && process.env.NEXA_DEV_RESTART_EXIT_CODE === String(DEV_RESTART_EXIT_CODE));
 const publicVoiceApiUrl = pathToFileURL(resolve(appRoot, "dist-electron", "voice", "index.js")).href;
 let mainWindow: BrowserWindow | null = null;
 let conversationRuntime: ConversationRuntimeApi | null = null;
@@ -660,6 +664,8 @@ function installWebContentsGuards(): void {
     () => mainWindow,
     () => startupPolicy.readSystemWallpaper ? getWindowsWallpaper(app.getPath("appData")) : Promise.resolve({ available: false }),
     { get: getWindowSettings, set: updateWindowPreferences },
+    undefined,
+    () => desktopRestart.request(),
   );
   if (startupPolicy.registerExternalServices) {
     registerWeatherIpcHandler(() => mainWindow);
@@ -846,6 +852,7 @@ function installWebContentsGuards(): void {
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
+app.on("will-quit", () => desktopRestart.onWillQuit());
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0 && app.isReady()) createMainWindow();
 });
@@ -896,6 +903,7 @@ app.on("before-quit", (event) => {
   ipcMain.removeHandler(PING_CHANNEL);
   ipcMain.removeHandler(SPOTIFY_OPEN_TRACK_CHANNEL);
   ipcMain.removeHandler(GET_WALLPAPER_CHANNEL);
+  ipcMain.removeHandler(DESKTOP_RESTART_CHANNEL);
   ipcMain.removeHandler(WINDOW_TOGGLE_MAXIMIZE_CHANNEL);
   ipcMain.removeHandler(WINDOW_SETTINGS_GET_CHANNEL);
   ipcMain.removeHandler(WINDOW_SETTINGS_SET_CHANNEL);

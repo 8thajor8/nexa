@@ -4,6 +4,7 @@ export const CLIPBOARD_WRITE_TEXT_CHANNEL = "nexa:clipboard:write-text" as const
 export const WINDOW_MINIMIZE_CHANNEL = "nexa:window:minimize" as const;
 export const WINDOW_TOGGLE_MAXIMIZE_CHANNEL = "nexa:window:toggle-maximize" as const;
 export const WINDOW_CLOSE_CHANNEL = "nexa:window:close" as const;
+export const DESKTOP_RESTART_CHANNEL = "nexa:desktop:restart" as const;
 export const WINDOW_SETTINGS_GET_CHANNEL = "nexa:window-settings:get" as const;
 export const WINDOW_SETTINGS_SET_CHANNEL = "nexa:window-settings:set" as const;
 export const WINDOW_SETTINGS_CHANGED_CHANNEL = "nexa:window-settings:changed" as const;
@@ -335,6 +336,8 @@ export interface PingResponse { ok: true; message: "pong"; }
 export type WallpaperResponse =
   | { available: true; dataUrl: string }
   | { available: false };
+export type DesktopRestartResponse = { ok: true; accepted: true }
+  | { ok: false; error: "restart_pending" | "restart_unavailable" | "relaunch_failed" };
 export interface NexaDesktopApi {
   readonly isIsolated: boolean;
   readonly isSyntheticOrganicPilot: boolean;
@@ -344,6 +347,7 @@ export interface NexaDesktopApi {
   minimizeWindow: () => void;
   toggleMaximizeWindow: () => Promise<boolean>;
   closeWindow: () => void;
+  restartDesktop: () => Promise<DesktopRestartResponse>;
   windowSettings: WindowSettingsDesktopApi;
   voice: VoiceDesktopApi;
   chat: ChatDesktopApi;
@@ -387,6 +391,16 @@ export function isPingResponse(value: unknown): value is PingResponse {
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record);
   return keys.length === 2 && record.ok === true && record.message === "pong";
+}
+
+export function isDesktopRestartResponse(value: unknown): value is DesktopRestartResponse {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  return record.ok === true ? keys.length === 2 && record.accepted === true
+    : record.ok === false && keys.length === 2
+      && typeof record.error === "string"
+      && ["restart_pending", "restart_unavailable", "relaunch_failed"].includes(record.error);
 }
 
 const MAX_WALLPAPER_DATA_URL_LENGTH = 14 * 1024 * 1024;

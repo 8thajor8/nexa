@@ -10,6 +10,8 @@ const vite = resolve(appRoot, "node_modules", "vite", "bin", "vite.js");
 const electronBuild = resolve(appRoot, "scripts", "build-electron.mjs");
 const electron = resolve(appRoot, "node_modules", "electron", "cli.js");
 const rendererUrl = "http://127.0.0.1:5174";
+// The launcher retains Vite and restarts only Electron for an in-app restart request.
+const restartExitCode = 87;
 
 function run(command, args, options = {}) {
   return new Promise((resolvePromise, rejectPromise) => {
@@ -51,13 +53,16 @@ try {
   await run(node, [electronBuild]);
   renderer = start(node, [vite, "--host", "127.0.0.1", "--strictPort"]);
   await waitForRenderer(renderer);
-  desktop = start(node, [electron, "."], {
-    env: { ...process.env, VITE_DEV_SERVER_URL: rendererUrl },
-  });
-  process.exitCode = await new Promise((resolvePromise, rejectPromise) => {
-    desktop.once("error", rejectPromise);
-    desktop.once("exit", (code) => resolvePromise(code ?? 0));
-  });
+  while (true) {
+    desktop = start(node, [electron, "."], {
+      env: { ...process.env, VITE_DEV_SERVER_URL: rendererUrl, NEXA_DEV_RESTART_EXIT_CODE: String(restartExitCode) },
+    });
+    const exitCode = await new Promise((resolvePromise, rejectPromise) => {
+      desktop.once("error", rejectPromise);
+      desktop.once("exit", (code) => resolvePromise(code ?? 0));
+    });
+    if (exitCode !== restartExitCode) { process.exitCode = exitCode; break; }
+  }
 } catch (error) {
   console.error(error instanceof Error ? error.message : error);
   process.exitCode = 1;

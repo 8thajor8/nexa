@@ -32,14 +32,48 @@ function renderSettings(onClose = vi.fn(), onPreferencesChange = vi.fn()) {
   const memoryApi = { getStatus: vi.fn(async () => ({ mode: "memory1" as const, memory2Available: true, memory2WriteAvailable: true, switching: false, fallbackReason: null })),
     setMode: vi.fn(async (mode: DesktopMemoryMode): Promise<DesktopMemoryModeResult> => ({ ok: true,
       status: { mode, memory2Available: true, memory2WriteAvailable: true, switching: false, fallbackReason: null } })) };
-  Object.defineProperty(window, "nexaDesktop", { configurable: true, value: { windowSettings: windowApi, memory: memoryApi } });
-  return { onClose, onPreferencesChange, windowApi, memoryApi, emitSettings: (settings: typeof snapshot) => changedListener?.(settings), ...render(createElement(SettingsModal, {
+  const restartDesktop = vi.fn(async () => ({ ok: true as const, accepted: true as const }));
+  Object.defineProperty(window, "nexaDesktop", { configurable: true, value: { windowSettings: windowApi, memory: memoryApi, restartDesktop } });
+  return { onClose, onPreferencesChange, windowApi, memoryApi, restartDesktop, emitSettings: (settings: typeof snapshot) => changedListener?.(settings), ...render(createElement(SettingsModal, {
     preferences: DEFAULT_DESKTOP_PREFERENCES, onPreferencesChange, microphoneDevices: makeStore(), microphoneDisabled: false, onClose,
     onMemoryModeChange: memoryApi.setMode,
   })) };
 }
 
 describe("Settings modal", () => {
+  it("shows the restart action and requires confirmation", async () => {
+    const { restartDesktop } = renderSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Reiniciar Nexa" }));
+    expect(restartDesktop).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancelar" }));
+    expect(restartDesktop).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Reiniciar Nexa" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar reinicio" }));
+    await waitFor(() => expect(restartDesktop).toHaveBeenCalledOnce());
+  });
+
+  it("does not send duplicate restart requests while one is pending", async () => {
+    const { restartDesktop } = renderSettings();
+    let finish!: (value: { ok: true; accepted: true }) => void;
+    restartDesktop.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    fireEvent.click(screen.getByRole("button", { name: "Reiniciar Nexa" }));
+    const confirm = screen.getByRole("button", { name: "Confirmar reinicio" });
+    fireEvent.click(confirm);
+    fireEvent.click(confirm);
+    expect(restartDesktop).toHaveBeenCalledOnce();
+    finish({ ok: true, accepted: true });
+    await waitFor(() => expect(confirm).toHaveProperty("disabled", true));
+  });
+
+  it("shows a failed restart request and permits retry", async () => {
+    const { restartDesktop } = renderSettings();
+    restartDesktop.mockRejectedValueOnce(new Error("ipc_unavailable"));
+    fireEvent.click(screen.getByRole("button", { name: "Reiniciar Nexa" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar reinicio" }));
+    expect(await screen.findByRole("alert")).toHaveProperty("textContent", "No se pudo solicitar el reinicio de Nexa.");
+    fireEvent.click(screen.getByRole("button", { name: "Confirmar reinicio" }));
+    await waitFor(() => expect(restartDesktop).toHaveBeenCalledTimes(2));
+  });
   it("renders audio, appearance, time, and weather preferences", () => {
     renderSettings();
     expect(screen.getByRole("dialog", { name: "Settings" })).toBeTruthy();

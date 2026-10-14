@@ -25,6 +25,10 @@ export function SettingsModal({ preferences, onPreferencesChange, microphoneDevi
   const [memoryStatus, setMemoryStatus] = useState<DesktopMemoryModeStatus | null>(null);
   const [memoryError, setMemoryError] = useState<string | null>(null);
   const [memoryLoading, setMemoryLoading] = useState(false);
+  const [restartConfirming, setRestartConfirming] = useState(false);
+  const [restartPending, setRestartPending] = useState(false);
+  const [restartError, setRestartError] = useState<string | null>(null);
+  const restartInFlight = useRef(false);
   const zones = availableTimeZones();
 
   useEffect(() => {
@@ -113,6 +117,23 @@ export function SettingsModal({ preferences, onPreferencesChange, microphoneDevi
   }, [onClose]);
 
   const update = (patch: Partial<DesktopPreferences>) => onPreferencesChange({ ...preferences, ...patch });
+  const confirmRestart = async () => {
+    if (restartInFlight.current || memoryLoading || memoryStatus?.switching || windowSettings?.transitioning) return;
+    restartInFlight.current = true;
+    setRestartPending(true);
+    setRestartError(null);
+    try {
+      const result = await window.nexaDesktop.restartDesktop();
+      if (result.ok) return;
+      setRestartError(result.error === "restart_unavailable"
+        ? "El reinicio no está disponible desde esta forma de inicio. Cierra Nexa y vuelve a iniciarla manualmente."
+        : result.error === "restart_pending" ? "El reinicio ya está en curso." : "No se pudo reiniciar Nexa.");
+    } catch {
+      setRestartError("No se pudo solicitar el reinicio de Nexa.");
+    }
+    restartInFlight.current = false;
+    setRestartPending(false);
+  };
   const addClock = () => {
     if (!isValidTimeZone(clockToAdd) || preferences.clocks.some((clock) => clock.timeZone === clockToAdd)
       || preferences.clocks.length >= 8) return;
@@ -224,6 +245,25 @@ export function SettingsModal({ preferences, onPreferencesChange, microphoneDevi
                 : "El modo de memoria guardado no está disponible. Se inició Memory1; no se cambió ningún almacén."}
             </p>}
             {memoryError && <p role="alert" className="settings-weather-note">{memoryError}</p>}
+          </section>
+          <section className="settings-section" aria-labelledby="settings-app-title">
+            <div className="settings-section__heading"><span>07</span><div><h3 id="settings-app-title">Aplicación</h3>
+              <p>Reinicia Nexa cuando necesites volver a cargar la aplicación.</p></div></div>
+            {!restartConfirming ? <button type="button" className="settings-restart-button"
+              onClick={() => { setRestartError(null); setRestartConfirming(true); }}>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.7" aria-hidden="true">
+                <path d="M20 11a8 8 0 1 1-2.35-5.65M20 4v6h-6" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+              Reiniciar Nexa
+            </button> : <div className="settings-restart-confirmation">
+              <p>¿Reiniciar Nexa ahora? La ventana se cerrará y volverá a abrirse.</p>
+              <div className="settings-restart-actions">
+                <button type="button" disabled={restartPending} onClick={() => setRestartConfirming(false)}>Cancelar</button>
+                <button type="button" disabled={restartPending || memoryLoading || !!memoryStatus?.switching || !!windowSettings?.transitioning}
+                  onClick={() => { void confirmRestart(); }}>Confirmar reinicio</button>
+              </div>
+            </div>}
+            {restartError && <p className="settings-weather-note" role="alert">{restartError}</p>}
           </section>
         </div>
         <footer className="settings-dialog__footer"><span>Las preferencias se guardan en este dispositivo.</span><button type="button" onClick={onClose}>Listo</button></footer>
