@@ -158,11 +158,26 @@ export function releaseVoiceDuckingExcept(requestId: string | null): void {
 }
 const perWindowSequence = new WeakMap<VoiceIpcWindow, number>();
 let cachedVoiceApi: Promise<PublicVoiceApi> | null = null;
-const speechTimingByRequest = new Map<string, { startedAt: number; responseDispatchedAt?: number; audioReadyAt?: number; playbackStartedAt?: number }>();
+type SpeechTiming = { startedAt: number; responseDispatchedAt?: number; synthesisStartedAt?: number;
+  audioReadyAt?: number; playbackStartedAt?: number; completed?: boolean; completedMetrics?: Record<string, unknown> };
+const speechTimingByRequest = new Map<string, SpeechTiming>();
 
-function rememberSpeechTiming(requestId: string, timing: { startedAt: number; responseDispatchedAt?: number; audioReadyAt?: number; playbackStartedAt?: number }): void {
+function rememberSpeechTiming(requestId: string, timing: SpeechTiming): void {
   speechTimingByRequest.set(requestId, timing);
   while (speechTimingByRequest.size > 16) speechTimingByRequest.delete(speechTimingByRequest.keys().next().value!);
+}
+
+function correlatedSpeechMetrics(timing: SpeechTiming): Record<string, number | null> {
+  return {
+    responseDispatchToSynthesisMs: timing.responseDispatchedAt === undefined || timing.synthesisStartedAt === undefined ? null
+      : Math.max(0, timing.synthesisStartedAt - timing.responseDispatchedAt),
+    responseDispatchToAudioReadyMs: timing.responseDispatchedAt === undefined || timing.audioReadyAt === undefined ? null
+      : Math.max(0, timing.audioReadyAt - timing.responseDispatchedAt),
+    responseDispatchToPlaybackMs: timing.responseDispatchedAt === undefined || timing.playbackStartedAt === undefined ? null
+      : Math.max(0, timing.playbackStartedAt - timing.responseDispatchedAt),
+    audioReadyToPlaybackMs: timing.audioReadyAt === undefined || timing.playbackStartedAt === undefined ? null
+      : Math.max(0, timing.playbackStartedAt - timing.audioReadyAt),
+  };
 }
 
 /** Marks Main's successful delivery of a final voice response to the Renderer. */
@@ -171,12 +186,10 @@ export function markVoiceResponseDispatched(requestId: string): void {
   if (!timing) return;
   timing.responseDispatchedAt = performance.now();
   if (timing.playbackStartedAt !== undefined) {
-    recordVoice({ requestId, stage: "playback", state: "success",
-      durationMs: Math.max(0, timing.playbackStartedAt - timing.responseDispatchedAt),
-      metrics: { responseDispatchToPlaybackMs: Math.max(0, timing.playbackStartedAt - timing.responseDispatchedAt),
-        responseDispatchToAudioReadyMs: timing.audioReadyAt === undefined ? null : Math.max(0, timing.audioReadyAt - timing.responseDispatchedAt),
-        audioReadyToPlaybackMs: timing.audioReadyAt === undefined ? null : Math.max(0, timing.playbackStartedAt - timing.audioReadyAt) } });
-    speechTimingByRequest.delete(requestId);
+    recordVoice({ requestId, stage: "playback", state: timing.completed ? "success" : "processing",
+      durationMs: timing.completed ? Math.max(0, timing.playbackStartedAt - timing.responseDispatchedAt) : null,
+      metrics: { ...(timing.completedMetrics ?? {}), ...correlatedSpeechMetrics(timing) } });
+    if (timing.completed) speechTimingByRequest.delete(requestId);
   }
 }
 
@@ -321,7 +334,6 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
             durationMs: playbackStartedAt - timing.startedAt,
             metrics: { playbackCommandStartMs: Number((event.diagnostics as Record<string, unknown> | undefined)?.durationMs) || null,
               responseDispatchToPlaybackMs, audioReadyToPlaybackMs } });
-          if (responseDispatchToPlaybackMs !== null) speechTimingByRequest.delete(event.turnId);
         }),
         owner.speaker.on("voice.speech.completed", (event) => {
           if (typeof event.turnId !== "string") return;
@@ -338,9 +350,18 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
           if (responseStillActive) owner.activeKind = "response_preparing";
           else if (!acknowledgementStillActive) emitSpeechEvent(window, { requestId: event.turnId, state: "completed" });
           const details = event.diagnostics as Record<string, unknown> | undefined;
+          const timing = speechTimingByRequest.get(event.turnId);
+          const completedMetrics = details?.metrics && typeof details.metrics === "object"
+            ? details.metrics as Record<string, unknown> : {};
+          if (timing) {
+            timing.completed = true;
+            timing.completedMetrics = completedMetrics;
+          }
           recordVoice({ requestId: event.turnId, stage: "playback", state: "success",
             durationMs: typeof details?.durationMs === "number" ? details.durationMs : null,
-            metrics: details?.metrics && typeof details.metrics === "object" ? details.metrics as Record<string, unknown> : null });
+            metrics: timing ? { ...completedMetrics, ...correlatedSpeechMetrics(timing) }
+              : details?.metrics && typeof details.metrics === "object" ? completedMetrics : null });
+          if (timing?.responseDispatchedAt !== undefined) speechTimingByRequest.delete(event.turnId);
           if (owner.activeRequestId === event.turnId) {
             if (!responseStillActive) { owner.activeRequestId = null; owner.activeKind = null; }
           }
@@ -527,6 +548,7 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
       owner.activeKind = "response_preparing";
     }
     const speechTiming = speechTimingByRequest.get(requestId);
+    if (speechTiming) speechTiming.synthesisStartedAt = performance.now();
     recordVoice({ requestId, stage: "synthesis", state: "started",
       metrics: { responseDispatchToSynthesisMs: speechTiming?.responseDispatchedAt === undefined ? null
         : Math.max(0, performance.now() - speechTiming.responseDispatchedAt) } });
@@ -597,6 +619,7 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
   owner.activeKind = "response";
   owner.nextTurnId = requestId;
   const speechTiming = speechTimingByRequest.get(requestId);
+  if (speechTiming) speechTiming.synthesisStartedAt = performance.now();
   recordVoice({ requestId, stage: "synthesis", state: "started",
     metrics: { responseDispatchToSynthesisMs: speechTiming?.responseDispatchedAt === undefined ? null
       : Math.max(0, performance.now() - speechTiming.responseDispatchedAt) } });

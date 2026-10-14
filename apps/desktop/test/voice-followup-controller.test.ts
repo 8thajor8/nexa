@@ -42,11 +42,18 @@ function harness(transcript = "Nexa, seguí contando") {
 afterEach(() => { vi.useRealTimers(); });
 
 describe("bounded Voice follow-up", () => {
-  it("accepts only an initial Nexa invocation and strips it", () => {
+  it("accepts the approved initial wake-word variants and strips punctuation", () => {
     expect(extractNexaFollowup("Nexa, ¿qué hora es?")).toBe("qué hora es?");
     expect(extractNexaFollowup("  nexA: seguí")).toBe("seguí");
+    expect(extractNexaFollowup("¡Mexa! Abrí Spotify")).toBe("Abrí Spotify");
+    expect(extractNexaFollowup("‘NEXT’ reproducí música")).toBe("reproducí música");
+    expect(extractNexaFollowup("¿nExT, cuánto falta?")).toBe("cuánto falta?");
+    expect(extractNexaFollowup("Nexa, ...")).toBeNull();
     expect(extractNexaFollowup("Hola Nexa, seguí")).toBeNull();
     expect(extractNexaFollowup("Nexabyte, seguí")).toBeNull();
+    expect(extractNexaFollowup("Mexican food, por favor")).toBeNull();
+    expect(extractNexaFollowup("Nextdoor, llamá a casa")).toBeNull();
+    expect(extractNexaFollowup("Nexx, seguí")).toBeNull();
     expect(extractNexaFollowup("Nexa")).toBeNull();
   });
 
@@ -64,11 +71,24 @@ describe("bounded Voice follow-up", () => {
     await h.controller.stop();
   });
 
-  it("distinguishes a rejected wake prefix from an empty transcript", async () => {
+  it("accepts Mexa and Next through the bounded follow-up path", async () => {
+    for (const [wakeWord, command] of [["Mexa", "seguí contando"], ["Next", "abrí Spotify"]]) {
+      const h = harness();
+      await h.controller.open();
+      await h.speak();
+      h.emit(`${wakeWord}, ${command}`);
+      await vi.waitFor(() => expect(h.accepted).toHaveBeenCalledOnce());
+      expect(h.accepted.mock.calls[0][0].text).toBe(command);
+      expect(h.diagnostics.mock.calls.map(([event]) => event.outcome)).toContain("prefix_accepted");
+      await h.controller.stop();
+    }
+  });
+
+  it("distinguishes a rejected similar word from an empty transcript", async () => {
     const h = harness();
     await h.controller.open();
     await h.speak();
-    h.emit("Mexa, seguí contando");
+    h.emit("Mexican food, seguí contando");
     await vi.waitFor(() => expect(h.controller.getSnapshot()).toBe("idle"));
     expect(h.diagnostics.mock.calls.map(([event]) => event.outcome)).toContain("prefix_rejected");
     expect(h.diagnostics.mock.calls.map(([event]) => event.outcome)).not.toContain("transcript_empty");

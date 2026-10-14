@@ -367,10 +367,16 @@ test('explicit Nexa diagnostics bypass the agent and voice diagnostics keep a sp
         const voice = await runtime.sendMessage({ conversationId, requestId: 'nexa-voice-diagnostic-1',
             text: 'Diagnóstico de voz', source: 'voice' });
         assert.equal(voice.status, 'completed');
-        assert.match(voice.text, /Diagnóstico de Nexa/u);
+        assert.match(voice.text, /Diagnóstico de Voice/u);
+        assert.doesNotMatch(voice.text, /Memory2|Spotify|Windows|Herramientas registradas/u);
         assert.doesNotMatch(voice.text, /Herramientas registradas \(|runtime-[0-9a-f-]{36}/iu);
         assert.equal(voice.presentation.kind, 'diagnostic');
         assert.match(voice.presentation.technicalDetail, /"schema"/u);
+        const technicalVoice = await runtime.sendMessage({ conversationId, requestId: 'nexa-voice-diagnostic-2',
+            text: 'Dame el diagnóstico técnico de Voice', source: 'typed' });
+        assert.match(technicalVoice.text, /Diagnóstico de Voice/u);
+        assert.doesNotMatch(technicalVoice.text, /Memory2|Spotify|Windows|Herramientas registradas/u);
+        assert.match(technicalVoice.presentation.technicalDetail, /"component":\s*"voice"/u);
         assert.equal(agentCalls, 0);
     } finally { await runtime.close(); }
 });

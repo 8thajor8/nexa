@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { config, resolveCliMemoryMode } from '../config.js';
 import { createRuntimeAgent } from './runtime-agent.js';
 import { classifySystemDiagnosticRequest, createOperationalDiagnostics, createTechnicalDiagnosticReport,
-    formatMemoryDiagnostics, formatSystemStatus, formatToolCatalog } from './system-diagnostics.js';
+    formatMemoryDiagnostics, formatSystemStatus, formatToolCatalog, formatVoiceStatus } from './system-diagnostics.js';
 import { getToolsForModel, hostedToolRegistry, localToolRegistry } from '../tools/index.js';
 
 const ID_MAX_LENGTH = 128;
@@ -209,6 +209,7 @@ export function createConversationRuntime({
                 }
                 const responseText = systemDiagnosticKind.endsWith('memory')
                     ? formatMemoryDiagnostics(snapshot, { technical })
+                    : systemDiagnosticKind === 'technical_voice' ? formatVoiceStatus(snapshot)
                     : formatSystemStatus(snapshot, { technical });
                 const presentation = { kind: 'diagnostic', technicalDetail: createTechnicalDiagnosticReport(snapshot,
                     systemDiagnosticKind.endsWith('memory') ? 'memory' : systemDiagnosticKind === 'technical_voice' ? 'voice' : 'system') };

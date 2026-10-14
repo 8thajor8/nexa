@@ -346,6 +346,63 @@ export function formatSystemStatus(snapshot, { technical = false } = {}) {
     return lines.join('\n');
 }
 
+export function formatVoiceStatus(snapshot) {
+    const voice = snapshot.voice ?? {};
+    const recent = Array.isArray(voice.recent) ? voice.recent : [];
+    const last = voice.last ?? null;
+    const latestFollowup = [...recent].reverse().find(item => item.stage === 'followup') ?? null;
+    const latestVad = [...recent].reverse().find(item => item.stage === 'followup'
+        && ['vad_speech_detected', 'vad_misfire', 'window_expired_no_speech', 'window_expired_after_speech'].includes(item.followupOutcome)) ?? null;
+    const latestTranscription = [...recent].reverse().find(item => item.stage === 'transcription') ?? null;
+    const latestPlayback = [...recent].reverse().find(item => item.stage === 'playback'
+        && ['responseDispatchToSynthesisMs', 'responseDispatchToAudioReadyMs', 'responseDispatchToPlaybackMs']
+            .some(key => Number.isSafeInteger(item.durations?.[key]))) ?? null;
+    const outcomeNames = {
+        window_opened: 'Se abrió la ventana de escucha.',
+        vad_speech_detected: 'Se detectó voz durante el seguimiento.',
+        vad_misfire: 'El detector descartó una activación como ruido.',
+        window_expired_no_speech: 'La ventana de seguimiento terminó sin detectar voz.',
+        window_expired_after_speech: 'La ventana terminó después de detectar voz.',
+        transcription_submitted: 'El audio se envió a transcripción.',
+        transcript_empty: 'La transcripción llegó vacía.',
+        prefix_rejected: 'La frase no comenzó con una palabra de activación reconocida.',
+        prefix_accepted: 'Se reconoció una palabra de activación válida.',
+        chat_submission_requested: 'La solicitud reconocida se envió al chat.',
+        transcription_error: 'Falló la transcripción.',
+        cancelled: 'El seguimiento se canceló.',
+    };
+    const stageNames = { ptt: 'captura del micrófono', transcription: 'transcripción', runtime: 'respuesta',
+        synthesis: 'síntesis de voz', identity_processing: 'procesamiento de identidad vocal',
+        audio_preparation: 'preparación de audio', playback: 'reproducción', followup: 'seguimiento por voz' };
+    const stateNames = { started: 'iniciada', processing: 'en curso', success: 'completada', error: 'con error',
+        cancelled: 'cancelada', interrupted: 'interrumpida' };
+    const duration = value => Number.isSafeInteger(value) && value >= 0 ? `${value} ms` : 'sin medición';
+    const profile = voice.configuration?.identityProfile === 'nova-portena' ? 'Nova rioplatense'
+        : voice.configuration?.identityProfile && voice.configuration.identityProfile !== 'unknown' ? 'perfil configurado'
+            : 'sin perfil comprobado';
+    const responseTimings = latestPlayback?.durations ?? {};
+    const voiceErrors = recent.filter(item => item.stage !== 'followup' && item.state === 'error');
+    const lastError = voiceErrors.at(-1)?.errorCode;
+    const errorNames = { voice_identity_browser_unavailable: 'No está disponible el motor local de identidad vocal.',
+        voice_audio_processing_failed: 'Falló el procesamiento del audio.', voice_tts_generation_failed: 'Falló la generación de voz.',
+        voice_tts_response_invalid: 'La síntesis devolvió audio inválido.', voice_speech_playback_failed: 'Falló la reproducción de voz.',
+        voice_speech_playback_timeout: 'La reproducción excedió el tiempo esperado.', voice_speech_too_long: 'La respuesta superó el límite de duración.',
+        VOICE_PTT_TRANSCRIPTION_FAILED: 'Falló la transcripción del micrófono.' };
+    return [
+        '**Diagnóstico de Voice**',
+        `- **Estado:** ${last ? `última operación ${stateNames[last.state] ?? 'registrada'}` : 'sin operaciones recientes registradas'}.`,
+        `- **Última etapa:** ${last ? stageNames[last.stage] ?? 'etapa registrada' : 'sin datos recientes'}.`,
+        `- **VAD:** ${latestVad ? outcomeNames[latestVad.followupOutcome] ?? 'actividad registrada' : 'sin resultado reciente registrado'}`,
+        `- **Prefijo y seguimiento:** ${latestFollowup ? outcomeNames[latestFollowup.followupOutcome] ?? 'estado de seguimiento registrado' : 'sin actividad reciente de seguimiento'}`,
+        `- **Última transcripción:** ${latestTranscription ? duration(latestTranscription.durations?.transcriptionMs ?? latestTranscription.durationMs) : 'sin transcripción reciente'}.`,
+        `- **Síntesis:** ${voice.configuration?.model && voice.configuration.model !== 'unknown' ? 'configurada; el proveedor no se comprueba en este informe' : 'configuración sin comprobar'}.`,
+        `- **Identidad vocal:** ${profile}; procesamiento ${voice.configuration?.identityProcessing === true ? 'activo' : voice.configuration?.identityProcessing === false ? 'desactivado' : 'sin comprobar'}.`,
+        `- **Tiempos de la última respuesta hablada:** TTS ${duration(responseTimings.synthesisMs)}, identidad ${duration(responseTimings.identityProcessingMs)}, respuesta escrita a inicio de síntesis ${duration(responseTimings.responseDispatchToSynthesisMs)}, audio listo ${duration(responseTimings.responseDispatchToAudioReadyMs)}, inicio de reproducción ${duration(responseTimings.responseDispatchToPlaybackMs)}${responseTimings.audioReadyToPlaybackMs == null ? '' : `; desde audio listo ${duration(responseTimings.audioReadyToPlaybackMs)}`}.`,
+        `- **Duración de la última etapa:** ${duration(last?.durationMs)}.`,
+        `- **Incidencias:** ${lastError ? errorNames[lastError] ?? 'Se registró un error de voz.' : 'no hay errores recientes de Voice registrados.'}`,
+    ].join('\n');
+}
+
 const TOOL_PRESENTATION = Object.freeze({
     get_current_time: ['Consultar la hora', 'Fecha y hora actuales del equipo.', 'Diagnóstico y sistema'],
     get_weather: ['Consultar el tiempo', 'Tiempo actual y pronóstico de una ciudad.', 'Búsqueda e información'],

@@ -5,8 +5,9 @@ const FOLLOWUP_WINDOW_MS = 5_000;
 const VAD_ASSET_BASE = "nexa-vad://assets/";
 
 export function extractNexaFollowup(text: string): string | null {
-  const match = /^\s*nexa\b[\s,.:;!?¡¿—–-]*(.+)$/iu.exec(text);
-  return match?.[1]?.trim() || null;
+  const match = /^\s*[¿¡"“‘([{]*\s*(?:nexa|mexa|next)\b[\s,.:;!?¡¿—–"”’)}\]\-]*(.+)$/iu.exec(text);
+  const command = match?.[1]?.trim();
+  return command && /[\p{L}\p{N}]/u.test(command) ? command : null;
 }
 
 interface VadPort {

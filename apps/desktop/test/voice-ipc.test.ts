@@ -272,7 +272,49 @@ describe("Electron Main Voice IPC", () => {
       responseDispatchToAudioReadyMs: expect.any(Number),
       audioReadyToPlaybackMs: expect.any(Number),
     });
+    expect(diagnostics.at(-1)?.state).toBe("success");
+    expect(diagnostics.at(-1)?.metrics).toMatchObject({
+      responseDispatchToPlaybackMs: expect.any(Number),
+      responseDispatchToSynthesisMs: expect.any(Number),
+      responseDispatchToAudioReadyMs: expect.any(Number),
+      audioReadyToPlaybackMs: expect.any(Number),
+    });
     expect(JSON.stringify(diagnostics)).not.toContain("Respuesta de prueba");
+  });
+
+  it("retains completion timing when response dispatch is marked before playback events", async () => {
+    const window = createWindow("speech-timing-dispatch-first");
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    let idFactory = () => "";
+    const speaker = {
+      speak: vi.fn(async () => {
+        const turnId = idFactory();
+        markVoiceResponseDispatched(turnId);
+        const event = { turnId, diagnostics: { metrics: { synthesisMs: 9 } } };
+        listeners.get("voice.speaking")?.(event);
+        listeners.get("voice.playback.started")?.({ ...event, diagnostics: { durationMs: 2 } });
+        listeners.get("voice.speech.completed")?.(event);
+        return { completed: true as const };
+      }),
+      cancel: vi.fn(() => true),
+      on: vi.fn((type: string, listener: (event: Record<string, unknown>) => void) => {
+        listeners.set(type, listener);
+        return () => listeners.delete(type);
+      }),
+    };
+    const api = { createVoiceSpeaker: vi.fn((options: { idFactory: () => string }) => { idFactory = options.idFactory; return speaker; }) };
+    const diagnostics: Array<Record<string, unknown>> = [];
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never,
+      (event) => diagnostics.push(event as unknown as Record<string, unknown>));
+    const requestId = "00000000-0000-4000-8000-000000000058";
+    await speakVoiceResponse(window as never, requestId, "Otra respuesta de prueba");
+    expect(diagnostics.at(-1)?.state).toBe("success");
+    expect(diagnostics.at(-1)?.metrics).toMatchObject({
+      responseDispatchToPlaybackMs: expect.any(Number),
+      responseDispatchToAudioReadyMs: expect.any(Number),
+      audioReadyToPlaybackMs: expect.any(Number),
+    });
+    expect(JSON.stringify(diagnostics)).not.toContain("Otra respuesta de prueba");
   });
 
   it("remembers Stop received before the response speaker initializes and discards that late response", async () => {

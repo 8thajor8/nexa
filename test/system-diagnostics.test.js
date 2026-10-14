@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { classifySystemDiagnosticRequest, createOperationalDiagnostics,
-    createTechnicalDiagnosticReport, formatMemoryDiagnostics, formatSystemStatus, formatToolCatalog } from '../src/core/system-diagnostics.js';
+    createTechnicalDiagnosticReport, formatMemoryDiagnostics, formatSystemStatus, formatToolCatalog, formatVoiceStatus } from '../src/core/system-diagnostics.js';
 
 test('classifies supported Spanish system and memory questions without matching ordinary recall prompts', () => {
     assert.equal(classifySystemDiagnosticRequest('¿Qué sistema de memoria estás usando?'), 'status');
@@ -81,6 +81,27 @@ test('follow-up diagnostics retain only an allowlisted outcome and bounded durat
     diagnostics.recordVoiceOperation({ requestId: '00000000-0000-4000-8000-000000000003', stage: 'followup', state: 'success',
         followupOutcome: 'private transcript' });
     assert.equal(diagnostics.snapshot().voice.last.followupOutcome, null);
+});
+
+test('Voice diagnostic is Spanish, Voice-only, and preserves observed follow-up and playback timing', () => {
+    const diagnostics = createOperationalDiagnostics({ memoryMode: 'memory2-readonly' });
+    diagnostics.recordVoiceOperation({ requestId: 'safe-request-1', stage: 'followup', state: 'success',
+        followupOutcome: 'prefix_accepted', durationMs: 5000 });
+    diagnostics.recordVoiceOperation({ requestId: 'safe-request-1', stage: 'transcription', state: 'success', durationMs: 430,
+        durations: { transcriptionMs: 430 } });
+    diagnostics.recordVoiceOperation({ requestId: 'safe-request-1', stage: 'playback', state: 'success', durationMs: 900,
+        model: 'gpt-4o-mini-tts', voice: 'nova', identityProfile: 'nova-portena', identityProcessing: true,
+        durations: { responseDispatchToSynthesisMs: 40, responseDispatchToAudioReadyMs: 700,
+            responseDispatchToPlaybackMs: 760, audioReadyToPlaybackMs: 60 } });
+    const snapshot = { ...diagnostics.snapshot(), tools: { registered: ['spotify_play'], available: ['spotify_play'] } };
+    const report = formatVoiceStatus(snapshot);
+    assert.match(report, /Diagnóstico de Voice/u);
+    assert.match(report, /palabra de activación válida/u);
+    assert.match(report, /430 ms/u);
+    assert.match(report, /audio listo 700 ms/u);
+    assert.match(report, /inicio de reproducción 760 ms/u);
+    assert.match(report, /Nova rioplatense; procesamiento activo/u);
+    assert.doesNotMatch(report, /Memory2|Spotify|Windows|memoria|spotify_play|safe-request-1/u);
 });
 
 test('diagnostic evidence is bounded, in-memory and retained when later reports are requested', () => {
