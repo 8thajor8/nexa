@@ -5,7 +5,7 @@ import type { AuthorizationProvider, ChatAuthorizationRequirement, ChatEventEnve
 import { ASSISTANT_STATE_LABELS, createMockAssistantStateProvider } from "../shared/assistant-state";
 import { loadDesktopPreferences, saveDesktopPreferences, type DesktopPreferences } from "./desktop-preferences";
 import type { PttVoiceControllerPort, PttVoiceSnapshot, PttVoiceStatus } from "./voice/ptt-voice-controller";
-import { VoiceFollowupController, type FollowupTranscript } from "./voice/voice-followup-controller";
+import { VoiceFollowupController, type FollowupTranscript, type VoiceFollowupFailure } from "./voice/voice-followup-controller";
 import { ConversationPanel, type ConversationChatMessage, type VoiceTranscriptItem } from "./components/ConversationPanel";
 import { PresencePanel } from "./components/PresencePanel";
 import { Sidebar } from "./components/Sidebar";
@@ -59,6 +59,13 @@ const VOICE_SPEECH_ERRORS: Record<VoiceSpeechErrorCode, string> = {
   voice_speech_too_long: "La respuesta es demasiado larga para reproducirla completa.",
 };
 
+const VOICE_FOLLOWUP_ERRORS: Record<VoiceFollowupFailure["code"], string> = {
+  microphone_permission_denied: "Nexa no pudo acceder al micrófono para continuar escuchando.",
+  microphone_unavailable: "No se encontró un micrófono para continuar escuchando.",
+  microphone_device_unavailable: "El micrófono seleccionado no está disponible para continuar escuchando.",
+  followup_failed: "No se pudo iniciar el seguimiento de voz.",
+};
+
 export default function App({ voiceController, microphoneDevices }: AppProps) {
   // Main sets this immutable startup fact before Preload runs; it is not a permission switch.
   const isIsolated = window.nexaDesktop.isIsolated;
@@ -72,12 +79,17 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const voiceSnapshot = useSyncExternalStore(
     voiceController.subscribe, voiceController.getSnapshot, voiceController.getSnapshot,
   );
+  const [voiceFollowupError, setVoiceFollowupError] = useState<string | null>(null);
   const followupSubmit = useRef<(value: FollowupTranscript) => void>(() => undefined);
   const followup = useMemo(() => new VoiceFollowupController(window.nexaDesktop.voice, {
     getDeviceId: () => microphoneDevices.getSnapshot().selectedDeviceId,
     onAcceptedTranscript: (value) => followupSubmit.current(value),
+    onFailure: (failure) => {
+      console.warn("[nexa-desktop] voice_followup_error", failure);
+      setVoiceFollowupError(VOICE_FOLLOWUP_ERRORS[failure.code]);
+    },
   }), [microphoneDevices]);
-  const followupActive = useSyncExternalStore(followup.subscribe, followup.getSnapshot, followup.getSnapshot);
+  const followupStatus = useSyncExternalStore(followup.subscribe, followup.getSnapshot, followup.getSnapshot);
   const followupEligibleRequests = useRef(new Set<string>());
   const [chatMessages, setChatMessages] = useState<ConversationChatMessage[]>([]);
   const [chatNotice, setChatNotice] = useState<string | null>(null);
@@ -415,7 +427,10 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         activeVoiceSpeechRequest.current = null;
         cancellingVoiceSpeechRequests.current.delete(event.requestId);
         setVoiceSpeechStatus(null);
-        if (shouldFollowup) void followup.open();
+        if (shouldFollowup) {
+          setVoiceFollowupError(null);
+          void followup.open();
+        }
         else void followup.stop();
       }
     });
@@ -624,10 +639,12 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
             onOpenSpotifyTrack={(url) => { void openSpotifyTrack(url); }}
             transcriptNotice={voiceTranscriptNotice}
             voiceSpeechStatus={voiceSpeechStatus}
-            onStart={() => { followupEligibleRequests.current.clear(); void followup.stop().then(() => voiceController.start()); }}
+            followupStatus={followupStatus}
+            followupError={voiceFollowupError}
+            onStart={() => { setVoiceFollowupError(null); followupEligibleRequests.current.clear(); void followup.stop().then(() => voiceController.start()); }}
             onFinish={() => { void voiceController.finish(); }}
             onRecover={() => { void voiceController.recoverMainCancellation(); }}
-            interactionCancelable={followupActive || activeChatRequest.current !== null || activeVoiceSpeechRequest.current !== null
+            interactionCancelable={followupStatus !== "idle" || activeChatRequest.current !== null || activeVoiceSpeechRequest.current !== null
               || voiceChatRequests.current.size > 0
               || ["starting", "listening", "finishing", "processing"].includes(voiceSnapshot.status)
               || (voiceSnapshot.status === "error" && !voiceSnapshot.canStart && Boolean(voiceSnapshot.sessionId))}

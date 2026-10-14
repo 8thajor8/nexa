@@ -389,8 +389,13 @@ describe("App PTT DOM integration", () => {
     })));
     act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "speaking" })));
     expect(bridge.voice.ptt.start).not.toHaveBeenCalled();
+    vi.mocked(bridge.voice.ptt.start).mockImplementation(async ({ requestId }) => ({
+      ok: true as const, requestId, sessionId: "session-followup-vad",
+    }));
     act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "completed" })));
     await waitFor(() => expect(bridge.voice.ptt.start).toHaveBeenCalledOnce());
+    expect(await screen.findByText("Escuchando… Podés hablar.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Detener interacción" })).toBeTruthy();
     act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "completed" })));
     expect(bridge.voice.ptt.start).toHaveBeenCalledOnce();
   });

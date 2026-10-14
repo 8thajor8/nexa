@@ -49,10 +49,17 @@ export interface FollowupTranscript {
   turnId: string;
 }
 
+export type VoiceFollowupStatus = "idle" | "preparing" | "listening";
+export type VoiceFollowupFailure = {
+  stage: "vad_initialization" | "main_session_start" | "vad_start" | "vad_finish" | "audio_validation" | "stt_finish";
+  code: "microphone_permission_denied" | "microphone_unavailable" | "microphone_device_unavailable" | "followup_failed";
+};
+
 export interface VoiceFollowupDependencies {
   createVad?: VadFactory;
   getDeviceId?: () => string | null;
   onAcceptedTranscript: (value: FollowupTranscript) => void;
+  onFailure?: (failure: VoiceFollowupFailure) => void;
   setTimeout?: typeof globalThis.setTimeout;
   clearTimeout?: typeof globalThis.clearTimeout;
 }
@@ -67,6 +74,7 @@ export class VoiceFollowupController {
   private durationTimer: ReturnType<typeof setTimeout> | null = null;
   private generation = 0;
   private active = false;
+  private status: VoiceFollowupStatus = "idle";
   private finishing = false;
   private windowDeadline = 0;
   private completionAllowed = false;
@@ -85,7 +93,7 @@ export class VoiceFollowupController {
     this.unschedule = dependencies.clearTimeout ?? globalThis.clearTimeout.bind(globalThis);
   }
 
-  readonly getSnapshot = (): boolean => this.active;
+  readonly getSnapshot = (): VoiceFollowupStatus => this.status;
   readonly subscribe = (listener: () => void): (() => void) => {
     this.listeners.add(listener);
     return () => { this.listeners.delete(listener); };
@@ -101,7 +109,10 @@ export class VoiceFollowupController {
       onVADMisfire: () => { if (this.isCurrent(generation)) this.armWindowTimer(generation); },
     });
     this.prepared = { generation, promise };
-    void promise.catch(() => { if (this.prepared?.promise === promise) this.prepared = null; });
+    void promise.catch((error: unknown) => {
+      this.reportFailure("vad_initialization", error);
+      if (this.prepared?.promise === promise) this.prepared = null;
+    });
   }
 
   async open(): Promise<void> {
@@ -113,12 +124,14 @@ export class VoiceFollowupController {
     this.prepared = null;
     const generation = prepared.generation;
     this.active = true;
+    this.status = "preparing";
     this.completionAllowed = false;
     this.unsubscribe = this.voice.onEvent((event) => this.onVoiceEvent(event));
     this.notify();
     const requestId = crypto.randomUUID();
     this.startRequestId = requestId;
     let vadClaimed = false;
+    let stage: VoiceFollowupFailure["stage"] = "main_session_start";
     const releasePrepared = async () => {
       try { const vad = await prepared.promise; await vad.destroy(); }
       catch { /* The model was unavailable or already released. */ }
@@ -135,16 +148,21 @@ export class VoiceFollowupController {
         await this.cancelSession(response.sessionId, requestId);
         return;
       }
+      stage = "vad_initialization";
       const vad = await prepared.promise;
       vadClaimed = true;
       if (!this.isCurrent(generation)) { await vad.destroy(); return; }
       this.vad = vad;
+      stage = "vad_start";
       await vad.start();
       if (!this.isCurrent(generation)) { await vad.destroy(); return; }
+      this.status = "listening";
+      this.notify();
       this.windowDeadline = performance.now() + FOLLOWUP_WINDOW_MS;
       this.armWindowTimer(generation);
       this.durationTimer = this.schedule(() => { void this.stop(); }, PTT_MAX_DURATION_SECONDS * 1_000);
-    } catch {
+    } catch (error: unknown) {
+      this.reportFailure(stage, error);
       this.pendingStart = null;
       if (!vadClaimed) await releasePrepared();
       if (this.isCurrent(generation)) void this.stop();
@@ -159,6 +177,7 @@ export class VoiceFollowupController {
     const prepared = this.prepared;
     this.prepared = null;
     this.active = false;
+    this.status = "idle";
     this.notify();
     this.clearWindowTimer();
     this.windowDeadline = 0;
@@ -202,16 +221,27 @@ export class VoiceFollowupController {
     const sessionId = this.sessionId;
     const vad = this.vad;
     this.vad = null;
-    try { await vad?.pause(); await vad?.destroy(); } catch { await this.stop(); return; }
+    try { await vad?.pause(); await vad?.destroy(); } catch (error: unknown) {
+      this.reportFailure("vad_finish", error);
+      await this.stop();
+      return;
+    }
     if (!this.isCurrent(generation)) return;
-    if (!audio.length || audio.length > PTT_MAX_DURATION_SECONDS * 16_000) { await this.stop(); return; }
+    if (!audio.length || audio.length > PTT_MAX_DURATION_SECONDS * 16_000) {
+      this.reportFailure("audio_validation");
+      await this.stop();
+      return;
+    }
     const wav = encodePcm16MonoWav(audio);
     const requestId = crypto.randomUUID();
     this.finishRequestId = requestId;
     try {
       const response = await this.voice.ptt.finish({ requestId, sessionId, audio: wav, format: "wav" });
       if (!response.ok || response.requestId !== requestId || response.sessionId !== sessionId) await this.stop();
-    } catch { await this.stop(); }
+    } catch (error: unknown) {
+      this.reportFailure("stt_finish", error);
+      await this.stop();
+    }
     finally { wav.fill(0); audio.fill(0); }
   }
 
@@ -254,5 +284,13 @@ export class VoiceFollowupController {
   }
 
   private isCurrent(generation: number): boolean { return this.active && generation === this.generation; }
+  private reportFailure(stage: VoiceFollowupFailure["stage"], error?: unknown): void {
+    const name = error instanceof DOMException || error instanceof Error ? error.name : "";
+    const code: VoiceFollowupFailure["code"] = name === "NotAllowedError"
+      ? "microphone_permission_denied"
+      : name === "NotFoundError" ? "microphone_unavailable"
+        : name === "OverconstrainedError" ? "microphone_device_unavailable" : "followup_failed";
+    this.dependencies.onFailure?.({ stage, code });
+  }
   private notify(): void { for (const listener of this.listeners) listener(); }
 }

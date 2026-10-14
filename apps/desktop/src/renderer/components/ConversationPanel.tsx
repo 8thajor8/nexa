@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ReactNode, UIEvent } from "react";
 import type { PttVoiceSnapshot } from "../voice/ptt-voice-controller";
+import type { VoiceFollowupStatus } from "../voice/voice-followup-controller";
 import type { AuthorizationProvider, ChatAuthorizationRequirement, ChatPresentationMetadata, SpotifyNowPlayingCard } from "../../shared/ipc-contract";
 import { HolographicFrame } from "./HolographicFrame";
 
@@ -37,6 +38,8 @@ interface ConversationPanelProps {
   authorizationAttempts?: Readonly<Record<string, { state: "connecting" | "connected" | "cancelled" | "error"; message?: string }>>;
   chatNotice?: string | null;
   voiceSpeechStatus?: { requestId: string; state: "preparing" | "speaking" | "cancelling" | "error"; message?: string } | null;
+  followupStatus?: VoiceFollowupStatus;
+  followupError?: string | null;
   interactionCancelable?: boolean;
   cancellationPending?: boolean;
   chatBusy?: boolean;
@@ -117,6 +120,7 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
   authorizationAttempts = {}, chatNotice, chatBusy = false, onSendMessage, onCancelInteraction,
   onConnectAuthorization, onCancelAuthorization, onRetryAuthorizedRequest, onOpenSpotifyTrack, transcriptNotice,
   voiceSpeechStatus = null, interactionCancelable = false, cancellationPending = false,
+  followupStatus = "idle", followupError = null,
   onStart, onFinish, onRecover }: ConversationPanelProps) {
   const messageListRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
@@ -300,9 +304,12 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
         </form>
         <div className="composer-hint">
           {STATUS_ANNOUNCEMENTS[snapshot.status] && <span className="voice-status-copy" role="status" aria-live="polite">{STATUS_ANNOUNCEMENTS[snapshot.status]}</span>}
+          {followupStatus === "preparing" && <span className="voice-status-copy voice-followup-status" role="status" aria-live="polite">Preparando escucha…</span>}
+          {followupStatus === "listening" && <span className="voice-status-copy voice-followup-status" role="status" aria-live="polite">Escuchando… Podés hablar.</span>}
         </div>
         {message && <p className="voice-error-message" role="alert">{message}</p>}
         {voiceSpeechStatus?.state === "error" && <p className="voice-error-message" role="alert">{voiceSpeechStatus.message}</p>}
+        {followupError && <p className="voice-error-message" role="alert">{followupError}</p>}
       </div>
     </section>
   );

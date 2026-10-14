@@ -52,9 +52,9 @@ describe("bounded Voice follow-up", () => {
     vi.useFakeTimers();
     const h = harness();
     await h.controller.open();
-    expect(h.controller.getSnapshot()).toBe(true);
+    expect(h.controller.getSnapshot()).toBe("listening");
     await vi.advanceTimersByTimeAsync(5_000);
-    expect(h.controller.getSnapshot()).toBe(false);
+    expect(h.controller.getSnapshot()).toBe("idle");
     expect(h.vad.destroy).toHaveBeenCalledOnce();
     expect(h.voice.ptt.cancel).toHaveBeenCalledOnce();
     expect(h.voice.ptt.finish).not.toHaveBeenCalled();
@@ -68,7 +68,7 @@ describe("bounded Voice follow-up", () => {
     h.callbacks?.onSpeechRealStart();
     h.callbacks?.onVADMisfire();
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(h.controller.getSnapshot()).toBe(false);
+    expect(h.controller.getSnapshot()).toBe("idle");
     expect(h.voice.ptt.finish).not.toHaveBeenCalled();
     expect(h.voice.ptt.cancel).toHaveBeenCalledOnce();
   });
@@ -80,7 +80,7 @@ describe("bounded Voice follow-up", () => {
     await vi.advanceTimersByTimeAsync(4_900);
     h.callbacks?.onSpeechRealStart();
     await vi.advanceTimersByTimeAsync(4_000);
-    expect(h.controller.getSnapshot()).toBe(true);
+    expect(h.controller.getSnapshot()).toBe("listening");
     h.callbacks?.onSpeechEnd(new Float32Array(16_000));
     await vi.advanceTimersByTimeAsync(1);
     expect(h.voice.ptt.finish).toHaveBeenCalledOnce();
@@ -95,7 +95,7 @@ describe("bounded Voice follow-up", () => {
     await h.controller.open();
     await h.speak();
     h.emit("Estamos hablando de otra cosa");
-    await vi.waitFor(() => expect(h.controller.getSnapshot()).toBe(false));
+    await vi.waitFor(() => expect(h.controller.getSnapshot()).toBe("idle"));
     h.emit("Nexa, escuchá");
     expect(h.accepted).not.toHaveBeenCalled();
     expect(h.voice.ptt.cancel).toHaveBeenCalledOnce();
@@ -168,8 +168,37 @@ describe("bounded Voice follow-up", () => {
     await h.controller.stop();
     releaseStart?.();
     await opening;
-    expect(h.controller.getSnapshot()).toBe(false);
+    expect(h.controller.getSnapshot()).toBe("idle");
     expect(h.vad.destroy).toHaveBeenCalledTimes(2);
     expect(h.voice.ptt.cancel).toHaveBeenCalled();
+  });
+
+  it("shows preparing until VAD confirms microphone capture, then listening", async () => {
+    let finishStart: (() => void) | undefined;
+    const h = harness();
+    h.vad.start.mockImplementation(() => new Promise<void>((resolve) => { finishStart = resolve; }));
+    const opening = h.controller.open();
+    await vi.waitFor(() => expect(finishStart).toBeTypeOf("function"));
+    expect(h.controller.getSnapshot()).toBe("preparing");
+    expect(h.controller.getSnapshot()).not.toBe("listening");
+    finishStart?.();
+    await opening;
+    expect(h.controller.getSnapshot()).toBe("listening");
+    await h.controller.stop();
+    expect(h.controller.getSnapshot()).toBe("idle");
+  });
+
+  it("reports a sanitized microphone failure and returns to idle", async () => {
+    const failure = vi.fn();
+    const h = harness();
+    h.vad.start.mockRejectedValue(new DOMException("private device details", "NotAllowedError"));
+    const controller = new VoiceFollowupController(h.voice, {
+      createVad: h.createVad, onAcceptedTranscript: h.accepted, onFailure: failure,
+    });
+    await controller.open();
+    await vi.waitFor(() => expect(controller.getSnapshot()).toBe("idle"));
+    expect(failure).toHaveBeenCalledWith({ stage: "vad_start", code: "microphone_permission_denied" });
+    expect(JSON.stringify(failure.mock.calls)).not.toContain("private device details");
+    expect(h.voice.ptt.cancel).toHaveBeenCalledOnce();
   });
 });
