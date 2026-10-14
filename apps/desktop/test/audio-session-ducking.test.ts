@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
   AUDIO_DUCKING_FACTOR,
@@ -28,6 +29,18 @@ function adapter(sessions = [snapshot("spotify", 0.7), snapshot("browser", 0.4)]
 }
 
 describe("Main Windows audio session ducking", () => {
+  it("declares ISimpleAudioVolume methods in native COM vtable order", () => {
+    for (const source of ["../src/main/audio-session-ducking.ts", "../scripts/diagnose-core-audio-get-mute.ps1"]) {
+      const content = readFileSync(new URL(source, import.meta.url), "utf8");
+      const declaration = content.match(/private interface ISimpleAudioVolume\s*\{([^}]+)\}/)?.[1];
+      expect(declaration, source).toBeDefined();
+      expect([...declaration!.matchAll(/\bint (\w+)\(/g)].map((match) => match[1])).toEqual([
+        "SetMasterVolume", "GetMasterVolume", "SetMute", "GetMute",
+      ]);
+      expect(declaration).toMatch(/GetMute\(\[MarshalAs\(UnmanagedType\.Bool\)\] out bool muted\)/);
+    }
+  });
+
   it("reduces each session relative to its own level and preserves zero and mute decisions", () => {
     expect(calculateDuckedVolume(0.7)).toBeCloseTo(0.14);
     expect(calculateDuckedVolume(0.4)).toBeCloseTo(0.08);

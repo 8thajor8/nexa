@@ -449,10 +449,10 @@ public static class NexaCoreAudioDucking {
 
   [ComImport, Guid("87CE5498-68D6-44E5-9215-6DA47EF883D8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
   private interface ISimpleAudioVolume {
-    [PreserveSig] int GetMasterVolume(out float volume);
     [PreserveSig] int SetMasterVolume(float volume, ref Guid context);
-    [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool muted);
+    [PreserveSig] int GetMasterVolume(out float volume);
     [PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool muted, ref Guid context);
+    [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool muted);
   }
 
   private sealed class SessionRef {
