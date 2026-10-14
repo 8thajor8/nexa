@@ -83,6 +83,17 @@ test('generates temporary audio with opaque ID, never returns a path, then plays
     assert.equal(f.store.get(generated.audioId), null);
 });
 
+test('can return generated audio bytes only for trusted concurrent playback orchestration', async t => {
+    const f = await fixture(t);
+    const generated = await f.service.generate({ text: 'Respuesta principal', includeAudio: true });
+    assert.equal(generated.success, true);
+    assert.deepEqual(generated.audio, Buffer.from('RIFF-mock-wav'));
+    assert.equal(generated.filePath, undefined);
+    assert.equal((await readFile(f.store.get(generated.audioId).filePath)).toString(), 'RIFF-mock-wav');
+    const defaultResult = await f.service.generate({ text: 'Sin bytes adjuntos' });
+    assert.equal('audio' in defaultResult, false);
+});
+
 test('stores locally prepared WAV without invoking the synthesis provider', async t => {
     const f = await fixture(t);
     const input = makePcmWav({ durationMs: 50, channels: 2 });

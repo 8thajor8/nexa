@@ -175,6 +175,7 @@ describe("Electron Main Voice IPC", () => {
       nextTurnId = idFactory();
       const event = { turnId: nextTurnId };
       listeners.get("voice.speaking")?.(event);
+      listeners.get("voice.playback.started")?.(event);
       listeners.get("voice.speech.completed")?.(event);
       expect(text).toBe("Hola, soy Nexa.");
       expect(options).toEqual({ style: "normal", persist: false });
@@ -192,6 +193,28 @@ describe("Electron Main Voice IPC", () => {
       { requestId: "00000000-0000-4000-8000-000000000051", state: "completed" },
     ]);
     expect(cancelVoiceSpeech(window as never, "user", "00000000-0000-4000-8000-000000000051")).toBe(false);
+  });
+
+  it("remembers Stop received before the response speaker initializes and discards that late response", async () => {
+    const window = createWindow("stop-before-speech-owner");
+    const speaker = {
+      speakPrepared: vi.fn(async () => ({ completed: true as const })),
+      speak: vi.fn(async () => ({ completed: true as const })), cancel: vi.fn(() => true),
+      on: vi.fn(() => () => undefined),
+    };
+    const api = { createVoiceSpeaker: vi.fn(() => speaker) };
+    const prepare = vi.fn(async () => ({ audio: makeAudio() }));
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never,
+      undefined, async () => makeAudio(), prepare);
+    const requestId = "00000000-0000-4000-8000-000000000053";
+
+    expect(cancelVoiceSpeech(window as never, "user", requestId)).toBe(true);
+    await speakVoiceResponse(window as never, requestId, "No debe sonar después de Stop");
+
+    expect(prepare).not.toHaveBeenCalled();
+    expect(speaker.speakPrepared).not.toHaveBeenCalled();
+    expect(speaker.speak).not.toHaveBeenCalled();
+    expect(window.webContents.send).toHaveBeenCalledWith(VOICE_SPEECH_EVENT_CHANNEL, { requestId, state: "cancelled" });
   });
 
   it("cancels only the active correlated speech request", async () => {
@@ -268,6 +291,182 @@ describe("Electron Main Voice IPC", () => {
     await speakVoiceResponse(window as never, requestId, "Respuesta principal");
     expect(order).toEqual(["ack-started", "ack-stopped", "response-started"]);
     expect(speaker.speak).toHaveBeenCalledOnce();
+  });
+
+  it("prepares the main response while a cached acknowledgement plays, then stops it before confirmed response playback", async () => {
+    const window = createWindow("ack-during-tts");
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    const order: string[] = [];
+    let idFactory = () => "";
+    let playing = false;
+    let finishAcknowledgement: (() => void) | undefined;
+    let resolvePrepared!: (value: { audio: Uint8Array }) => void;
+    const preparation = new Promise<{ audio: Uint8Array }>((resolve) => { resolvePrepared = resolve; });
+    const speaker = {
+      getPlaybackState: () => playing ? "playing" : "idle",
+      speakPrepared: vi.fn((audio: Uint8Array) => {
+        const turnId = idFactory();
+        if (order.length === 0) {
+          playing = true; order.push("ack-started");
+          listeners.get("voice.speaking")?.({ turnId });
+          return new Promise<null>((resolve) => { finishAcknowledgement = () => {
+            playing = false; listeners.get("voice.speech.cancelled")?.({ turnId, reason: "superseded" }); resolve(null);
+          }; });
+        }
+        expect(playing).toBe(false);
+        expect(audio.byteLength).toBeGreaterThan(0);
+        order.push("response-started");
+        listeners.get("voice.speaking")?.({ turnId });
+        listeners.get("voice.playback.started")?.({ turnId });
+        listeners.get("voice.speech.completed")?.({ turnId });
+        return Promise.resolve({ completed: true as const });
+      }),
+      speak: vi.fn(),
+      cancel: vi.fn(() => { order.push("ack-stopped"); finishAcknowledgement?.(); return true; }),
+      on: vi.fn((type: string, listener: (event: Record<string, unknown>) => void) => {
+        listeners.set(type, listener); return () => listeners.delete(type);
+      }),
+    };
+    const api = { createVoiceSpeaker: vi.fn((options: { idFactory: () => string }) => { idFactory = options.idFactory; return speaker; }) };
+    const prepareResponse = vi.fn(async (_text: string, _signal: AbortSignal) => preparation);
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never, undefined,
+      async () => makeAudio(), prepareResponse);
+    const requestId = "00000000-0000-4000-8000-000000000077";
+    await expect(invoke(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL, trustedEvent(window), { requestId }))
+      .resolves.toMatchObject({ accepted: true });
+    await vi.waitFor(() => expect(speaker.speakPrepared).toHaveBeenCalledOnce());
+
+    const response = speakVoiceResponse(window as never, requestId, "Respuesta extensa lista para voz");
+    await vi.waitFor(() => expect(prepareResponse).toHaveBeenCalledOnce());
+    const duplicateResponse = speakVoiceResponse(window as never, requestId, "Respuesta duplicada que no debe sintetizarse");
+    await Promise.resolve();
+    expect(prepareResponse).toHaveBeenCalledOnce();
+    expect(playing).toBe(true);
+    expect(order).toEqual(["ack-started"]);
+    resolvePrepared({ audio: makeAudio() });
+    await Promise.all([response, duplicateResponse]);
+
+    expect(order).toEqual(["ack-started", "ack-stopped", "response-started"]);
+    expect(speaker.speak).not.toHaveBeenCalled();
+    expect(window.webContents.send).toHaveBeenCalledWith(VOICE_SPEECH_EVENT_CHANNEL,
+      { requestId, state: "speaking" });
+    expect(window.webContents.send.mock.calls.map(([, payload]) => payload))
+      .not.toContainEqual({ requestId, state: "error", error: { code: "voice_audio_processing_failed" } });
+  });
+
+  it("keeps the request active when the acknowledgement ends before response synthesis, so Stop remains effective", async () => {
+    const window = createWindow("ack-ends-during-tts");
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    let idFactory = () => "";
+    let finishAcknowledgement: (() => void) | undefined;
+    let playbackState = "idle";
+    let resolvePrepared!: (value: { audio: Uint8Array }) => void;
+    let responseSignal: AbortSignal | undefined;
+    const responseAudio = new Promise<{ audio: Uint8Array }>((resolve) => { resolvePrepared = resolve; });
+    const speaker = {
+      getPlaybackState: vi.fn(() => playbackState),
+      speakPrepared: vi.fn(() => {
+        playbackState = "playing";
+        const turnId = idFactory();
+        return new Promise<null>((resolve) => { finishAcknowledgement = () => {
+          playbackState = "idle"; listeners.get("voice.speech.completed")?.({ turnId }); resolve(null);
+        }; });
+      }),
+      speak: vi.fn(), cancel: vi.fn(() => { playbackState = "idle"; finishAcknowledgement?.(); return true; }),
+      on: vi.fn((type: string, listener: (event: Record<string, unknown>) => void) => {
+        listeners.set(type, listener); return () => listeners.delete(type);
+      }),
+    };
+    const api = { createVoiceSpeaker: vi.fn((options: { idFactory: () => string }) => { idFactory = options.idFactory; return speaker; }) };
+    const prepareResponse = vi.fn((_text: string, signal: AbortSignal) => { responseSignal = signal; return responseAudio; });
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never,
+      undefined, async () => makeAudio(), prepareResponse);
+    const requestId = "00000000-0000-4000-8000-000000000080";
+    await invoke(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL, trustedEvent(window), { requestId });
+    await vi.waitFor(() => expect(speaker.speakPrepared).toHaveBeenCalledOnce());
+    const response = speakVoiceResponse(window as never, requestId, "Respuesta principal");
+    await vi.waitFor(() => expect(prepareResponse).toHaveBeenCalledOnce());
+
+    finishAcknowledgement?.();
+    expect(window.webContents.send).not.toHaveBeenCalledWith(VOICE_SPEECH_EVENT_CHANNEL, { requestId, state: "completed" });
+    expect(cancelVoiceSpeech(window as never, "user", requestId)).toBe(true);
+    expect(responseSignal?.aborted).toBe(true);
+    resolvePrepared({ audio: makeAudio() });
+    await response;
+    expect(speaker.speakPrepared).toHaveBeenCalledOnce();
+    expect(window.webContents.send).toHaveBeenCalledWith(VOICE_SPEECH_EVENT_CHANNEL, { requestId, state: "cancelled" });
+  });
+
+  it("reports a real response-processing failure after stopping its acknowledgement, without playing audio", async () => {
+    const window = createWindow("ack-then-real-error");
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    let idFactory = () => "";
+    let finishAcknowledgement: (() => void) | undefined;
+    let playbackState = "idle";
+    const speaker = {
+      getPlaybackState: vi.fn(() => playbackState),
+      speakPrepared: vi.fn(() => {
+        playbackState = "playing";
+        const turnId = idFactory();
+        return new Promise<null>((resolve) => { finishAcknowledgement = () => {
+          listeners.get("voice.speech.cancelled")?.({ turnId, reason: "superseded" }); resolve(null);
+        }; });
+      }),
+      speak: vi.fn(), cancel: vi.fn(() => { playbackState = "idle"; finishAcknowledgement?.(); return true; }),
+      on: vi.fn((type: string, listener: (event: Record<string, unknown>) => void) => {
+        listeners.set(type, listener); return () => listeners.delete(type);
+      }),
+    };
+    const api = { createVoiceSpeaker: vi.fn((options: { idFactory: () => string }) => { idFactory = options.idFactory; return speaker; }) };
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never,
+      undefined, async () => makeAudio(), async () => ({ audio: null, errorCode: "voice_audio_processing_failed" }));
+    const requestId = "00000000-0000-4000-8000-000000000081";
+    await invoke(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL, trustedEvent(window), { requestId });
+    await vi.waitFor(() => expect(speaker.speakPrepared).toHaveBeenCalledOnce());
+    await speakVoiceResponse(window as never, requestId, "Respuesta que falla al procesar");
+
+    expect(speaker.speakPrepared).toHaveBeenCalledOnce();
+    expect(window.webContents.send).toHaveBeenCalledWith(VOICE_SPEECH_EVENT_CHANNEL,
+      { requestId, state: "error", error: { code: "voice_audio_processing_failed" } });
+    expect(window.webContents.send).not.toHaveBeenCalledWith(VOICE_SPEECH_EVENT_CHANNEL,
+      { requestId, state: "cancelled" });
+  });
+
+  it("aborts response preparation on Stop, discards late audio, and accepts the next response", async () => {
+    const window = createWindow("response-stop-during-tts");
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    const speaker = {
+      speakPrepared: vi.fn(async () => ({ completed: true as const })),
+      speak: vi.fn(), cancel: vi.fn(() => true),
+      on: vi.fn((type: string, listener: (event: Record<string, unknown>) => void) => {
+        listeners.set(type, listener); return () => listeners.delete(type);
+      }),
+    };
+    const api = { createVoiceSpeaker: vi.fn((options: { idFactory: () => string }) => speaker) };
+    let resolveFirst!: (value: { audio: Uint8Array | null; errorCode?: string }) => void;
+    let firstSignal: AbortSignal | undefined;
+    const prepare = vi.fn((_text: string, signal: AbortSignal) => {
+      if (prepare.mock.calls.length === 1) {
+        firstSignal = signal;
+        return new Promise<{ audio: Uint8Array | null; errorCode?: string }>((resolve) => { resolveFirst = resolve; });
+      }
+      return Promise.resolve({ audio: makeAudio() });
+    });
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never,
+      undefined, async () => makeAudio(), prepare);
+    const firstId = "00000000-0000-4000-8000-000000000078";
+    const firstResponse = speakVoiceResponse(window as never, firstId, "Se cancela");
+    await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+    expect(cancelVoiceSpeech(window as never, "user", firstId)).toBe(true);
+    expect(firstSignal?.aborted).toBe(true);
+    resolveFirst({ audio: null, errorCode: "voice_audio_processing_failed" });
+    await firstResponse;
+    expect(speaker.speakPrepared).not.toHaveBeenCalled();
+    expect(window.webContents.send).not.toHaveBeenCalledWith(VOICE_SPEECH_EVENT_CHANNEL,
+      { requestId: firstId, state: "error", error: { code: "voice_audio_processing_failed" } });
+
+    await speakVoiceResponse(window as never, "00000000-0000-4000-8000-000000000079", "Nueva respuesta");
+    expect(speaker.speakPrepared).toHaveBeenCalledOnce();
   });
 
   it("Stop during local acknowledgement loading prevents both late acknowledgement and reply audio", async () => {

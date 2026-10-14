@@ -205,10 +205,10 @@ describe("App PTT DOM integration", () => {
     expect(bridge.voice.ptt.finish).not.toHaveBeenCalled();
   });
 
-  it("cancels from the listening state through the explicit cancel control", async () => {
+  it("cancels the PTT session from the unified Stop control", async () => {
     controller.publish({ status: "listening", canStart: false, sessionId: "session-live" });
     await mountApp();
-    fireEvent.click(screen.getByRole("button", { name: "Cancelar sesión de voz" }));
+    fireEvent.click(screen.getByRole("button", { name: "Detener interacción" }));
     await waitFor(() => expect((screen.getByRole("button", { name: "Iniciar grabación de voz" }) as HTMLButtonElement).disabled).toBe(false));
     expect(controller.cancel).toHaveBeenCalledOnce();
   });
@@ -235,7 +235,7 @@ describe("App PTT DOM integration", () => {
     controller.publish({ status: "error", canStart: false, sessionId: "session-old", error: { code: "VOICE_PTT_TRANSCRIPTION_FAILED", message: "failed" } });
     await mountApp();
     expect(screen.queryByRole("button", { name: "Reintentar grabación de voz" })).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "Cancelar sesión de voz" }));
+    fireEvent.click(screen.getByRole("button", { name: "Detener interacción" }));
     await waitFor(() => expect((screen.getByRole("button", { name: "Iniciar grabación de voz" }) as HTMLButtonElement).disabled).toBe(false));
     expect(controller.cancel).toHaveBeenCalledOnce();
   });
@@ -380,6 +380,8 @@ describe("App PTT DOM integration", () => {
       const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
       act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
         requestId: request.requestId, status: "completed", response: "Respuesta rápida" })));
+      act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "preparing" })));
+      act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "speaking" })));
       await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
       expect(bridge.voice.speech.acknowledge).not.toHaveBeenCalled();
     } finally { vi.useRealTimers(); }
@@ -399,6 +401,25 @@ describe("App PTT DOM integration", () => {
       expect(bridge.voice.speech.acknowledge).toHaveBeenCalledOnce();
       expect(bridge.voice.speech.acknowledge).toHaveBeenCalledWith({ requestId: request.requestId });
       expect(chatListeners.size).toBeGreaterThan(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("keeps the acknowledgement eligible after Runtime completes while main TTS is still preparing", async () => {
+    vi.useFakeTimers();
+    try {
+      await mountApp();
+      act(() => controller.publish({ status: "transcript-ready", canStart: true, sessionId: "session-tts-slow", requestId: "voice-tts-slow",
+        turnId: "voice-turn-tts-slow", transcript: "Nexa, dame tu diagnóstico", language: "es" }));
+      await act(async () => { await Promise.resolve(); });
+      const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+      act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+        requestId: request.requestId, status: "completed", response: "Informe largo" })));
+      act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "preparing" })));
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
+      expect(bridge.voice.speech.acknowledge).toHaveBeenCalledOnce();
+      act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "speaking" })));
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
+      expect(bridge.voice.speech.acknowledge).toHaveBeenCalledOnce();
     } finally { vi.useRealTimers(); }
   });
 
@@ -423,14 +444,33 @@ describe("App PTT DOM integration", () => {
     fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
     await waitFor(() => expect(bridge.chat.sendMessage).toHaveBeenCalledOnce());
     const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
-    fireEvent.click(screen.getByRole("button", { name: "Solicitar cancelación del mensaje activo" }));
+    expect(screen.getAllByRole("button", { name: "Detener interacción" })).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Detener interacción" }));
     await waitFor(() => expect(bridge.chat.cancelRequest).toHaveBeenCalledWith(request.requestId));
-    expect(screen.getByText("Cancelación solicitada; esperando confirmación de Runtime.")).toBeTruthy();
+    expect(screen.queryByText("Cancelación solicitada; esperando confirmación de Runtime.")).toBeNull();
     act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId, requestId: request.requestId, status: "cancelled" })));
     expect(screen.getByText("Cancelado")).toBeTruthy();
+    fireEvent.change(screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" }), { target: { value: "Consulta siguiente" } });
+    fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
+    await waitFor(() => expect(bridge.chat.sendMessage).toHaveBeenCalledTimes(2));
   });
 
-  it("Stop cancels only Voice speech and does not request Runtime cancellation", async () => {
+  it("uses one Stop control to cancel both Runtime and Voice for the same PTT interaction", async () => {
+    await mountApp();
+    act(() => controller.publish({ status: "transcript-ready", canStart: true, sessionId: "session-unified",
+      requestId: "voice-unified", turnId: "voice-turn-unified", transcript: "Probá una respuesta", language: "es" }));
+    await act(async () => { await Promise.resolve(); });
+    act(() => speechListeners.forEach((listener) => listener({ requestId: "voice-unified", state: "preparing" })));
+    expect(screen.getAllByRole("button", { name: "Detener interacción" })).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Detener interacción" }));
+    await waitFor(() => {
+      expect(bridge.chat.cancelRequest).toHaveBeenCalledWith("voice-unified");
+      expect(bridge.voice.speech.cancel).toHaveBeenCalledWith({ requestId: "voice-unified" });
+    });
+    expect(screen.queryByRole("button", { name: "Solicitar cancelación del mensaje activo" })).toBeNull();
+  });
+
+  it("the unified Stop cancels Voice speech when no Runtime request is active", async () => {
     speechListeners = new Set();
     Object.assign(bridge.voice, { speech: {
       cancel: vi.fn(async ({ requestId }: { requestId: string }) => ({ ok: true as const, requestId, cancelled: true as const })),
@@ -441,7 +481,7 @@ describe("App PTT DOM integration", () => {
     } });
     await mountApp();
     act(() => speechListeners.forEach((listener) => listener({ requestId: "speech-stop", state: "preparing" })));
-    fireEvent.click(screen.getByRole("button", { name: "Detener respuesta hablada" }));
+    fireEvent.click(screen.getByRole("button", { name: "Detener interacción" }));
 
     await waitFor(() => expect(bridge.voice.speech.cancel).toHaveBeenCalledWith({ requestId: "speech-stop" }));
     expect(bridge.chat.cancelRequest).not.toHaveBeenCalled();
@@ -459,8 +499,8 @@ describe("App PTT DOM integration", () => {
       error: { code: "request_not_found", message: "No active request matches this identifier." },
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "Solicitar cancelación del mensaje activo" }));
-    await waitFor(() => expect(screen.queryByRole("button", { name: "Solicitar cancelación del mensaje activo" })).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Detener interacción" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Detener interacción" })).toBeNull());
     expect(screen.getAllByText("La solicitud ya no está activa. No se recibió su resultado final.")).toHaveLength(2);
     expect(bridge.chat.sendMessage).toHaveBeenCalledOnce();
     act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,

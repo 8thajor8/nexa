@@ -88,11 +88,15 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const knownChatRequests = useRef(new Set<string>());
   const terminalChatRequests = useRef(new Set<string>());
   const acknowledgementTimers = useRef(new Map<string, number>());
+  const voiceChatRequests = useRef(new Set<string>());
+  const completedVoiceChatRequests = useRef(new Set<string>());
   const originalRequestTexts = useRef(new Map<string, string>());
   const [voiceTranscriptNotice, setVoiceTranscriptNotice] = useState<string | null>(null);
   const [voiceSpeechStatus, setVoiceSpeechStatus] = useState<{ requestId: string; state: "preparing" | "speaking" | "cancelling" | "error"; message?: string } | null>(null);
+  const [cancellationPending, setCancellationPending] = useState(false);
   const activeVoiceSpeechRequest = useRef<string | null>(null);
   const cancellingVoiceSpeechRequests = useRef(new Set<string>());
+  const cancellationInFlight = useRef(false);
   const seenTranscriptKeys = useRef(new Set<string>());
   const [weatherStatus, setWeatherStatus] = useState<WeatherCurrentStatus>(() => ({
     available: false, location: preferences.weatherLocation, temperatureC: null, condition: null, updatedAt: 0,
@@ -114,6 +118,8 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     if (result.ok || result.error === "operation_failed") {
       for (const timer of acknowledgementTimers.current.values()) window.clearTimeout(timer);
       acknowledgementTimers.current.clear();
+      voiceChatRequests.current.clear();
+      completedVoiceChatRequests.current.clear();
       setChatMessages([]);
       setChatNotice(null);
       setChatConversationId(null);
@@ -198,15 +204,22 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       setChatNotice("La transcripción se conservó, pero no se envió porque hay otra solicitud activa.");
       return;
     }
+    for (const timer of acknowledgementTimers.current.values()) window.clearTimeout(timer);
+    acknowledgementTimers.current.clear();
+    voiceChatRequests.current.clear();
+    completedVoiceChatRequests.current.clear();
     knownChatRequests.current.add(requestId);
     originalRequestTexts.current.set(requestId, text);
     activeChatRequest.current = requestId;
     setChatMessages((current) => [...current, message].slice(-MAX_CHAT_HISTORY));
     setChatNotice(null);
     if (source === "voice") {
+      voiceChatRequests.current.add(requestId);
       const timer = window.setTimeout(() => {
         acknowledgementTimers.current.delete(requestId);
-        if (terminalChatRequests.current.has(requestId) || activeChatRequest.current !== requestId) return;
+        const completed = completedVoiceChatRequests.current.has(requestId);
+        if (!voiceChatRequests.current.has(requestId) || (!completed && activeChatRequest.current !== requestId)
+          || (terminalChatRequests.current.has(requestId) && !completed)) return;
         void window.nexaDesktop.voice.speech.acknowledge({ requestId }).catch(() => undefined);
       }, VOICE_ACKNOWLEDGEMENT_DELAY_MS);
       acknowledgementTimers.current.set(requestId, timer);
@@ -220,6 +233,8 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         if (timer !== undefined) window.clearTimeout(timer);
         acknowledgementTimers.current.delete(requestId);
         terminalChatRequests.current.add(requestId);
+        voiceChatRequests.current.delete(requestId);
+        completedVoiceChatRequests.current.delete(requestId);
         if (activeChatRequest.current === requestId) activeChatRequest.current = null;
         setChatMessages((current) => current.map((entry) => entry.requestId === requestId
           ? { ...entry, status: "error", error: CHAT_ERROR_MESSAGES[response.error.code] ?? "No se pudo enviar el mensaje." }
@@ -234,6 +249,8 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       if (timer !== undefined) window.clearTimeout(timer);
       acknowledgementTimers.current.delete(requestId);
       terminalChatRequests.current.add(requestId);
+      voiceChatRequests.current.delete(requestId);
+      completedVoiceChatRequests.current.delete(requestId);
       if (activeChatRequest.current === requestId) activeChatRequest.current = null;
       setChatMessages((current) => current.map((entry) => entry.requestId === requestId
         ? { ...entry, status: "error", error: "Se perdió la conexión con el proceso Desktop; el mensaje no se reintentó." }
@@ -260,8 +277,14 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     }
     terminalChatRequests.current.add(event.requestId);
     const acknowledgementTimer = acknowledgementTimers.current.get(event.requestId);
-    if (acknowledgementTimer !== undefined) window.clearTimeout(acknowledgementTimer);
-    acknowledgementTimers.current.delete(event.requestId);
+    if (event.status === "completed" && voiceChatRequests.current.has(event.requestId)) {
+      completedVoiceChatRequests.current.add(event.requestId);
+    } else {
+      if (acknowledgementTimer !== undefined) window.clearTimeout(acknowledgementTimer);
+      acknowledgementTimers.current.delete(event.requestId);
+      voiceChatRequests.current.delete(event.requestId);
+      completedVoiceChatRequests.current.delete(event.requestId);
+    }
     if (event.status !== "completed" && activeVoiceSpeechRequest.current === event.requestId) {
       void window.nexaDesktop.voice.speech.cancel({ requestId: event.requestId }).catch(() => undefined);
     }
@@ -337,15 +360,32 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         setVoiceSpeechStatus({ requestId: event.requestId, state: "preparing" });
         return;
       }
-      if (activeVoiceSpeechRequest.current !== event.requestId) return;
-      if (event.state === "speaking") setVoiceSpeechStatus({ requestId: event.requestId, state: "speaking" });
+      if (activeVoiceSpeechRequest.current !== event.requestId && !voiceChatRequests.current.has(event.requestId)) return;
+      if (event.state === "speaking") {
+        const timer = acknowledgementTimers.current.get(event.requestId);
+        if (timer !== undefined) window.clearTimeout(timer);
+        acknowledgementTimers.current.delete(event.requestId);
+        voiceChatRequests.current.delete(event.requestId);
+        completedVoiceChatRequests.current.delete(event.requestId);
+        setVoiceSpeechStatus({ requestId: event.requestId, state: "speaking" });
+      }
       else if (event.state === "error") {
+        const timer = acknowledgementTimers.current.get(event.requestId);
+        if (timer !== undefined) window.clearTimeout(timer);
+        acknowledgementTimers.current.delete(event.requestId);
+        voiceChatRequests.current.delete(event.requestId);
+        completedVoiceChatRequests.current.delete(event.requestId);
         activeVoiceSpeechRequest.current = null;
         cancellingVoiceSpeechRequests.current.delete(event.requestId);
         setVoiceSpeechStatus({ requestId: event.requestId, state: "error",
           message: VOICE_SPEECH_ERRORS[event.error?.code ?? "voice_speech_playback_failed"] });
       }
       else {
+        const timer = acknowledgementTimers.current.get(event.requestId);
+        if (timer !== undefined) window.clearTimeout(timer);
+        acknowledgementTimers.current.delete(event.requestId);
+        voiceChatRequests.current.delete(event.requestId);
+        completedVoiceChatRequests.current.delete(event.requestId);
         activeVoiceSpeechRequest.current = null;
         cancellingVoiceSpeechRequests.current.delete(event.requestId);
         setVoiceSpeechStatus(null);
@@ -361,6 +401,11 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const cancelVoiceSpeech = useCallback(async () => {
     const requestId = activeVoiceSpeechRequest.current;
     if (!requestId) return;
+    const timer = acknowledgementTimers.current.get(requestId);
+    if (timer !== undefined) window.clearTimeout(timer);
+    acknowledgementTimers.current.delete(requestId);
+    voiceChatRequests.current.delete(requestId);
+    completedVoiceChatRequests.current.delete(requestId);
     if (cancellingVoiceSpeechRequests.current.has(requestId)) return;
     cancellingVoiceSpeechRequests.current.add(requestId);
     setVoiceSpeechStatus((current) => current?.requestId === requestId ? { ...current, state: "cancelling" } : current);
@@ -419,27 +464,55 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     }
   }
 
-  const cancelChatRequest = useCallback(async () => {
+  const cancelActiveInteraction = useCallback(async () => {
+    if (cancellationInFlight.current) return;
     const requestId = activeChatRequest.current;
-    if (!requestId) return;
+    const pendingVoiceRequestId = voiceChatRequests.current.values().next().value as string | undefined;
+    const speechRequestId = activeVoiceSpeechRequest.current ?? pendingVoiceRequestId ?? null;
+    const voiceStatus = voiceController.getSnapshot().status;
+    const captureActive = ["starting", "listening", "finishing", "processing"].includes(voiceStatus)
+      || (voiceStatus === "error" && !voiceController.getSnapshot().canStart && Boolean(voiceController.getSnapshot().sessionId));
+    if (!requestId && !speechRequestId && !captureActive) return;
+    cancellationInFlight.current = true;
+    setCancellationPending(true);
     try {
-      const result = await window.nexaDesktop.chat.cancelRequest(requestId);
-      if (!result.ok && result.error.code === "request_not_found") {
-        terminalChatRequests.current.add(requestId);
-        if (activeChatRequest.current === requestId) activeChatRequest.current = null;
-        const message = CHAT_ERROR_MESSAGES.request_not_found ?? "La solicitud ya no está activa.";
-        setChatMessages((current) => current.map((entry) => entry.requestId === requestId
-          ? { ...entry, status: "error", error: message } : entry));
-        setChatNotice(message);
-      } else if (!result.ok) {
-        setChatNotice(CHAT_ERROR_MESSAGES[result.error.code] ?? "No se pudo solicitar la cancelación.");
-      } else {
-        setChatNotice("Cancelación solicitada; esperando confirmación de Runtime.");
+      const cancellations: Promise<void>[] = [];
+      if (requestId) {
+        cancellations.push((async () => {
+          try {
+          const result = await window.nexaDesktop.chat.cancelRequest(requestId);
+          if (!result.ok && result.error.code === "request_not_found") {
+            terminalChatRequests.current.add(requestId);
+            if (activeChatRequest.current === requestId) activeChatRequest.current = null;
+            const message = CHAT_ERROR_MESSAGES.request_not_found ?? "La solicitud ya no está activa.";
+            setChatMessages((current) => current.map((entry) => entry.requestId === requestId
+              ? { ...entry, status: "error", error: message } : entry));
+            setChatNotice(message);
+          } else if (!result.ok) {
+            setChatNotice(CHAT_ERROR_MESSAGES[result.error.code] ?? "No se pudo solicitar la cancelación.");
+          }
+        } catch {
+          setChatNotice("No se confirmó la cancelación de Runtime. El estado final sigue pendiente.");
+        }
+        })());
       }
-    } catch {
-      setChatNotice("No se confirmó la solicitud de cancelación. El estado final sigue pendiente.");
+      if (speechRequestId) {
+        if (activeVoiceSpeechRequest.current === speechRequestId) {
+          cancellations.push(cancelVoiceSpeech());
+        } else {
+          cancellations.push(window.nexaDesktop.voice.speech.cancel({ requestId: speechRequestId }).then(() => undefined)
+            .catch(() => undefined)); /* Main retains this request id if speaker initialization is still pending. */
+        }
+      }
+      if (captureActive) {
+        cancellations.push(voiceController.cancel().catch(() => undefined));
+      }
+      await Promise.all(cancellations);
+    } finally {
+      cancellationInFlight.current = false;
+      setCancellationPending(false);
     }
-  }, []);
+  }, [cancelVoiceSpeech, voiceController]);
 
   useEffect(() => {
     if (voiceSnapshot.status === "starting" || voiceSnapshot.status === "listening") {
@@ -513,18 +586,21 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
             chatNotice={chatNotice}
             chatBusy={chatConversationId === null || activeChatRequest.current !== null}
             onSendMessage={(text) => { void submitChatMessage(text, "typed"); }}
-            onCancelRequest={() => { void cancelChatRequest(); }}
+            onCancelInteraction={() => { void cancelActiveInteraction(); }}
             onConnectAuthorization={(provider, requestId) => { void connectAuthorization(provider, requestId); }}
             onCancelAuthorization={(provider, requestId) => { void cancelAuthorization(provider, requestId); }}
             onRetryAuthorizedRequest={(text) => { void submitChatMessage(text, "typed"); }}
             onOpenSpotifyTrack={(url) => { void openSpotifyTrack(url); }}
             transcriptNotice={voiceTranscriptNotice}
             voiceSpeechStatus={voiceSpeechStatus}
-            onCancelSpeech={() => { void cancelVoiceSpeech(); }}
             onStart={() => { void voiceController.start(); }}
             onFinish={() => { void voiceController.finish(); }}
-            onCancel={() => { void voiceController.cancel(); }}
             onRecover={() => { void voiceController.recoverMainCancellation(); }}
+            interactionCancelable={activeChatRequest.current !== null || activeVoiceSpeechRequest.current !== null
+              || voiceChatRequests.current.size > 0
+              || ["starting", "listening", "finishing", "processing"].includes(voiceSnapshot.status)
+              || (voiceSnapshot.status === "error" && !voiceSnapshot.canStart && Boolean(voiceSnapshot.sessionId))}
+            cancellationPending={cancellationPending}
           />
           <PresencePanel status={voiceSnapshot.status} statusLabel={VOICE_STATUS_LABELS[voiceSnapshot.status]} />
         </div>

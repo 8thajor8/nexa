@@ -67,10 +67,11 @@ import {
   registerVoiceMicrophonePermissions,
   removeVoiceIpcHandlers,
   type PublicVoiceApi,
+  type PreparedVoiceResponseAudio,
 } from "./voice-ipc.js";
 
 interface DesktopSpeechService {
-  generate(input: { text: string; style?: string; persist?: boolean }): Promise<unknown>;
+  generate(input: { text: string; style?: string; persist?: boolean; signal?: AbortSignal; includeAudio?: boolean }): Promise<unknown>;
   prepareAudio(input: Uint8Array): Promise<unknown>;
   play(audioId: string, options?: { playbackId?: string; onStarted?: () => void }): Promise<unknown>;
   stopPlayback(playbackId: string): Promise<unknown>;
@@ -132,6 +133,27 @@ async function closeDesktopSpeechService(): Promise<void> {
 async function loadDesktopVoiceApi(): Promise<PublicVoiceApi> {
   const api = await import(publicVoiceApiUrl) as PublicVoiceApi;
   return { ...api, createVoiceSpeaker: (options) => api.createVoiceSpeaker({ ...options, speechService: desktopSpeechService }) };
+}
+
+async function prepareDesktopVoiceResponseAudio(text: string, signal: AbortSignal): Promise<PreparedVoiceResponseAudio> {
+  let result: { success?: boolean; audioId?: string; audio?: Uint8Array; error?: { code?: string } };
+  try {
+    result = await desktopSpeechService.generate({ text, style: "normal", persist: false, signal, includeAudio: true }) as typeof result;
+  } catch {
+    return { audio: null, errorCode: "voice_speech_generation_failed" };
+  }
+  if (!result.success) {
+    const errorCode = result.error?.code === "voice_identity_browser_unavailable" ? "voice_identity_browser_unavailable"
+      : result.error?.code === "audio_processing_failed" ? "voice_audio_processing_failed"
+        : result.error?.code === "audio_storage_unavailable" ? "voice_audio_storage_unavailable"
+          : result.error?.code === "invalid_provider_audio" ? "voice_tts_response_invalid"
+            : result.error?.code === "speech_generation_failed" ? "voice_tts_generation_failed"
+              : "voice_speech_generation_failed";
+    return { audio: null, errorCode };
+  }
+  const audio = result.audio instanceof Uint8Array ? Buffer.from(result.audio) : null;
+  if (result.audioId) await desktopSpeechService.removeTemporary(result.audioId).catch(() => false);
+  return audio ? { audio } : { audio: null, errorCode: "voice_tts_response_invalid" };
 }
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -634,6 +656,7 @@ function installWebContentsGuards(): void {
           });
         },
         (id) => readPreparedVoiceAcknowledgement(id),
+        (text, signal) => prepareDesktopVoiceResponseAudio(text, signal),
       );
     }
   }

@@ -14,7 +14,10 @@ function conversation(status: PttVoiceStatus, extras: Partial<PttVoiceSnapshot> 
   voiceSpeechStatus: { requestId: string; state: "preparing" | "speaking" | "cancelling" | "error"; message?: string } | null = null) {
   return renderToStaticMarkup(createElement(ConversationPanel, {
     snapshot: { status, canStart: status === "idle" || status === "transcript-ready", ...extras }, transcripts: entries, transcriptNotice: null,
-    voiceSpeechStatus, onCancelSpeech: noop, onStart: noop, onFinish: noop, onCancel: noop, onRecover: noop,
+    voiceSpeechStatus, interactionCancelable: ["starting", "listening", "finishing", "processing"].includes(status)
+      || (status === "error" && extras.canStart !== true && Boolean(extras.sessionId))
+      || Boolean(voiceSpeechStatus && ["preparing", "speaking", "cancelling"].includes(voiceSpeechStatus.state)),
+    onCancelInteraction: noop, onStart: noop, onFinish: noop, onRecover: noop,
   }));
 }
 
@@ -32,14 +35,15 @@ describe("PTT visual integration", () => {
     const listening = conversation("listening", { sessionId: "session-1" });
     expect(listening).toContain('aria-label="Finalizar grabación y transcribir"');
     expect(listening).not.toContain("aria-pressed");
-    expect(listening).toContain('aria-label="Cancelar sesión de voz"');
+    expect(listening).toContain('aria-label="Detener interacción"');
+    expect(listening).not.toContain('>Cancelar</button>');
 
     for (const status of ["starting", "finishing", "processing", "cancelling", "recovering"] as const) {
       const markup = conversation(status, { sessionId: "session-1" });
       expect(markup).toContain("disabled=\"\"");
       expect(markup).not.toContain('aria-label="Iniciar grabación de voz"');
     }
-    expect(conversation("processing", { sessionId: "session-1" })).toContain('aria-label="Cancelar sesión de voz"');
+    expect(conversation("processing", { sessionId: "session-1" })).toContain('aria-label="Detener interacción"');
   });
 
   it("shows explicit recovery and a controlled microphone permission error", () => {
@@ -60,13 +64,13 @@ describe("PTT visual integration", () => {
     });
     expect(erroredSession).toContain('aria-label="Grabación no disponible"');
     expect(erroredSession).toContain("disabled=\"\"");
-    expect(erroredSession).toContain('aria-label="Cancelar sesión de voz"');
+    expect(erroredSession).toContain('aria-label="Detener interacción"');
 
     const recoveredSession = conversation("error", {
       canStart: true, sessionId: "session-1", error: { code: "VOICE_PTT_TRANSCRIPTION_FAILED", message: "failed" },
     });
     expect(recoveredSession).toContain('aria-label="Reintentar grabación de voz"');
-    expect(recoveredSession).not.toContain('aria-label="Cancelar sesión de voz"');
+    expect(recoveredSession).not.toContain('aria-label="Detener interacción"');
   });
 
   it("renders final voice transcripts as Jor's user messages with a discreet voice source marker", () => {
@@ -82,8 +86,8 @@ describe("PTT visual integration", () => {
   it("shows an icon-only accessible Stop control while speech is preparing or playing, and omits redundant status copy", () => {
     for (const state of ["preparing", "speaking"] as const) {
       const markup = conversation("transcript-ready", {}, transcripts, { requestId: "speech-1", state });
-      expect(markup).toContain('aria-label="Detener respuesta hablada"');
-      expect(markup).toContain('title="Detener respuesta hablada"');
+      expect(markup).toContain('aria-label="Detener interacción"');
+      expect(markup).toContain('title="Detener interacción"');
       expect(markup).toContain('class="voice-stop-button"');
       expect(markup).not.toContain("Preparando respuesta hablada");
       expect(markup).not.toContain("Transcripción final recibida");
@@ -92,7 +96,7 @@ describe("PTT visual integration", () => {
       expect(markup).toContain("Texto transcrito real.");
     }
     const cancelling = conversation("idle", {}, [], { requestId: "speech-1", state: "cancelling" });
-    expect(cancelling).toContain('aria-label="Detener respuesta hablada"');
+    expect(cancelling).toContain('aria-label="Detener interacción"');
     expect(cancelling).toContain("disabled=\"\"");
   });
 

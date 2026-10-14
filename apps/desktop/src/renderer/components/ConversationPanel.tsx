@@ -37,18 +37,18 @@ interface ConversationPanelProps {
   authorizationAttempts?: Readonly<Record<string, { state: "connecting" | "connected" | "cancelled" | "error"; message?: string }>>;
   chatNotice?: string | null;
   voiceSpeechStatus?: { requestId: string; state: "preparing" | "speaking" | "cancelling" | "error"; message?: string } | null;
+  interactionCancelable?: boolean;
+  cancellationPending?: boolean;
   chatBusy?: boolean;
   onSendMessage?(text: string): void;
-  onCancelRequest?(): void;
+  onCancelInteraction?(): void;
   onConnectAuthorization?(provider: AuthorizationProvider, requestId: string): void;
   onCancelAuthorization?(provider: AuthorizationProvider, requestId: string): void;
   onRetryAuthorizedRequest?(text: string, requestId: string): void;
   onOpenSpotifyTrack?(url: string): void;
-  onCancelSpeech?(): void;
   transcriptNotice: string | null;
   onStart(): void;
   onFinish(): void;
-  onCancel(): void;
   onRecover(): void;
 }
 
@@ -114,10 +114,10 @@ function resizeComposer(textarea: HTMLTextAreaElement): boolean {
 }
 
 export function ConversationPanel({ snapshot, transcripts, chatMessages = [], authorizationRequirements = {}, spotifyNowPlayingCards = {},
-  authorizationAttempts = {}, chatNotice, chatBusy = false, onSendMessage, onCancelRequest,
+  authorizationAttempts = {}, chatNotice, chatBusy = false, onSendMessage, onCancelInteraction,
   onConnectAuthorization, onCancelAuthorization, onRetryAuthorizedRequest, onOpenSpotifyTrack, transcriptNotice,
-  voiceSpeechStatus = null, onCancelSpeech,
-  onStart, onFinish, onCancel, onRecover }: ConversationPanelProps) {
+  voiceSpeechStatus = null, interactionCancelable = false, cancellationPending = false,
+  onStart, onFinish, onRecover }: ConversationPanelProps) {
   const messageListRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const [composerText, setComposerText] = useState("");
@@ -129,8 +129,6 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
   const lastTranscriptKeyRef = useRef<string | null>(null);
   const canStart = snapshot.canStart;
   const canFinish = snapshot.status === "listening";
-  const canCancel = ["starting", "listening", "finishing", "processing"].includes(snapshot.status)
-    || (snapshot.status === "error" && !snapshot.canStart && Boolean(snapshot.sessionId));
   const message = errorMessage(snapshot);
 
   useLayoutEffect(() => {
@@ -273,19 +271,17 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
                 event.preventDefault();
                 if (composerText.trim() && !chatBusy) event.currentTarget.form?.requestSubmit();
               }} maxLength={16_000} />
-            {chatBusy && <button className="chat-cancel-button" type="button" onClick={onCancelRequest} aria-label="Solicitar cancelación del mensaje activo">Cancelar</button>}
             <button className="composer-send" type="submit" disabled={!composerText.trim() || chatBusy} aria-label="Enviar mensaje a Nexa">
               <svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="M3 10h13M10 4l6 6-6 6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
             </button>
           </div>
           <div className="voice-ptt-controls" role="group" aria-label="Controles de voz">
-            {voiceSpeechStatus && ["preparing", "speaking", "cancelling"].includes(voiceSpeechStatus.state) && <button
-              className="voice-stop-button" type="button" onClick={onCancelSpeech}
-              disabled={voiceSpeechStatus.state === "cancelling"}
-              aria-label="Detener respuesta hablada" title="Detener respuesta hablada">
+            {interactionCancelable && <button
+              className="voice-stop-button" type="button" onClick={onCancelInteraction}
+              disabled={cancellationPending || voiceSpeechStatus?.state === "cancelling"}
+              aria-label="Detener interacción" title="Detener interacción">
               <svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><rect x="6.5" y="6.5" width="11" height="11" rx="1.5" fill="currentColor"/></svg>
             </button>}
-            {canCancel && <button className="voice-secondary-button" type="button" onClick={onCancel} aria-label="Cancelar sesión de voz">Cancelar</button>}
             {snapshot.status === "recovery-required" && (
               <button className="voice-secondary-button voice-recover-button" type="button" onClick={onRecover} aria-label="Recuperar cancelación pendiente de Main">Recuperar</button>
             )}

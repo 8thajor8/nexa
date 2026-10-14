@@ -25,14 +25,16 @@ export function classifySystemDiagnosticRequest(message) {
     const technical = /\b(informe tecnico|diagnostico tecnico|detalles tecnicos|reporte para soporte|informe para soporte)\b/u.test(text);
     const voice = /\b(voz|voice|ptt|audio hablado)\b/u.test(text);
     const memory = /\b(memoria|memory ?2|recuerdo|recordaste|recuperacion de memoria)\b/u.test(text);
-    const explicitNexaStatus = /\b(?:nexa(?:\s*,)?\s+(?:dame\s+)?diagnostico|dame\s+tu\s+diagnostico|como\s+estan\s+tus\s+sistemas|dame\s+tu\s+estado\s+operativo|tu\s+estado\s+operativo)\b/u.test(text);
+    const explicitComputerTarget = /\b(?:mi\s+pc|pc|computadora|windows|mi\s+equipo|equipo|procesos\s+(?:de\s+)?(?:mi\s+)?(?:computadora|pc|equipo)|rendimiento\s+(?:de\s+)?(?:mi\s+)?(?:equipo|pc|computadora))\b/u.test(text);
+    if (explicitComputerTarget) return null;
+    const explicitNexaStatus = /\b(?:nexa(?:\s*,)?\s+(?:dame\s+)?diagnostico|dame\s+tu\s+diagnostico|tu\s+diagnostico(?:\s+de\s+sistema)?|necesito\s+tu\s+diagnostico(?:\s+de\s+sistema)?|como\s+estan\s+tus\s+sistemas|estan\s+tus\s+sistemas|dame\s+tu\s+estado\s+operativo|tu\s+estado\s+operativo|como\s+esta\s+(?:funcionando\s+)?tu\s+runtime)\b/u.test(text);
     const toolCatalog = /\b(herramientas.*disponibles|que herramientas|herramientas tenes|que podes hacer con spotify|capacidades.*(spotify|windows|correo|calendario))\b/u.test(text);
     const status = toolCatalog || /\b(sistema de memoria|memory ?2 activo|modo.*memoria|capacidades activas|estado del sistema)\b/u.test(text);
     if (technical && memory) return 'technical_memory';
     if ((technical && voice) || (voice && /\b(diagnostico|informe|estado)\b/u.test(text))) return 'technical_voice';
     if (technical) return 'technical_status';
     if (toolCatalog) return /\bspotify\b/u.test(text) ? 'tool_catalog_spotify' : 'tool_catalog';
-    if (memory && (/\bdiagnostic|funcionando|por que|recordaste|recuperacion\b/u.test(text))) return 'memory';
+    if (memory && (/\bdiagnostic|funcionando|por que|recordaste|recuperacion|como esta\b/u.test(text))) return 'memory';
     if (explicitNexaStatus) return 'status';
     if (status) return 'status';
     return null;

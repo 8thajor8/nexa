@@ -35,12 +35,13 @@ export function createSpeechService({
         return { success: true };
     }
 
-    async function generate({ text, style = 'normal', persist = false, signal } = {}) {
+    async function generate({ text, style = 'normal', persist = false, signal, includeAudio = false } = {}) {
         const audioReadyStartedAt = performance.now();
         if (typeof text !== 'string' || text.trim().length === 0) return failure('invalid_text', 'El texto no puede estar vacío.');
         if (text.length > maxTextLength) return failure('text_too_long', `El texto supera el límite de ${maxTextLength} caracteres.`);
         if (typeof style !== 'string' || !Object.hasOwn(speechStyles, style)) return failure('invalid_speech_style', 'El estilo debe ser normal, professional, alert, sassy o calm.');
         if (typeof persist !== 'boolean') return failure('invalid_persist_option', 'persist debe ser true o false.');
+        if (typeof includeAudio !== 'boolean') return failure('invalid_audio_return_option', 'includeAudio debe ser true o false.');
         const metrics = { model: speechConfig.model, voice: speechConfig.voice, identityProfile: 'nova-portena',
             identityProcessing: voiceIdentityEnabled, storageInitializationMs: null, synthesisMs: null,
             identityProcessingMs: null, identityServerStartupMs: null, identityBrowserStartupMs: null,
@@ -112,7 +113,7 @@ export function createSpeechService({
             metrics.voiceIdentityProcessingMs = metrics.identityProcessingMs;
             metrics.outputBytes = audio.byteLength;
             lastMetrics = { ...metrics };
-            return { success: true, ...reference };
+            return { success: true, ...reference, ...(includeAudio ? { audio: Buffer.from(audio) } : {}) };
         } catch {
             metrics.audioSaveMs = performance.now() - saveStartedAt; metrics.failureStage = 'audio_preparation'; lastMetrics = { ...metrics };
             return failure('audio_storage_failed', 'No pude guardar el audio generado.');

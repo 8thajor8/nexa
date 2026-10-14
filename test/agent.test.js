@@ -34,6 +34,15 @@ async function makeAgent({ responses, maxToolIterations = 5, execute, logger = (
     return { agent, requests };
 }
 
+test('voice test requests remain ordinary content and are reserved for the existing response playback path', async () => {
+    const { agent, requests } = await makeAgent({ responses: [finalResponse('La música funk tiene un groove marcado.')] });
+    const answer = await agent.run('Generame una respuesta larga para probar tu voz y el audio.', 'voice');
+    assert.equal(answer, 'La música funk tiene un groove marcado.');
+    assert.match(requests[0].instructions, /texto largo para probar cómo hablás.*Voice leerá la respuesta final/u);
+    assert.match(requests[0].instructions, /diagnósticos de Voice solo ante una solicitud explícita/u);
+    assert.match(requests[0].instructions, /Mencionar probar voz, audio o una respuesta larga no es por sí mismo un pedido de diagnóstico/u);
+});
+
 test('agent completes open, find, set, then returns the model final answer', async () => {
     const calls = [];
     const { agent, requests } = await makeAgent({

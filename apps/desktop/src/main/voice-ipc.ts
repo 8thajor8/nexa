@@ -97,21 +97,26 @@ interface ActiveVoiceSession {
 type LoadPublicVoiceApi = () => Promise<PublicVoiceApi>;
 type VoiceAcknowledgementId = "clear" | "review" | "moment";
 type LoadVoiceAcknowledgement = (id: VoiceAcknowledgementId) => Promise<Uint8Array | null>;
+export type PreparedVoiceResponseAudio = { audio: Uint8Array | null; errorCode?: VoiceSpeechErrorCode };
+export type PrepareVoiceResponseAudio = (text: string, signal: AbortSignal) => Promise<PreparedVoiceResponseAudio>;
 
 const activeSessions = new WeakMap<VoiceIpcWindow, ActiveVoiceSession>();
 interface VoiceSpeechOwner {
   window: VoiceIpcWindow;
   speaker: VoiceSpeakerController;
   activeRequestId: string | null;
-  activeKind: "acknowledgement" | "response" | null;
+  activeKind: "acknowledgement" | "response_preparing" | "response" | null;
   nextTurnId: string | null;
   acknowledgementEnd: { requestId: string; promise: Promise<void>; resolve: () => void } | null;
   acknowledgementStarting: boolean;
   stoppedRequestIds: Set<string>;
+  handledResponseRequestIds: Set<string>;
   unsubscribe: Array<() => void>;
 }
 const speechOwners = new Map<VoiceIpcWindow, VoiceSpeechOwner>();
 const pendingSpeechOwners = new WeakMap<VoiceIpcWindow, Promise<VoiceSpeechOwner>>();
+const pendingResponsePreparations = new WeakMap<VoiceIpcWindow, Map<string, AbortController>>();
+const stoppedVoiceRequests = new WeakMap<VoiceIpcWindow, Set<string>>();
 const navigatingWindows = new WeakSet<VoiceIpcWindow>();
 const navigationHooks = new WeakSet<VoiceIpcWindow>();
 type VoiceDiagnosticEvent = { requestId: string; stage: string; state: string; errorCode?: string; durationMs?: number | null;
@@ -249,20 +254,23 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
   let pending = pendingSpeechOwners.get(window);
   if (!pending) {
     pending = getPublicVoiceApi(loadVoiceApi).then((voice) => {
+      let stoppedRequests = stoppedVoiceRequests.get(window);
+      if (!stoppedRequests) { stoppedRequests = new Set(); stoppedVoiceRequests.set(window, stoppedRequests); }
       const owner: VoiceSpeechOwner = { window, speaker: undefined as unknown as VoiceSpeakerController,
         activeRequestId: null, activeKind: null, nextTurnId: null, acknowledgementEnd: null,
-        acknowledgementStarting: false, stoppedRequestIds: new Set(), unsubscribe: [] };
+        acknowledgementStarting: false, stoppedRequestIds: stoppedRequests,
+        handledResponseRequestIds: new Set(), unsubscribe: [] };
       owner.speaker = voice.createVoiceSpeaker({ idFactory: () => owner.nextTurnId ?? randomUUID() });
       owner.unsubscribe = [
         owner.speaker.on("voice.speaking", (event) => {
           if (typeof event.turnId !== "string") return;
-          emitSpeechEvent(window, { requestId: event.turnId, state: "speaking" });
           const details = event.diagnostics as Record<string, unknown> | undefined;
           recordVoice({ requestId: event.turnId, stage: "playback", state: "processing",
             metrics: details?.metrics && typeof details.metrics === "object" ? details.metrics as Record<string, unknown> : null });
         }),
         owner.speaker.on("voice.playback.started", (event) => {
           if (typeof event.turnId !== "string") return;
+          emitSpeechEvent(window, { requestId: event.turnId, state: "speaking" });
           const timing = speechTimingByRequest.get(event.turnId);
           const playbackStartedAt = performance.now();
           if (!timing) return;
@@ -277,45 +285,59 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
         }),
         owner.speaker.on("voice.speech.completed", (event) => {
           if (typeof event.turnId !== "string") return;
+          const responseStillActive = owner.activeRequestId === event.turnId
+            && owner.activeKind === "acknowledgement"
+            && pendingResponsePreparations.get(window)?.has(event.turnId) === true;
           if (owner.acknowledgementEnd?.requestId === event.turnId) {
             owner.acknowledgementEnd.resolve();
             owner.acknowledgementEnd = null;
           }
-          emitSpeechEvent(window, { requestId: event.turnId, state: "completed" });
+          if (responseStillActive) owner.activeKind = "response_preparing";
+          else emitSpeechEvent(window, { requestId: event.turnId, state: "completed" });
           const details = event.diagnostics as Record<string, unknown> | undefined;
           recordVoice({ requestId: event.turnId, stage: "playback", state: "success",
             durationMs: typeof details?.durationMs === "number" ? details.durationMs : null,
             metrics: details?.metrics && typeof details.metrics === "object" ? details.metrics as Record<string, unknown> : null });
-          if (owner.activeRequestId === event.turnId) { owner.activeRequestId = null; owner.activeKind = null; }
+          if (owner.activeRequestId === event.turnId) {
+            if (!responseStillActive) { owner.activeRequestId = null; owner.activeKind = null; }
+          }
         }),
         owner.speaker.on("voice.speech.cancelled", (event) => {
           if (typeof event.turnId !== "string") return;
+          const responseStillActive = owner.activeRequestId === event.turnId
+            && owner.activeKind === "response_preparing"
+            && pendingResponsePreparations.get(window)?.has(event.turnId) === true;
           if (owner.acknowledgementEnd?.requestId === event.turnId) {
             owner.acknowledgementEnd.resolve();
             owner.acknowledgementEnd = null;
           }
           speechTimingByRequest.delete(event.turnId);
-          emitSpeechEvent(window, { requestId: event.turnId, state: "cancelled" });
+          if (responseStillActive) owner.activeKind = "response_preparing";
+          else emitSpeechEvent(window, { requestId: event.turnId, state: "cancelled" });
           recordVoice({ requestId: event.turnId, stage: typeof event.phase === "string" && event.phase === "speaking" ? "playback" : "synthesis",
             state: "cancelled", cancellation: typeof event.reason === "string" ? event.reason : "unknown" });
-          if (owner.activeRequestId === event.turnId) { owner.activeRequestId = null; owner.activeKind = null; }
+          if (owner.activeRequestId === event.turnId && !responseStillActive) { owner.activeRequestId = null; owner.activeKind = null; }
         }),
         owner.speaker.on("voice.speech.error", (event) => {
           if (typeof event.turnId !== "string") return;
+          const responseStillActive = owner.activeRequestId === event.turnId
+            && owner.activeKind === "response_preparing"
+            && pendingResponsePreparations.get(window)?.has(event.turnId) === true;
           if (owner.acknowledgementEnd?.requestId === event.turnId) {
             owner.acknowledgementEnd.resolve();
             owner.acknowledgementEnd = null;
           }
           speechTimingByRequest.delete(event.turnId);
           const error = event.error as Record<string, unknown> | undefined;
-          emitSpeechEvent(window, { requestId: event.turnId, state: "error",
+          if (responseStillActive) owner.activeKind = "response_preparing";
+          else emitSpeechEvent(window, { requestId: event.turnId, state: "error",
             error: { code: safeSpeechErrorCode(error?.code) } });
           const details = event.diagnostics as Record<string, unknown> | undefined;
           recordVoice({ requestId: event.turnId, stage: typeof details?.stage === "string" ? details.stage : "audio_preparation",
             state: "error", errorCode: safeSpeechErrorCode(error?.code),
             durationMs: typeof details?.durationMs === "number" ? details.durationMs : null,
             metrics: details?.metrics && typeof details.metrics === "object" ? details.metrics as Record<string, unknown> : null });
-          if (owner.activeRequestId === event.turnId) { owner.activeRequestId = null; owner.activeKind = null; }
+          if (owner.activeRequestId === event.turnId && !responseStillActive) { owner.activeRequestId = null; owner.activeKind = null; }
         }),
       ];
       speechOwners.set(window, owner);
@@ -335,8 +357,45 @@ export function cancelVoiceSpeech(window: VoiceIpcWindow | null, reason: "user" 
   targetRequestId?: string): boolean {
   if (!window || window.isDestroyed()) return false;
   const owner = speechOwners.get(window);
-  if (!owner?.activeRequestId || (targetRequestId !== undefined && owner.activeRequestId !== targetRequestId)) return false;
+  const pending = pendingResponsePreparations.get(window);
+  const pendingRequestId = targetRequestId ?? owner?.activeRequestId ?? (pending?.keys().next().value as string | undefined);
+  const pendingController = pendingRequestId ? pending?.get(pendingRequestId) : undefined;
+  if (reason === "user" && targetRequestId && isVoiceId(targetRequestId)) {
+    if (owner && owner.activeRequestId !== targetRequestId && !pendingController) {
+      return owner.stoppedRequestIds.has(targetRequestId);
+    }
+    if (!owner && !pendingController) {
+      let stopped = stoppedVoiceRequests.get(window);
+      if (!stopped) { stopped = new Set(); stoppedVoiceRequests.set(window, stopped); }
+      stopped.add(targetRequestId);
+      if (stopped.size > 64) stopped.delete(stopped.values().next().value!);
+      return true;
+    }
+    let stopped = stoppedVoiceRequests.get(window);
+    if (!stopped) { stopped = new Set(); stoppedVoiceRequests.set(window, stopped); }
+    stopped.add(targetRequestId);
+    if (stopped.size > 64) stopped.delete(stopped.values().next().value!);
+  }
+  if (!owner?.activeRequestId || (targetRequestId !== undefined && owner.activeRequestId !== targetRequestId)) {
+    if (!pendingController || !pendingRequestId) return reason === "user" && pendingRequestId !== undefined;
+    if (reason === "user") {
+      owner?.stoppedRequestIds.add(pendingRequestId);
+      if (owner && owner.stoppedRequestIds.size > 64) owner.stoppedRequestIds.delete(owner.stoppedRequestIds.values().next().value!);
+    }
+    pendingController.abort();
+    pending?.delete(pendingRequestId);
+    if (owner?.activeRequestId === pendingRequestId && owner.activeKind === "response_preparing") {
+      owner.activeRequestId = null; owner.activeKind = null; owner.nextTurnId = null;
+      emitSpeechEvent(window, { requestId: pendingRequestId, state: "cancelled" });
+    }
+    return true;
+  }
   const requestId = owner.activeRequestId;
+  if (targetRequestId !== undefined && pendingController && pendingRequestId === targetRequestId) {
+    if (reason === "user") owner.stoppedRequestIds.add(requestId);
+    pendingController.abort();
+    pending?.delete(requestId);
+  }
   if (reason === "user") {
     owner.stoppedRequestIds.add(requestId);
     if (owner.stoppedRequestIds.size > 64) owner.stoppedRequestIds.delete(owner.stoppedRequestIds.values().next().value!);
@@ -351,6 +410,15 @@ export function cancelVoiceSpeech(window: VoiceIpcWindow | null, reason: "user" 
       owner.acknowledgementEnd = null;
       pending.resolve();
     }
+    emitSpeechEvent(window, { requestId, state: "cancelled" });
+    return true;
+  }
+  if (owner.activeKind === "response_preparing") {
+    if (owner.speaker.getPlaybackState?.() !== undefined && owner.speaker.getPlaybackState?.() !== "idle") {
+      const interrupted = owner.speaker.cancel(reason);
+      if (interrupted) return true;
+    }
+    owner.activeRequestId = null; owner.activeKind = null; owner.nextTurnId = null;
     emitSpeechEvent(window, { requestId, state: "cancelled" });
     return true;
   }
@@ -382,7 +450,85 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
   }
   recordVoice({ requestId, stage: "synthesis", state: "processing", durationMs: performance.now() - ownerPreparationStartedAt,
     metrics: { speechInitializationMs: performance.now() - ownerPreparationStartedAt } });
-  if (owner.stoppedRequestIds.has(requestId)) return;
+  if (owner.stoppedRequestIds.has(requestId)) {
+    speechTimingByRequest.delete(requestId);
+    emitSpeechEvent(window, { requestId, state: "cancelled" });
+    return;
+  }
+  if (owner.handledResponseRequestIds.has(requestId)) return;
+  owner.handledResponseRequestIds.add(requestId);
+  if (owner.handledResponseRequestIds.size > 256) owner.handledResponseRequestIds.delete(owner.handledResponseRequestIds.values().next().value!);
+  const prepareResponseAudio = configuredResponseAudioPreparer;
+  if (prepareResponseAudio) {
+    let preparations = pendingResponsePreparations.get(window);
+    if (!preparations) { preparations = new Map(); pendingResponsePreparations.set(window, preparations); }
+    if (preparations.has(requestId)) return;
+    const controller = new AbortController();
+    preparations.set(requestId, controller);
+    if (owner.activeRequestId && owner.activeRequestId !== requestId
+      && owner.activeKind !== "acknowledgement") cancelVoiceSpeech(window, "superseded", owner.activeRequestId ?? undefined);
+    if (owner.activeKind !== "acknowledgement") {
+      owner.activeRequestId = requestId;
+      owner.activeKind = "response_preparing";
+    } else if (owner.activeRequestId !== requestId) {
+      cancelVoiceSpeech(window, "superseded", owner.activeRequestId ?? undefined);
+      owner.activeRequestId = requestId;
+      owner.activeKind = "response_preparing";
+    }
+    recordVoice({ requestId, stage: "synthesis", state: "started" });
+    emitSpeechEvent(window, { requestId, state: "preparing" });
+    let prepared: PreparedVoiceResponseAudio;
+    try { prepared = await prepareResponseAudio(text, controller.signal); }
+    catch { prepared = { audio: null, errorCode: "voice_speech_generation_failed" }; }
+    if (owner.stoppedRequestIds.has(requestId) || controller.signal.aborted || window.isDestroyed()) {
+      preparations.delete(requestId);
+      if (owner.activeRequestId === requestId && owner.activeKind === "response_preparing") {
+        owner.activeRequestId = null; owner.activeKind = null;
+      }
+      return;
+    }
+    if (!(prepared?.audio instanceof Uint8Array) || prepared.audio.byteLength === 0) {
+      const errorCode = prepared?.errorCode ?? "voice_speech_generation_failed";
+      if (owner.activeKind === "acknowledgement" && owner.activeRequestId === requestId) {
+        const acknowledgementEnd = owner.acknowledgementEnd;
+        await stopAcknowledgementForResponse(owner, requestId);
+        if (acknowledgementEnd?.requestId === requestId) await acknowledgementEnd.promise;
+      }
+      preparations.delete(requestId);
+      if (owner.activeRequestId === requestId) { owner.activeRequestId = null; owner.activeKind = null; }
+      speechTimingByRequest.delete(requestId);
+      recordVoice({ requestId, stage: "synthesis", state: "error", errorCode });
+      emitSpeechEvent(window, { requestId, state: "error", error: { code: errorCode } });
+      return;
+    }
+    if (owner.activeKind === "acknowledgement" && owner.activeRequestId) {
+      const acknowledgementRequestId = owner.activeRequestId;
+      const acknowledgementEnd = owner.acknowledgementEnd;
+      if (acknowledgementRequestId === requestId) await stopAcknowledgementForResponse(owner, requestId);
+      else cancelVoiceSpeech(window, "superseded", acknowledgementRequestId);
+      if (acknowledgementEnd?.requestId === acknowledgementRequestId) await acknowledgementEnd.promise;
+    }
+    if (owner.stoppedRequestIds.has(requestId) || controller.signal.aborted || window.isDestroyed()) {
+      preparations.delete(requestId);
+      return;
+    }
+    preparations.delete(requestId);
+    if (owner.activeRequestId && owner.activeRequestId !== requestId) cancelVoiceSpeech(window, "superseded", owner.activeRequestId);
+    owner.activeRequestId = requestId;
+    owner.activeKind = "response";
+    owner.nextTurnId = requestId;
+    try { await owner.speaker.speakPrepared(Buffer.from(prepared.audio)); }
+    catch {
+      speechTimingByRequest.delete(requestId);
+      if (owner.activeRequestId === requestId) {
+        owner.activeRequestId = null; owner.activeKind = null;
+        emitSpeechEvent(window, { requestId, state: "error", error: { code: "voice_speech_generation_failed" } });
+      }
+    } finally {
+      if (owner.nextTurnId === requestId) owner.nextTurnId = null;
+    }
+    return;
+  }
   if (owner.activeKind === "acknowledgement" && owner.activeRequestId) {
     const acknowledgementRequestId = owner.activeRequestId;
     const acknowledgementEnd = owner.acknowledgementEnd;
@@ -408,16 +554,36 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
   }
 }
 
+async function stopAcknowledgementForResponse(owner: VoiceSpeechOwner, requestId: string): Promise<void> {
+  if (owner.activeRequestId !== requestId || owner.activeKind !== "acknowledgement") return;
+  const acknowledgementEnd = owner.acknowledgementEnd?.requestId === requestId ? owner.acknowledgementEnd : null;
+  owner.activeRequestId = requestId;
+  owner.activeKind = "response_preparing";
+  if (owner.acknowledgementStarting) {
+    owner.acknowledgementStarting = false;
+    owner.nextTurnId = null;
+    if (acknowledgementEnd) {
+      owner.acknowledgementEnd = null;
+      acknowledgementEnd.resolve();
+    }
+  } else {
+    owner.speaker.cancel("superseded");
+  }
+  if (acknowledgementEnd) await acknowledgementEnd.promise;
+}
+
 let configuredVoiceApiLoader: LoadPublicVoiceApi | null = null;
 let configuredVoiceAcknowledgementLoader: LoadVoiceAcknowledgement | null = null;
+let configuredResponseAudioPreparer: PrepareVoiceResponseAudio | null = null;
 let voiceAcknowledgementIndex = 0;
 
 export async function speakVoiceAcknowledgement(window: VoiceIpcWindow | null, requestId: string): Promise<boolean> {
   if (!window || window.isDestroyed() || !isVoiceId(requestId) || !configuredVoiceApiLoader || !configuredVoiceAcknowledgementLoader) return false;
   const owner = await getSpeechOwner(window, configuredVoiceApiLoader).catch(() => null);
   const playbackState = owner?.speaker.getPlaybackState?.();
+  const responsePreparingForRequest = owner?.activeKind === "response_preparing" && owner.activeRequestId === requestId;
   if (!owner || window.isDestroyed() || owner.stoppedRequestIds.has(requestId)
-    || owner.activeRequestId || (playbackState !== undefined && playbackState !== "idle")) return false;
+    || (owner.activeRequestId && !responsePreparingForRequest) || (playbackState !== undefined && playbackState !== "idle")) return false;
   let resolve!: () => void;
   const promise = new Promise<void>((done) => { resolve = done; });
   owner.acknowledgementEnd = { requestId, promise, resolve };
@@ -498,9 +664,11 @@ export function registerVoiceIpcHandlers(
   loadVoiceApi: LoadPublicVoiceApi,
   diagnosticRecorder?: (event: VoiceDiagnosticEvent) => void,
   loadAcknowledgement?: LoadVoiceAcknowledgement,
+  prepareResponseAudio?: PrepareVoiceResponseAudio,
 ): void {
   configuredVoiceApiLoader = loadVoiceApi;
   configuredVoiceAcknowledgementLoader = loadAcknowledgement ?? null;
+  configuredResponseAudioPreparer = prepareResponseAudio ?? null;
   recordVoiceDiagnostic = diagnosticRecorder ?? null;
   ipcMain.removeHandler(VOICE_PTT_START_CHANNEL);
   ipcMain.removeHandler(VOICE_PTT_FINISH_CHANNEL);
@@ -678,6 +846,7 @@ export function removeVoiceIpcHandlers(): void {
   speechOwners.clear();
   configuredVoiceApiLoader = null;
   configuredVoiceAcknowledgementLoader = null;
+  configuredResponseAudioPreparer = null;
   cachedVoiceApi = null;
 }
 

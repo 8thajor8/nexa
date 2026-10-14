@@ -20,8 +20,17 @@ test('classifies supported Spanish system and memory questions without matching 
     assert.equal(classifySystemDiagnosticRequest('Dame tu estado operativo'), 'status');
     assert.equal(classifySystemDiagnosticRequest('¿Está funcionando tu memoria?'), 'memory');
     assert.equal(classifySystemDiagnosticRequest('Diagnóstico de voz'), 'technical_voice');
+    for (const text of ['Generame una respuesta larga para probar tu voz', 'Decime veinte líneas para escuchar cómo hablás',
+        'Generame un texto largo para probar el audio', 'Hablame sobre música funk durante un rato']) {
+        assert.equal(classifySystemDiagnosticRequest(text), null, `${text} is a normal conversational request`);
+    }
+    for (const text of ['Tu diagnóstico. Necesito tu diagnóstico de sistema', 'Necesito tu diagnóstico de sistema',
+        'Dame tu diagnóstico de sistema', 'Están tus sistemas', '¿Cómo está tu memoria?', '¿Cómo está funcionando tu Runtime?']) {
+        assert.ok(classifySystemDiagnosticRequest(text), `${text} should be routed to an internal Nexa diagnostic`);
+    }
     for (const text of ['diagnóstico', '¿Cómo está mi PC?', 'Revisá mi computadora', 'Diagnosticá Windows',
-        'Revisá los procesos de mi computadora', '¿Qué memoria usa mi computadora?']) {
+        'Revisá los procesos de mi computadora', '¿Qué memoria usa mi computadora?', '¿Cuántos procesos tengo abiertos?',
+        '¿Cómo está el rendimiento de mi equipo?', 'Nexa, revisá mi computadora']) {
         assert.equal(classifySystemDiagnosticRequest(text), null, `${text} must not be routed to Nexa status`);
     }
 });
