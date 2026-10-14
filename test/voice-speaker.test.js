@@ -142,6 +142,40 @@ test('repeated cancellation during speech generation remains idempotent and late
     assert.equal(events.length, 1);
 });
 
+test('a new spoken response waits for cancelled synthesis to settle, then plays without restart', async () => {
+    const oldGeneration = deferred();
+    const calls = [];
+    let nextTurn = 0;
+    let oldSignal;
+    const speaker = createVoiceSpeaker({ idFactory: () => `turn-${++nextTurn}`, speechService: {
+        generate({ text, signal }) {
+            calls.push(`generate:${text}`);
+            if (text === 'respuesta anterior') {
+                oldSignal = signal;
+                return oldGeneration.promise;
+            }
+            return Promise.resolve({ success: true, audioId: 'respuesta-nueva' });
+        },
+        async play(id) { calls.push(`play:${id}`); return { success: true, released: true }; },
+        async removeTemporary(id) { calls.push(`remove:${id}`); return true; },
+    } });
+
+    const previous = speaker.speak('respuesta anterior');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(speaker.cancel('user'), true);
+    assert.equal(oldSignal.aborted, true);
+    assert.equal(await previous, null);
+
+    const next = speaker.speak('respuesta siguiente');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(calls, ['generate:respuesta anterior']);
+    oldGeneration.resolve({ success: true, audioId: 'audio-tardio' });
+    assert.deepEqual(await next, { sessionId: speaker.sessionId, turnId: 'turn-2', completed: true });
+    assert.deepEqual(calls.filter(call => call.startsWith('generate:') || call.startsWith('play:')),
+        ['generate:respuesta anterior', 'generate:respuesta siguiente', 'play:respuesta-nueva']);
+    assert.ok(calls.includes('remove:audio-tardio'));
+});
+
 test('cancellation during playback is logical and reports that playback was not interrupted', async () => {
     const pendingPlayback = deferred();
     let playbackStarted = false;

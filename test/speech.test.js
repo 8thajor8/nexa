@@ -183,6 +183,17 @@ test('supports every fixed style while keeping a shared voice identity', async t
     assert.doesNotMatch(getSpeechInstructions('normal'), /youthful adult feminine voice|warm, friendly, lively|witty|confident|corporate/iu);
 });
 
+test('synthesizes short and maximum-length configured responses without changing the voice profile', async t => {
+    const f = await fixture(t);
+    for (const text of ['Respuesta breve.', 'x'.repeat(speechConfig.maxTextLength)]) {
+        const generated = await f.service.generate({ text });
+        assert.equal(generated.success, true);
+        assert.equal(f.calls.generated.at(-1).text, text);
+        assert.equal(f.calls.generated.at(-1).instructions, getSpeechInstructions('normal'));
+    }
+    assert.equal(f.calls.generated.length, 2);
+});
+
 test('production voice config selects Nova and enables the separate identity processor by default', () => {
     assert.equal(speechConfig.model, 'gpt-4o-mini-tts');
     assert.equal(speechConfig.voice, 'nova');

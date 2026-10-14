@@ -54,7 +54,7 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
     let selectedService = speechService;
     let servicePromise;
     let active = null;
-    let synthesisInFlight = false;
+    let synthesisTail = Promise.resolve();
     let cleanupInFlight = false;
     let playbackState = 'idle';
 
@@ -104,6 +104,19 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
         const error = new VoiceError(code);
         emit('voice.speech.error', operation, { phase: 'queued', error: Object.freeze({ code: error.code, message: error.message }) });
         return Promise.reject(error);
+    }
+    function enqueueSynthesis(operation, service) {
+        const previous = synthesisTail;
+        let release;
+        synthesisTail = new Promise(resolve => { release = resolve; });
+        return previous.then(async () => {
+            try {
+                if (active !== operation) return null;
+                return await service.generate({ text: operation.text, ...operation.options, signal: operation.controller.signal });
+            } finally {
+                release();
+            }
+        });
     }
     function cancel(reason = 'user') {
         if (!validCancelReasons.has(reason)) throw new TypeError('voice_cancel_reason_invalid');
@@ -170,16 +183,14 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
         try {
             service = await resolveService();
             if (active !== operation) return null;
-            synthesisInFlight = true;
-            try { generated = await service.generate({ text: operation.text, ...operation.options, signal: operation.controller.signal }); }
-            finally { synthesisInFlight = false; }
-            operation.speechMetrics = typeof service.getLastMetrics === 'function' ? safeSpeechMetrics(service.getLastMetrics()) : null;
+            generated = await enqueueSynthesis(operation, service);
             if (active !== operation) {
                 operation.service = service;
                 operation.generatedAudioId = generated?.audioId;
                 if (generated?.success) await discardGenerated(operation);
                 return null;
             }
+            operation.speechMetrics = typeof service.getLastMetrics === 'function' ? safeSpeechMetrics(service.getLastMetrics()) : null;
             if (!generated?.success || typeof generated.audioId !== 'string') {
                 const underlying = generated?.error?.code;
                 const mapped = ({ audio_storage_unavailable: 'voice_audio_storage_unavailable',
@@ -257,7 +268,7 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
         const normalizedOptions = normalizeOptions(options);
         const operation = makeOperation(text, normalizedOptions);
         if (playbackState === 'degraded') return failFast(operation, 'voice_speech_degraded');
-        if (active || synthesisInFlight || cleanupInFlight || playbackState === 'playing') return failFast(operation, 'voice_speech_busy');
+        if (active || cleanupInFlight || playbackState === 'playing') return failFast(operation, 'voice_speech_busy');
         active = operation;
         const work = run(operation);
         return Promise.race([work, operation.cancellation]);

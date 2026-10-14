@@ -41,6 +41,7 @@ let bridge: NexaDesktopApi;
 let microphoneDevices: MicrophoneDeviceStore;
 let previousBridge: PropertyDescriptor | undefined;
 let chatListeners: Set<(event: import("../src/shared/ipc-contract").ChatEventEnvelope) => void>;
+let speechListeners: Set<(event: import("../src/shared/ipc-contract").VoiceSpeechEvent) => void>;
 
 async function mountApp() {
   const view = render(createElement(StrictMode, null,
@@ -371,6 +372,24 @@ describe("App PTT DOM integration", () => {
     expect(screen.getByText("Cancelación solicitada; esperando confirmación de Runtime.")).toBeTruthy();
     act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId, requestId: request.requestId, status: "cancelled" })));
     expect(screen.getByText("Cancelado")).toBeTruthy();
+  });
+
+  it("Stop cancels only Voice speech and does not request Runtime cancellation", async () => {
+    speechListeners = new Set();
+    Object.assign(bridge.voice, { speech: {
+      cancel: vi.fn(async ({ requestId }: { requestId: string }) => ({ ok: true as const, requestId, cancelled: true as const })),
+      onEvent: vi.fn((listener: (event: import("../src/shared/ipc-contract").VoiceSpeechEvent) => void) => {
+        speechListeners.add(listener);
+        return () => speechListeners.delete(listener);
+      }),
+    } });
+    await mountApp();
+    act(() => speechListeners.forEach((listener) => listener({ requestId: "speech-stop", state: "preparing" })));
+    fireEvent.click(screen.getByRole("button", { name: "Detener respuesta hablada" }));
+
+    await waitFor(() => expect(bridge.voice.speech.cancel).toHaveBeenCalledWith({ requestId: "speech-stop" }));
+    expect(bridge.chat.cancelRequest).not.toHaveBeenCalled();
+    expect(screen.queryByText("Cancelación solicitada; esperando confirmación de Runtime.")).toBeNull();
   });
 
   it("releases the processing state when Main reports the request is already inactive", async () => {
