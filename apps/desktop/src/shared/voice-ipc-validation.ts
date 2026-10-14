@@ -137,7 +137,7 @@ export function isVoiceSpeechEvent(value: unknown): value is VoiceSpeechEvent {
     && isPlainRecord(value.error) && hasExactKeys(value.error, ["code"])
     && ["voice_speech_generation_failed", "voice_speech_playback_failed", "voice_speech_playback_timeout",
       "voice_speech_start_timeout", "voice_speech_stop_failed", "voice_speech_stop_timeout", "voice_speech_busy",
-      "voice_speech_degraded", "voice_speech_too_long", "voice_audio_storage_unavailable", "voice_tts_generation_failed",
+      "voice_speech_degraded", "voice_speech_too_long", "voice_audio_storage_unavailable", "voice_tts_generation_failed", "voice_tts_generation_timeout",
       "voice_tts_response_invalid", "voice_audio_processing_failed", "voice_audio_storage_failed",
       "voice_identity_browser_unavailable"].includes(String(value.error.code));
 }

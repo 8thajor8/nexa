@@ -15,6 +15,7 @@ const messages = Object.freeze({
     voice_speech_generation_failed: 'No pude generar el audio hablado.',
     voice_audio_storage_unavailable: 'No se pudo preparar el almacenamiento de audio.',
     voice_tts_generation_failed: 'El proveedor no pudo generar la respuesta hablada.',
+    voice_tts_generation_timeout: 'La síntesis de voz tardó demasiado.',
     voice_tts_response_invalid: 'El proveedor devolvió un audio no válido.',
     voice_audio_processing_failed: 'No pude preparar el audio para reproducirlo.',
     voice_identity_browser_unavailable: 'No está disponible el motor local requerido por la identidad vocal.',

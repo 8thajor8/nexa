@@ -23,7 +23,12 @@ export function getVoiceConfig(env = process.env) {
     if (model.length > 128 || /[\u0000-\u0020\u007f]/u.test(model)) {
         throw new VoiceError('voice_model_invalid');
     }
-    return Object.freeze({ model, maxAudioBytes: MAX_AUDIO_BYTES });
+    const languageSetting = typeof env?.NEXA_STT_LANGUAGE === 'string' ? env.NEXA_STT_LANGUAGE.trim().toLowerCase() : '';
+    if (languageSetting && languageSetting !== 'auto' && !/^[a-z]{2}$/u.test(languageSetting)) {
+        throw new VoiceError('voice_language_invalid');
+    }
+    return Object.freeze({ model, maxAudioBytes: MAX_AUDIO_BYTES,
+        preferredLanguage: languageSetting === 'auto' ? null : languageSetting || 'es' });
 }
 
 export const voiceConfig = getVoiceConfig();

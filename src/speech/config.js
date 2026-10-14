@@ -16,6 +16,12 @@ export const speechConfig = Object.freeze({
     persistentDirectory: path.join(projectRoot, 'data', 'audio'),
 });
 
+export function getSpeechRequestTimeoutMs(text, env = process.env) {
+    const configured = Number(env?.NEXA_TTS_TIMEOUT_MS);
+    if (Number.isInteger(configured) && configured >= 30_000 && configured <= 300_000) return configured;
+    return Math.min(180_000, 90_000 + 30_000 * Math.floor(Math.max(0, text.length - 1) / 1_000));
+}
+
 export const voiceIdentity = [
     novaPortenaInstructions,
     'Keep it relaxed and spontaneous, like chatting with someone you know.',

@@ -9,8 +9,9 @@ export function createOpenAITranscriptionProvider({ clientFactory = getOpenAICli
             if (signal?.aborted) throw new VoiceError('voice_cancelled');
             try {
                 const file = await toFile(audio, `voice-audio.${format}`, { type: AUDIO_FORMATS[format] });
-                const languageHint = language
-                    ? (model === DEFAULT_TRANSCRIPTION_MODEL ? { languages: [language] } : { language })
+                const preferredLanguage = language === undefined ? config.preferredLanguage : language;
+                const languageHint = preferredLanguage
+                    ? (model === DEFAULT_TRANSCRIPTION_MODEL ? { languages: [preferredLanguage] } : { language: preferredLanguage })
                     : {};
                 const response = await clientFactory().audio.transcriptions.create({
                     file,

@@ -45,6 +45,7 @@ const VOICE_SPEECH_ERRORS: Record<VoiceSpeechErrorCode, string> = {
   voice_speech_generation_failed: "No se pudo generar la respuesta hablada.",
   voice_audio_storage_unavailable: "No se pudo preparar el almacenamiento de audio.",
   voice_tts_generation_failed: "El proveedor no pudo generar la respuesta hablada.",
+  voice_tts_generation_timeout: "La síntesis de voz tardó demasiado. Podés volver a intentarlo.",
   voice_tts_response_invalid: "El proveedor devolvió un audio no válido.",
   voice_audio_processing_failed: "No se pudo procesar el audio para reproducirlo.",
   voice_identity_browser_unavailable: "Falta el motor local requerido para procesar la identidad vocal.",

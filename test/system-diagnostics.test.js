@@ -41,7 +41,8 @@ test('Voice diagnostics retain bounded safe stage metadata and omit conversation
         errorCode: 'voice_identity_browser_unavailable', durationMs: 17, model: 'gpt-4o-mini-tts', voice: 'nova',
         identityProfile: 'nova-portena', identityProcessing: true,
         durations: { pttFinalizationMs: 31, audioConversionMs: 8, speechInitializationMs: 22,
-            synthesisMs: 800, identityProcessingMs: 17, playbackCommandStartMs: 14, responseDispatchToPlaybackMs: 1200,
+            synthesisMs: 800, ttsSdkResponseMs: 730, ttsBodyReadMs: 50,
+            identityProcessingMs: 17, playbackCommandStartMs: 14, responseDispatchToPlaybackMs: 1200,
             responseDispatchToSynthesisMs: 80, responseDispatchToAudioReadyMs: 1150, audioReadyToPlaybackMs: 50,
             identityBrowserStartupMs: 900,
             identityRendererPreparationMs: 120, identityDspSetupMs: 40, identityDspProcessingMs: 7000,
@@ -53,6 +54,8 @@ test('Voice diagnostics retain bounded safe stage metadata and omit conversation
     assert.equal(report.voice.last.errorCode, 'voice_identity_browser_unavailable');
     assert.equal(report.voice.last.errorDescription, 'Browser local de procesamiento de identidad vocal no disponible');
     assert.equal(report.voice.last.durations.synthesisMs, 800);
+    assert.equal(report.voice.last.durations.ttsSdkResponseMs, 730);
+    assert.equal(report.voice.last.durations.ttsBodyReadMs, 50);
     assert.equal(report.voice.last.durations.pttFinalizationMs, 31);
     assert.equal(report.voice.last.durations.audioConversionMs, 8);
     assert.equal(report.voice.last.durations.speechInitializationMs, 22);

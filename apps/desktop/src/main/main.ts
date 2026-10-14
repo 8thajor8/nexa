@@ -145,18 +145,22 @@ async function prepareDesktopVoiceResponseAudio(text: string, signal: AbortSigna
   } catch {
     return { audio: null, errorCode: "voice_speech_generation_failed" };
   }
+  const lastMetrics = desktopSpeechService.getLastMetrics?.() ?? null;
+  const metrics = lastMetrics ? { synthesisMs: lastMetrics.synthesisMs, ttsSdkResponseMs: lastMetrics.ttsSdkResponseMs,
+    ttsBodyReadMs: lastMetrics.ttsBodyReadMs, identityProcessingMs: lastMetrics.identityProcessingMs } : undefined;
   if (!result.success) {
     const errorCode = result.error?.code === "voice_identity_browser_unavailable" ? "voice_identity_browser_unavailable"
       : result.error?.code === "audio_processing_failed" ? "voice_audio_processing_failed"
         : result.error?.code === "audio_storage_unavailable" ? "voice_audio_storage_unavailable"
           : result.error?.code === "invalid_provider_audio" ? "voice_tts_response_invalid"
-            : result.error?.code === "speech_generation_failed" ? "voice_tts_generation_failed"
+            : result.error?.code === "speech_generation_timeout" ? "voice_tts_generation_timeout"
+              : result.error?.code === "speech_generation_failed" ? "voice_tts_generation_failed"
               : "voice_speech_generation_failed";
-    return { audio: null, errorCode };
+    return { audio: null, errorCode, metrics };
   }
   const audio = result.audio instanceof Uint8Array ? Buffer.from(result.audio) : null;
   if (result.audioId) await desktopSpeechService.removeTemporary(result.audioId).catch(() => false);
-  return audio ? { audio } : { audio: null, errorCode: "voice_tts_response_invalid" };
+  return audio ? { audio, metrics } : { audio: null, errorCode: "voice_tts_response_invalid", metrics };
 }
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -680,6 +684,8 @@ function installWebContentsGuards(): void {
           const stageKey = event.stage === "transcription" ? "transcriptionMs" : event.stage === "runtime" ? "runtimeMs"
             : event.stage === "playback" ? "playbackMs" : null;
           const synthesisMs = duration(metrics.synthesisMs);
+          const ttsSdkResponseMs = duration(metrics.ttsSdkResponseMs);
+          const ttsBodyReadMs = duration(metrics.ttsBodyReadMs);
           const identityProcessingMs = duration(metrics.identityProcessingMs);
           const identityServerStartupMs = duration(metrics.identityServerStartupMs);
           const identityBrowserStartupMs = duration(metrics.identityBrowserStartupMs);
@@ -695,7 +701,7 @@ function installWebContentsGuards(): void {
             errorCode: event.errorCode, durationMs: event.durationMs, cancellation: event.cancellation,
             followupOutcome: typeof metrics.followupOutcome === "string" ? metrics.followupOutcome : null,
             ...desktopVoiceConfiguration,
-            durations: { ...(stageKey ? { [stageKey]: event.durationMs } : {}), synthesisMs, identityProcessingMs,
+            durations: { ...(stageKey ? { [stageKey]: event.durationMs } : {}), synthesisMs, ttsSdkResponseMs, ttsBodyReadMs, identityProcessingMs,
               identityServerStartupMs, identityBrowserStartupMs, identityRendererPreparationMs, identityDspSetupMs,
               identityDspProcessingMs, identityAudioCaptureWaitMs, identityPostProcessingMs, audioReadyMs,
               audioPreparationMs: audioPreparationMs || null,

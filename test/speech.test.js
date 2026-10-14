@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createAudioStore } from '../src/speech/audio-store.js';
 import { createSpeechService } from '../src/speech/service.js';
-import { speechConfig, speechStyles, voiceIdentity, getSpeechInstructions } from '../src/speech/config.js';
+import { speechConfig, speechStyles, voiceIdentity, getSpeechInstructions, getSpeechRequestTimeoutMs } from '../src/speech/config.js';
 import { createOpenAISpeechProvider } from '../src/speech/providers/openai.js';
 import { generateSpeechTool, playAudioTool, speechRegistrations } from '../src/speech/index.js';
 import { checkToolPermission } from '../src/tools/permissions.js';
@@ -266,6 +266,15 @@ test('provider failures are sanitized and do not leak their error details', asyn
     assert.doesNotMatch(JSON.stringify(result), /secret|api_key|response body/iu);
 });
 
+test('service preserves a distinct sanitized synthesis deadline failure', async t => {
+    const f = await fixture(t);
+    f.provider.synthesize = async () => { const error = new Error('sensitive provider detail'); error.code = 'speech_generation_timeout'; throw error; };
+    const result = await f.service.generate({ text: 'Hola' });
+    assert.equal(result.error.code, 'speech_generation_timeout');
+    assert.doesNotMatch(JSON.stringify(result), /sensitive|provider detail/iu);
+    assert.equal(f.service.getLastMetrics().failureStage, 'synthesis');
+});
+
 test('playback only resolves IDs registered during this process; paths and unknown IDs are rejected', async t => {
     const f = await fixture(t);
     assert.equal((await f.service.play('C:\\Users\\Jor\\private.wav')).error.code, 'audio_not_found');
@@ -324,12 +333,58 @@ test('OpenAI provider uses centralized model, voice, instructions, WAV format an
     } } } }) });
     const controller = new AbortController();
     assert.deepEqual(await provider.synthesize({ text: 'Hola', instructions: 'Nexa voice', signal: controller.signal }), Buffer.from([1, 2, 3]));
-    assert.equal(requestOptions.signal, controller.signal);
+    assert.equal(requestOptions.signal.aborted, false);
+    assert.equal(requestOptions.maxRetries, 0);
+    assert.equal(requestOptions.timeout, 90_000);
     assert.deepEqual(request, {
         model: 'gpt-4o-mini-tts', voice: 'nova', input: 'Hola', instructions: 'Nexa voice', response_format: 'wav',
     });
     await provider.synthesize({ text: 'Hola', instructions: 'Nexa voice', voice: 'coral' });
     assert.equal(request.voice, 'coral');
+});
+
+test('TTS budget scales with response length and supports a bounded override', () => {
+    assert.equal(getSpeechRequestTimeoutMs('Hola', {}), 90_000);
+    assert.equal(getSpeechRequestTimeoutMs('x'.repeat(1_001), {}), 120_000);
+    assert.equal(getSpeechRequestTimeoutMs('x'.repeat(3_000), {}), 150_000);
+    assert.equal(getSpeechRequestTimeoutMs('Hola', { NEXA_TTS_TIMEOUT_MS: '45000' }), 45_000);
+    assert.equal(getSpeechRequestTimeoutMs('Hola', { NEXA_TTS_TIMEOUT_MS: '1' }), 90_000);
+});
+
+test('TTS deadline and cancellation stop a stalled SDK request without retries or body disclosure', async () => {
+    const options = [];
+    const provider = createOpenAISpeechProvider({ timeoutForText: () => 10,
+        clientFactory: () => ({ audio: { speech: { create(_request, requestOptions) {
+            options.push(requestOptions);
+            return new Promise(() => {});
+        } } } }),
+    });
+    await assert.rejects(provider.synthesize({ text: 'Hola' }), error => error.code === 'speech_generation_timeout');
+    assert.equal(options.length, 1);
+    assert.equal(options[0].maxRetries, 0);
+    const controller = new AbortController();
+    const pending = provider.synthesize({ text: 'Hola', signal: controller.signal });
+    controller.abort();
+    await assert.rejects(pending, error => error.code !== 'speech_generation_timeout');
+    const stalledBody = createOpenAISpeechProvider({ timeoutForText: () => 10,
+        clientFactory: () => ({ audio: { speech: { async create() {
+            return { arrayBuffer: () => new Promise(() => {}) };
+        } } } }),
+    });
+    await assert.rejects(stalledBody.synthesize({ text: 'Hola' }), error => error.code === 'speech_generation_timeout');
+});
+
+test('TTS exposes only timing and text length, not speech content', async () => {
+    const timings = [];
+    const provider = createOpenAISpeechProvider({ clientFactory: () => ({ audio: { speech: { async create() {
+        return { async arrayBuffer() { return Uint8Array.from([1, 2, 3]).buffer; } };
+    } } } }) });
+    await provider.synthesize({ text: 'Privado', onTiming: timing => timings.push(timing) });
+    assert.equal(timings.length, 2);
+    assert.equal(timings[0].ttsInputCharacters, 7);
+    assert.ok(timings[0].ttsSdkResponseMs >= 0);
+    assert.ok(timings[1].ttsBodyReadMs >= 0);
+    assert.equal(JSON.stringify(timings).includes('Privado'), false);
 });
 
 test('cancellation during identity processing prevents the late audio from being stored', async () => {

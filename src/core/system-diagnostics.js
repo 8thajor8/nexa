@@ -6,7 +6,7 @@ const SAFE_VOICE_STAGES = new Set(['ptt', 'transcription', 'runtime', 'synthesis
 const SAFE_VOICE_STATES = new Set(['started', 'processing', 'success', 'error', 'cancelled', 'interrupted']);
 const SAFE_VOICE_ERRORS = new Set(['VOICE_PTT_INVALID_AUDIO', 'VOICE_PTT_UNSUPPORTED_FORMAT', 'VOICE_PTT_TOO_LARGE',
     'VOICE_PTT_TOO_LONG', 'VOICE_PTT_INVALID_STATE', 'VOICE_PTT_TRANSCRIPTION_FAILED', 'voice_audio_storage_unavailable',
-    'voice_tts_generation_failed', 'voice_tts_response_invalid', 'voice_audio_processing_failed', 'voice_audio_storage_failed',
+    'voice_tts_generation_failed', 'voice_tts_generation_timeout', 'voice_tts_response_invalid', 'voice_audio_processing_failed', 'voice_audio_storage_failed',
     'voice_identity_browser_unavailable', 'voice_speech_generation_failed', 'voice_speech_playback_failed', 'voice_speech_playback_timeout',
     'voice_speech_start_timeout', 'voice_speech_stop_failed', 'voice_speech_stop_timeout', 'voice_speech_busy',
     'voice_speech_degraded', 'voice_speech_too_long',
@@ -70,7 +70,8 @@ export function createOperationalDiagnostics({ runtimeId = randomUUID(), memoryM
             model: voiceConfiguration.model, voice: voiceConfiguration.voice,
             identityProfile: voiceConfiguration.identityProfile, identityProcessing: voiceConfiguration.identityProcessing,
             durations: Object.freeze({ transcriptionMs: duration(event.durations?.transcriptionMs), runtimeMs: duration(event.durations?.runtimeMs),
-                synthesisMs: duration(event.durations?.synthesisMs), identityProcessingMs: duration(event.durations?.identityProcessingMs),
+                synthesisMs: duration(event.durations?.synthesisMs), ttsSdkResponseMs: duration(event.durations?.ttsSdkResponseMs),
+                ttsBodyReadMs: duration(event.durations?.ttsBodyReadMs), identityProcessingMs: duration(event.durations?.identityProcessingMs),
                 identityServerStartupMs: duration(event.durations?.identityServerStartupMs),
                 identityBrowserStartupMs: duration(event.durations?.identityBrowserStartupMs),
                 identityRendererPreparationMs: duration(event.durations?.identityRendererPreparationMs),
@@ -276,7 +277,8 @@ export function formatSystemStatus(snapshot, { technical = false } = {}) {
         const voiceStateNames = { started: 'iniciada', processing: 'en curso', success: 'completada', error: 'con error',
             cancelled: 'cancelada', interrupted: 'interrumpida' };
         const safeErrorNames = { voice_identity_browser_unavailable: 'No está disponible el motor local de identidad vocal.',
-            voice_tts_generation_failed: 'Falló la generación de voz.', voice_audio_processing_failed: 'Falló el procesamiento del audio.',
+            voice_tts_generation_failed: 'Falló la generación de voz.', voice_tts_generation_timeout: 'La síntesis de voz tardó demasiado.',
+            voice_audio_processing_failed: 'Falló el procesamiento del audio.',
             voice_speech_playback_failed: 'Falló la reproducción de voz.', voice_speech_playback_timeout: 'La reproducción excedió el tiempo esperado.',
             voice_speech_stop_failed: 'No se pudo confirmar la interrupción de la voz.', voice_speech_stop_timeout: 'La interrupción de voz excedió el tiempo esperado.',
             voice_audio_storage_unavailable: 'El almacenamiento temporal de audio no está disponible.', voice_speech_busy: 'Ya había una operación de voz en curso.' };
@@ -385,6 +387,7 @@ export function formatVoiceStatus(snapshot) {
     const lastError = voiceErrors.at(-1)?.errorCode;
     const errorNames = { voice_identity_browser_unavailable: 'No está disponible el motor local de identidad vocal.',
         voice_audio_processing_failed: 'Falló el procesamiento del audio.', voice_tts_generation_failed: 'Falló la generación de voz.',
+        voice_tts_generation_timeout: 'La síntesis de voz tardó demasiado.',
         voice_tts_response_invalid: 'La síntesis devolvió audio inválido.', voice_speech_playback_failed: 'Falló la reproducción de voz.',
         voice_speech_playback_timeout: 'La reproducción excedió el tiempo esperado.', voice_speech_too_long: 'La respuesta superó el límite de duración.',
         VOICE_PTT_TRANSCRIPTION_FAILED: 'Falló la transcripción del micrófono.' };
@@ -532,6 +535,7 @@ export function createTechnicalDiagnosticReport(snapshot, kind = 'memory') {
         voice_audio_storage_unavailable: 'No se pudo inicializar el almacenamiento local de audio',
         voice_audio_storage_failed: 'No se pudo guardar el audio preparado',
         voice_tts_generation_failed: 'Falló la solicitud de síntesis de voz',
+        voice_tts_generation_timeout: 'La síntesis de voz superó el tiempo permitido',
         voice_tts_response_invalid: 'El proveedor devolvió audio inválido',
         voice_speech_playback_failed: 'Falló la reproducción de audio',
         voice_speech_playback_timeout: 'La reproducción superó el límite de tiempo',
@@ -542,7 +546,7 @@ export function createTechnicalDiagnosticReport(snapshot, kind = 'memory') {
         errorCode: allowedString(item.errorCode), durationMs: Number.isSafeInteger(item.durationMs) ? item.durationMs : null,
         errorDescription: voiceErrorDescription(item.errorCode),
         durations: Object.fromEntries(['pttFinalizationMs', 'audioConversionMs', 'transcriptionMs', 'runtimeMs', 'speechInitializationMs',
-            'synthesisMs', 'identityProcessingMs', 'playbackCommandStartMs', 'responseDispatchToPlaybackMs',
+            'synthesisMs', 'ttsSdkResponseMs', 'ttsBodyReadMs', 'identityProcessingMs', 'playbackCommandStartMs', 'responseDispatchToPlaybackMs',
             'responseDispatchToSynthesisMs', 'responseDispatchToAudioReadyMs', 'audioReadyToPlaybackMs',
             'identityServerStartupMs', 'identityBrowserStartupMs', 'identityRendererPreparationMs', 'identityDspProcessingMs',
             'identityDspSetupMs', 'identityAudioCaptureWaitMs', 'identityPostProcessingMs', 'audioReadyMs',

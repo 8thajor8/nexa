@@ -82,7 +82,8 @@ export function createSpeechRecognizer({ provider, config = voiceConfig } = {}) 
         try {
             const selected = await resolveProvider();
             if (signal?.aborted) throw new VoiceError('voice_cancelled');
-            const result = await selected.transcribe({ ...input, model: config.model });
+            const language = input.language ?? config.preferredLanguage;
+            const result = await selected.transcribe({ ...input, model: config.model, language });
             if (signal?.aborted) throw new VoiceError('voice_cancelled');
             if (!result || typeof result !== 'object' || typeof result.text !== 'string') {
                 throw new VoiceError('voice_response_invalid');

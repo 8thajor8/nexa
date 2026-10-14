@@ -16,6 +16,7 @@ function safeSpeechMetrics(value) {
         identityProcessing: typeof value.identityProcessing === 'boolean' ? value.identityProcessing : null,
         failureStage: safeSpeechStages.has(value.failureStage) ? value.failureStage : null,
         storageInitializationMs: duration('storageInitializationMs'), synthesisMs: duration('synthesisMs'),
+        ttsSdkResponseMs: duration('ttsSdkResponseMs'), ttsBodyReadMs: duration('ttsBodyReadMs'),
         identityProcessingMs: duration('identityProcessingMs'), identityServerStartupMs: duration('identityServerStartupMs'),
         identityBrowserStartupMs: duration('identityBrowserStartupMs'), identityRendererPreparationMs: duration('identityRendererPreparationMs'),
         identityDspSetupMs: duration('identityDspSetupMs'), identityDspProcessingMs: duration('identityDspProcessingMs'),
@@ -196,7 +197,8 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
             if (!generated?.success || typeof generated.audioId !== 'string') {
                 const underlying = generated?.error?.code;
                 const mapped = ({ audio_storage_unavailable: 'voice_audio_storage_unavailable',
-                    speech_generation_failed: 'voice_tts_generation_failed', invalid_provider_audio: 'voice_tts_response_invalid',
+                    speech_generation_failed: 'voice_tts_generation_failed', speech_generation_timeout: 'voice_tts_generation_timeout',
+                    invalid_provider_audio: 'voice_tts_response_invalid',
                     audio_processing_failed: 'voice_audio_processing_failed', voice_identity_browser_unavailable: 'voice_identity_browser_unavailable',
                     audio_storage_failed: 'voice_audio_storage_failed' })[underlying];
                 operation.errorStage = operation.speechMetrics?.failureStage ?? 'synthesis';

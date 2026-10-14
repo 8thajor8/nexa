@@ -44,6 +44,7 @@ export function createSpeechService({
         if (typeof includeAudio !== 'boolean') return failure('invalid_audio_return_option', 'includeAudio debe ser true o false.');
         const metrics = { model: speechConfig.model, voice: speechConfig.voice, identityProfile: 'nova-portena',
             identityProcessing: voiceIdentityEnabled, storageInitializationMs: null, synthesisMs: null,
+            ttsSdkResponseMs: null, ttsBodyReadMs: null, ttsInputCharacters: text.length,
             identityProcessingMs: null, identityServerStartupMs: null, identityBrowserStartupMs: null,
             identityRendererPreparationMs: null, identityDspSetupMs: null, identityDspProcessingMs: null,
             identityAudioCaptureWaitMs: null, identityPostProcessingMs: null,
@@ -54,10 +55,12 @@ export function createSpeechService({
 
         let audio;
         const providerStartedAt = performance.now();
-        try { audio = await provider.synthesize({ text, instructions: getSpeechInstructions(style), format: speechConfig.format, signal }); }
-        catch {
+        try { audio = await provider.synthesize({ text, instructions: getSpeechInstructions(style), format: speechConfig.format, signal,
+            onTiming: timing => { Object.assign(metrics, timing); } }); }
+        catch (error) {
             metrics.synthesisMs = performance.now() - providerStartedAt; metrics.failureStage = 'synthesis'; lastMetrics = { ...metrics };
             if (signal?.aborted) return failure('voice_cancelled', 'La generación de voz fue cancelada.');
+            if (error?.code === 'speech_generation_timeout') return failure('speech_generation_timeout', 'La síntesis de voz tardó demasiado.');
             return failure('speech_generation_failed', 'El proveedor de voz no pudo generar el audio.');
         }
         metrics.synthesisMs = performance.now() - providerStartedAt;

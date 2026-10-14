@@ -201,7 +201,7 @@ describe("Electron Main Voice IPC", () => {
         const event = { turnId: nextTurnId };
         listeners.get("voice.speaking")?.(event);
         listeners.get("voice.speech.completed")?.(event);
-        expect(text).toBe("Hola, soy Nexa.");
+        expect(text).toBe("Hola, soy Nexa. Mirá la guía y este sitio web.");
         expect(options).toEqual({ style: "normal", persist: false });
         return { completed: true as const };
       }),
@@ -222,13 +222,14 @@ describe("Electron Main Voice IPC", () => {
       listeners.get("voice.speaking")?.(event);
       listeners.get("voice.playback.started")?.(event);
       listeners.get("voice.speech.completed")?.(event);
-      expect(text).toBe("Hola, soy Nexa.");
+      expect(text).toBe("Hola, soy Nexa. Mirá la guía y este sitio web.");
       expect(options).toEqual({ style: "normal", persist: false });
       return { completed: true as const };
     });
     registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never);
 
-    await speakVoiceResponse(window as never, "00000000-0000-4000-8000-000000000051", "Hola, soy Nexa.");
+    await speakVoiceResponse(window as never, "00000000-0000-4000-8000-000000000051",
+      "Hola, soy Nexa. Mirá [la guía](https://example.com/guia) y https://example.org/?x=1.");
 
     expect(api.createVoiceSpeaker).toHaveBeenCalledOnce();
     expect(speaker.speak).toHaveBeenCalledOnce();

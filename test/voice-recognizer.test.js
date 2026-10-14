@@ -66,10 +66,25 @@ test('cancellation is forwarded and pre-cancelled input makes no provider call',
 
 test('configuration selects gpt-transcribe by default and accepts an explicit model override', () => {
     assert.equal(getVoiceConfig({}).model, 'gpt-transcribe');
+    assert.equal(getVoiceConfig({}).preferredLanguage, 'es');
+    assert.equal(getVoiceConfig({ NEXA_STT_LANGUAGE: 'auto' }).preferredLanguage, null);
+    assert.equal(getVoiceConfig({ NEXA_STT_LANGUAGE: 'en' }).preferredLanguage, 'en');
+    assert.throws(() => getVoiceConfig({ NEXA_STT_LANGUAGE: 'spanish' }), error => error.code === 'voice_language_invalid');
     assert.equal(getVoiceConfig({ NEXA_STT_MODEL: 'custom-stt-v1' }).model, 'custom-stt-v1');
     assert.equal(getVoiceConfig({ NEXA_STT_MODEL: '  ' }).model, 'gpt-transcribe');
     assert.throws(() => getVoiceConfig({ NEXA_STT_MODEL: 'bad model' }), error => error.code === 'voice_model_invalid');
     assert.equal(Object.keys(AUDIO_FORMATS).length, 9);
+});
+
+test('recognizer prefers Spanish for PTT and follow-up, with an explicit override or automatic detection', async () => {
+    const languages = [];
+    const provider = { async transcribe(input) { languages.push(input.language ?? null); return { text: 'hola', language: 'es' }; } };
+    const recognizer = createSpeechRecognizer({ provider });
+    await recognizer.transcribe({ audio: Buffer.from([1]), format: 'wav' });
+    await recognizer.transcribe({ audio: Buffer.from([1]), format: 'wav', language: 'en' });
+    const automatic = createSpeechRecognizer({ provider, config: getVoiceConfig({ NEXA_STT_LANGUAGE: 'auto' }) });
+    await automatic.transcribe({ audio: Buffer.from([1]), format: 'wav' });
+    assert.deepEqual(languages, ['es', 'en', null]);
 });
 
 test('OpenAI adapter uses the shared client, in-memory upload, configured model, and request AbortSignal', async () => {
@@ -92,7 +107,7 @@ test('OpenAI adapter uses the shared client, in-memory upload, configured model,
     assert.equal(request.model, 'gpt-transcribe');
     assert.equal(request.response_format, 'json');
     assert.equal(Object.hasOwn(request, 'language'), false);
-    assert.equal(Object.hasOwn(request, 'languages'), false);
+    assert.deepEqual(request.languages, ['es']);
     assert.equal(requestOptions.signal, signal);
     assert.equal(toFile instanceof Function, true);
 });
@@ -114,6 +129,8 @@ test('OpenAI adapter maps gpt-transcribe language hints to languages and preserv
     const defaultRequest = await captureRequest(DEFAULT_TRANSCRIPTION_MODEL, 'es');
     assert.deepEqual(defaultRequest.languages, ['es']);
     assert.equal(Object.hasOwn(defaultRequest, 'language'), false);
+    const automaticRequest = await captureRequest(DEFAULT_TRANSCRIPTION_MODEL, null);
+    assert.equal(Object.hasOwn(automaticRequest, 'languages'), false);
 
     for (const model of ['whisper-1', 'gpt-4o-transcribe', 'gpt-4o-mini-transcribe']) {
         const request = await captureRequest(model, 'es');

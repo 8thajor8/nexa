@@ -23,6 +23,7 @@ import {
   type VoiceSpeechAcknowledgementRequest,
   type VoiceSpeechErrorCode,
 } from "../shared/ipc-contract.js";
+import { prepareSpokenText } from "./spoken-text.js";
 import {
   isVoiceEventEnvelope,
   isVoiceId,
@@ -106,7 +107,8 @@ export interface VoiceAudioDuckingPort {
 }
 type VoiceAcknowledgementId = "clear" | "review" | "moment";
 type LoadVoiceAcknowledgement = (id: VoiceAcknowledgementId) => Promise<Uint8Array | null>;
-export type PreparedVoiceResponseAudio = { audio: Uint8Array | null; errorCode?: VoiceSpeechErrorCode };
+export type PreparedVoiceResponseAudio = { audio: Uint8Array | null; errorCode?: VoiceSpeechErrorCode;
+  metrics?: Record<string, unknown> };
 export type PrepareVoiceResponseAudio = (text: string, signal: AbortSignal) => Promise<PreparedVoiceResponseAudio>;
 
 const activeSessions = new WeakMap<VoiceIpcWindow, ActiveVoiceSession>();
@@ -289,7 +291,7 @@ function emitSpeechEvent(window: VoiceIpcWindow, event: VoiceSpeechEvent): void 
 function safeSpeechErrorCode(value: unknown): VoiceSpeechErrorCode {
   const allowed = new Set(["voice_speech_generation_failed", "voice_speech_playback_failed", "voice_speech_playback_timeout",
     "voice_speech_start_timeout", "voice_speech_stop_failed", "voice_speech_stop_timeout", "voice_speech_busy",
-    "voice_speech_degraded", "voice_speech_too_long", "voice_audio_storage_unavailable", "voice_tts_generation_failed",
+    "voice_speech_degraded", "voice_speech_too_long", "voice_audio_storage_unavailable", "voice_tts_generation_failed", "voice_tts_generation_timeout",
     "voice_tts_response_invalid", "voice_audio_processing_failed", "voice_audio_storage_failed", "voice_identity_browser_unavailable"]);
   return (typeof value === "string" && allowed.has(value) ? value : "voice_speech_playback_failed") as VoiceSpeechErrorCode;
 }
@@ -491,11 +493,12 @@ export function cancelVoiceSpeech(window: VoiceIpcWindow | null, reason: "user" 
 
 export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestId: string, text: string): Promise<void> {
   if (!window || window.isDestroyed() || !isVoiceId(requestId) || typeof text !== "string") return;
-  if (!text.trim()) {
+  const spokenText = prepareSpokenText(text);
+  if (!spokenText.trim()) {
     releaseVoiceDucking(window, requestId);
     return;
   }
-  if (text.length > 3_000) {
+  if (spokenText.length > 3_000) {
     recordVoice({ requestId, stage: "synthesis", state: "error", errorCode: "voice_speech_too_long" });
     emitSpeechEvent(window, { requestId, state: "error", error: { code: "voice_speech_too_long" } });
     releaseVoiceDucking(window, requestId);
@@ -554,7 +557,7 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
         : Math.max(0, performance.now() - speechTiming.responseDispatchedAt) } });
     emitSpeechEvent(window, { requestId, state: "preparing" });
     let prepared: PreparedVoiceResponseAudio;
-    try { prepared = await prepareResponseAudio(text, controller.signal); }
+    try { prepared = await prepareResponseAudio(spokenText, controller.signal); }
     catch { prepared = { audio: null, errorCode: "voice_speech_generation_failed" }; }
     if (owner.stoppedRequestIds.has(requestId) || controller.signal.aborted || window.isDestroyed()) {
       preparations.delete(requestId);
@@ -573,7 +576,7 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
       preparations.delete(requestId);
       if (owner.activeRequestId === requestId) { owner.activeRequestId = null; owner.activeKind = null; }
       speechTimingByRequest.delete(requestId);
-      recordVoice({ requestId, stage: "synthesis", state: "error", errorCode });
+      recordVoice({ requestId, stage: "synthesis", state: "error", errorCode, metrics: prepared?.metrics });
       emitSpeechEvent(window, { requestId, state: "error", error: { code: errorCode } });
       releaseVoiceDucking(window, requestId);
       return;
@@ -590,6 +593,7 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
       return;
     }
     preparations.delete(requestId);
+    recordVoice({ requestId, stage: "synthesis", state: "success", metrics: prepared.metrics });
     if (owner.activeRequestId && owner.activeRequestId !== requestId) cancelVoiceSpeech(window, "superseded", owner.activeRequestId);
     owner.activeRequestId = requestId;
     owner.activeKind = "response";
@@ -624,7 +628,7 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
     metrics: { responseDispatchToSynthesisMs: speechTiming?.responseDispatchedAt === undefined ? null
       : Math.max(0, performance.now() - speechTiming.responseDispatchedAt) } });
   emitSpeechEvent(window, { requestId, state: "preparing" });
-  try { await owner.speaker.speak(text, { style: "normal", persist: false }); }
+  try { await owner.speaker.speak(spokenText, { style: "normal", persist: false }); }
   catch {
     speechTimingByRequest.delete(requestId);
     if (owner.activeRequestId === requestId) {
