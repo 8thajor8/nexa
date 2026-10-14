@@ -86,6 +86,21 @@ test('follow-up diagnostics retain only an allowlisted outcome and bounded durat
     assert.equal(diagnostics.snapshot().voice.last.followupOutcome, null);
 });
 
+test('chat voice timing preserves allowlisted ACK lifecycle phases without message content', () => {
+    const diagnostics = createOperationalDiagnostics();
+    diagnostics.recordVoiceOperation({ requestId: 'safe-request-ack', stage: 'acknowledgement', state: 'started',
+        durationMs: 2000, chatTimingOrigin: 'typed', chatTimingPhase: 'ack_timer_expired', message: 'private message' });
+    const report = JSON.parse(createTechnicalDiagnosticReport(diagnostics.snapshot(), 'voice'));
+    assert.equal(report.voice.last.stage, 'acknowledgement');
+    assert.equal(report.voice.last.state, 'started');
+    assert.equal(report.voice.last.chatTimingOrigin, 'typed');
+    assert.equal(report.voice.last.chatTimingPhase, 'ack_timer_expired');
+    assert.doesNotMatch(JSON.stringify(report), /private message/u);
+    diagnostics.recordVoiceOperation({ requestId: 'safe-request-ack', stage: 'acknowledgement', state: 'started',
+        chatTimingOrigin: 'typed', chatTimingPhase: 'private message' });
+    assert.equal(diagnostics.snapshot().voice.last.chatTimingPhase, null);
+});
+
 test('Voice diagnostic is Spanish, Voice-only, and preserves observed follow-up and playback timing', () => {
     const diagnostics = createOperationalDiagnostics({ memoryMode: 'memory2-readonly' });
     diagnostics.recordVoiceOperation({ requestId: 'safe-request-1', stage: 'followup', state: 'success',

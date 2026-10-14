@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import type { AuthorizationProvider, ChatAuthorizationRequirement, ChatEventEnvelope, ChatIpcErrorCode, DesktopMemoryMode,
   DesktopMemoryModeResult, SpotifyLiveStatus, SpotifyPlaybackControl, SpotifyNowPlayingCard, VoiceSpeechErrorCode,
-  VoiceSpeechEvent, WeatherCurrentStatus } from "../shared/ipc-contract";
+  VoiceSpeechEvent, VoiceChatTimingOrigin, VoiceChatTimingPhase, WeatherCurrentStatus } from "../shared/ipc-contract";
 import { ASSISTANT_STATE_LABELS, createMockAssistantStateProvider } from "../shared/assistant-state";
 import { loadDesktopPreferences, saveDesktopPreferences, type DesktopPreferences } from "./desktop-preferences";
 import type { PttVoiceControllerPort, PttVoiceSnapshot, PttVoiceStatus } from "./voice/ptt-voice-controller";
@@ -110,6 +110,8 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const knownChatRequests = useRef(new Set<string>());
   const terminalChatRequests = useRef(new Set<string>());
   const acknowledgementTimers = useRef(new Map<string, number>());
+  const chatTimingByRequest = useRef(new Map<string, { origin: VoiceChatTimingOrigin; startedAt: number;
+    acceptedAt?: number; finalAt?: number; acknowledgementAt?: number; acknowledgementTimerStartedAt?: number; rendered?: boolean }>());
   const voiceChatRequests = useRef(new Set<string>());
   const completedVoiceChatRequests = useRef(new Set<string>());
   const originalRequestTexts = useRef(new Map<string, string>());
@@ -122,6 +124,11 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const typedVoiceFinalSpeechRequests = useRef(new Set<string>());
   const voiceRepliesEnabledRef = useRef(preferences.voiceRepliesEnabled);
   voiceRepliesEnabledRef.current = preferences.voiceRepliesEnabled;
+  const reportChatTiming = useCallback((requestId: string, origin: VoiceChatTimingOrigin,
+    phase: VoiceChatTimingPhase, durationMs?: number) => {
+    void window.nexaDesktop.voice.recordChatTiming({ requestId, origin, phase,
+      ...(typeof durationMs === "number" ? { durationMs: Math.max(0, durationMs) } : {}) }).catch(() => undefined);
+  }, []);
   const cancellingVoiceSpeechRequests = useRef(new Set<string>());
   const cancellationInFlight = useRef(false);
   const seenTranscriptKeys = useRef(new Set<string>());
@@ -257,6 +264,11 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     for (const previousRequestId of typedVoiceReplyRequests.current) {
       const timer = acknowledgementTimers.current.get(previousRequestId);
       if (timer !== undefined) window.clearTimeout(timer);
+      const timing = chatTimingByRequest.current.get(previousRequestId);
+      if (timer !== undefined && timing?.acknowledgementTimerStartedAt !== undefined && timing.acknowledgementAt === undefined) {
+        reportChatTiming(previousRequestId, timing.origin, "ack_timer_cancelled_superseded",
+          performance.now() - timing.acknowledgementTimerStartedAt);
+      }
       acknowledgementTimers.current.delete(previousRequestId);
       void window.nexaDesktop.voice.speech.cancel({ requestId: previousRequestId }).catch(() => undefined)
         .finally(() => { void window.nexaDesktop.voice.endDucking(previousRequestId, "stop").catch(() => false); });
@@ -271,13 +283,32 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     knownChatRequests.current.add(requestId);
     originalRequestTexts.current.set(requestId, text);
     activeChatRequest.current = requestId;
+    const timingOrigin: VoiceChatTimingOrigin = source;
+    const timingStartedAt = performance.now();
+    const timingEnabled = source === "voice" || voiceRepliesEnabledRef.current;
+    if (timingEnabled) {
+      chatTimingByRequest.current.set(requestId, { origin: timingOrigin, startedAt: timingStartedAt });
+      while (chatTimingByRequest.current.size > 24) chatTimingByRequest.current.delete(chatTimingByRequest.current.keys().next().value!);
+      reportChatTiming(requestId, timingOrigin, "request_started");
+    }
     setChatMessages((current) => [...current, message].slice(-MAX_CHAT_HISTORY));
     setChatNotice(null);
     if (source === "voice") {
       voiceChatRequests.current.add(requestId);
       followupEligibleRequests.current.add(requestId);
+      const timerStartedAt = performance.now();
+      const timing = chatTimingByRequest.current.get(requestId);
+      if (timing) {
+        timing.acknowledgementTimerStartedAt = timerStartedAt;
+        reportChatTiming(requestId, timing.origin, "ack_timer_started", VOICE_ACKNOWLEDGEMENT_DELAY_MS);
+      }
       const timer = window.setTimeout(() => {
         acknowledgementTimers.current.delete(requestId);
+        const timing = chatTimingByRequest.current.get(requestId);
+        if (timing) {
+          timing.acknowledgementAt = performance.now();
+          reportChatTiming(requestId, timing.origin, "ack_timer_expired", timing.acknowledgementAt - timerStartedAt);
+        }
         const completed = completedVoiceChatRequests.current.has(requestId);
         if (!voiceChatRequests.current.has(requestId) || (!completed && activeChatRequest.current !== requestId)
           || (terminalChatRequests.current.has(requestId) && !completed)) return;
@@ -286,8 +317,17 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       acknowledgementTimers.current.set(requestId, timer);
     } else if (voiceRepliesEnabledRef.current) {
       typedVoiceReplyRequests.current.add(requestId);
+      const timerStartedAt = performance.now();
+      const timing = chatTimingByRequest.current.get(requestId);
+      if (timing) timing.acknowledgementTimerStartedAt = timerStartedAt;
+      reportChatTiming(requestId, "typed", "ack_timer_started", TYPED_VOICE_ACKNOWLEDGEMENT_DELAY_MS);
       const timer = window.setTimeout(() => {
         acknowledgementTimers.current.delete(requestId);
+        const timing = chatTimingByRequest.current.get(requestId);
+        if (timing) {
+          timing.acknowledgementAt = performance.now();
+          reportChatTiming(requestId, timing.origin, "ack_timer_expired", timing.acknowledgementAt - timerStartedAt);
+        }
         if (!typedVoiceReplyRequests.current.has(requestId) || !voiceRepliesEnabledRef.current
           || activeChatRequest.current !== requestId || terminalChatRequests.current.has(requestId)) return;
         void window.nexaDesktop.voice.speech.acknowledge({ requestId }).catch(() => undefined);
@@ -299,6 +339,9 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         conversationId: chatConversationId, requestId, text, source,
       });
       if (!response.ok) {
+        const timing = chatTimingByRequest.current.get(requestId);
+        if (timing) { reportChatTiming(requestId, timing.origin, "ack_timer_cancelled_terminal", performance.now() - timing.startedAt);
+          chatTimingByRequest.current.delete(requestId); }
         const timer = acknowledgementTimers.current.get(requestId);
         if (timer !== undefined) window.clearTimeout(timer);
         acknowledgementTimers.current.delete(requestId);
@@ -314,10 +357,19 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
           : entry));
         setChatNotice(CHAT_ERROR_MESSAGES[response.error.code] ?? "No se pudo enviar el mensaje.");
       } else {
+        const timing = chatTimingByRequest.current.get(requestId);
+        if (timing) {
+          timing.acceptedAt = performance.now();
+          reportChatTiming(requestId, timing.origin, "runtime_processing_started", timing.acceptedAt - timing.startedAt);
+          if (timing.finalAt !== undefined) reportChatTiming(requestId, timing.origin, "runtime_to_final", timing.finalAt - timing.acceptedAt);
+        }
         setChatMessages((current) => current.map((entry) => entry.requestId === requestId && entry.status === "sending"
           ? { ...entry, status: "processing" } : entry));
       }
     } catch {
+      const timing = chatTimingByRequest.current.get(requestId);
+      if (timing) { reportChatTiming(requestId, timing.origin, "ack_timer_cancelled_terminal", performance.now() - timing.startedAt);
+        chatTimingByRequest.current.delete(requestId); }
       const timer = acknowledgementTimers.current.get(requestId);
       if (timer !== undefined) window.clearTimeout(timer);
       acknowledgementTimers.current.delete(requestId);
@@ -333,7 +385,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         : entry));
       setChatNotice("No se confirmó el envío. No se reintentó automáticamente.");
     }
-  }, [chatConversationId, followup]);
+  }, [chatConversationId, followup, reportChatTiming]);
   followupSubmit.current = (value) => {
     void submitChatMessage(value.text, "voice", value);
   };
@@ -362,6 +414,11 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     } else {
       if (acknowledgementTimer !== undefined) window.clearTimeout(acknowledgementTimer);
       acknowledgementTimers.current.delete(event.requestId);
+      const timing = chatTimingByRequest.current.get(event.requestId);
+      if (timing && event.status !== "completed") {
+        reportChatTiming(event.requestId, timing.origin, "ack_timer_cancelled_terminal", performance.now() - timing.startedAt);
+        chatTimingByRequest.current.delete(event.requestId);
+      }
       voiceChatRequests.current.delete(event.requestId);
       completedVoiceChatRequests.current.delete(event.requestId);
     }
@@ -369,7 +426,22 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     if (event.status === "completed" && typedVoiceReplyEligible) {
       if (acknowledgementTimer !== undefined) window.clearTimeout(acknowledgementTimer);
       acknowledgementTimers.current.delete(event.requestId);
+      const timing = chatTimingByRequest.current.get(event.requestId);
+      if (timing) {
+        timing.finalAt = performance.now();
+        if (timing.acknowledgementAt === undefined && timing.acknowledgementTimerStartedAt !== undefined) {
+          reportChatTiming(event.requestId, timing.origin, "ack_timer_cancelled_response",
+            timing.finalAt - timing.acknowledgementTimerStartedAt);
+        }
+        reportChatTiming(event.requestId, timing.origin, "response_final_received", timing.finalAt - timing.startedAt);
+        if (timing.acceptedAt !== undefined) reportChatTiming(event.requestId, timing.origin, "runtime_to_final", timing.finalAt - timing.acceptedAt);
+        if (timing.acknowledgementAt !== undefined) reportChatTiming(event.requestId, timing.origin, "response_after_ack_timer",
+          timing.finalAt - timing.acknowledgementAt);
+      }
     } else if (event.status !== "completed" && typedVoiceReplyEligible) {
+      const timing = chatTimingByRequest.current.get(event.requestId);
+      if (timing) { reportChatTiming(event.requestId, timing.origin, "ack_timer_cancelled_terminal", performance.now() - timing.startedAt);
+        chatTimingByRequest.current.delete(event.requestId); }
       typedVoiceReplyRequests.current.delete(event.requestId);
       typedVoiceFinalSpeechRequests.current.delete(event.requestId);
       if (typedVoiceSpeechRequest.current === event.requestId) typedVoiceSpeechRequest.current = null;
@@ -383,6 +455,16 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     }
     if (activeChatRequest.current === event.requestId) activeChatRequest.current = null;
     if (event.status === "completed") {
+      if (!typedVoiceReplyEligible && fromVoice) {
+        const timing = chatTimingByRequest.current.get(event.requestId);
+        if (timing) {
+          timing.finalAt = performance.now();
+          reportChatTiming(event.requestId, timing.origin, "response_final_received", timing.finalAt - timing.startedAt);
+          if (timing.acceptedAt !== undefined) reportChatTiming(event.requestId, timing.origin, "runtime_to_final", timing.finalAt - timing.acceptedAt);
+          if (timing.acknowledgementAt !== undefined) reportChatTiming(event.requestId, timing.origin, "response_after_ack_timer",
+            timing.finalAt - timing.acknowledgementAt);
+        }
+      }
       const responseMessage: ConversationChatMessage = {
         id: `${event.requestId}:response`, requestId: event.requestId, conversationId: event.conversationId,
         role: "assistant", text: event.response, source: "typed", status: "completed", createdAt: Date.now(),
@@ -420,7 +502,18 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         ? { ...entry, status: "error", error: message } : entry));
       setChatNotice(message);
     }
-  }, []);
+  }, [reportChatTiming]);
+
+  useLayoutEffect(() => {
+    for (const message of chatMessages) {
+      if (message.role !== "assistant" || !message.requestId) continue;
+      const timing = chatTimingByRequest.current.get(message.requestId);
+      if (!timing || timing.finalAt === undefined || timing.rendered) continue;
+      timing.rendered = true;
+      reportChatTiming(message.requestId, timing.origin, "response_rendered", performance.now() - timing.finalAt);
+      chatTimingByRequest.current.delete(message.requestId);
+    }
+  }, [chatMessages, reportChatTiming]);
 
   const connectAuthorization = useCallback(async (provider: AuthorizationProvider, requestId: string) => {
     setAuthorizationAttempts((current) => ({ ...current, [requestId]: { state: "connecting" } }));
@@ -482,6 +575,11 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         const timer = acknowledgementTimers.current.get(event.requestId);
         if (timer !== undefined) window.clearTimeout(timer);
         acknowledgementTimers.current.delete(event.requestId);
+        const timing = chatTimingByRequest.current.get(event.requestId);
+        if (timer !== undefined && timing?.acknowledgementTimerStartedAt !== undefined && timing.acknowledgementAt === undefined) {
+          reportChatTiming(event.requestId, timing.origin, "ack_timer_cancelled_response",
+            performance.now() - timing.acknowledgementTimerStartedAt);
+        }
         voiceChatRequests.current.delete(event.requestId);
         completedVoiceChatRequests.current.delete(event.requestId);
         setVoiceSpeechStatus({ requestId: event.requestId, state: "speaking" });
@@ -538,7 +636,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         }
       }
     });
-  }, [followup]);
+  }, [followup, reportChatTiming]);
 
   useEffect(() => () => {
     void followup.stop();
@@ -552,6 +650,11 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     const timer = acknowledgementTimers.current.get(requestId);
     if (timer !== undefined) window.clearTimeout(timer);
     acknowledgementTimers.current.delete(requestId);
+    const timing = chatTimingByRequest.current.get(requestId);
+    if (timer !== undefined && timing?.acknowledgementTimerStartedAt !== undefined && timing.acknowledgementAt === undefined) {
+      reportChatTiming(requestId, timing.origin, "ack_timer_cancelled_terminal",
+        performance.now() - timing.acknowledgementTimerStartedAt);
+    }
     voiceChatRequests.current.delete(requestId);
     completedVoiceChatRequests.current.delete(requestId);
     if (cancellingVoiceSpeechRequests.current.has(requestId)) return;
@@ -569,7 +672,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       cancellingVoiceSpeechRequests.current.delete(requestId);
       setVoiceSpeechStatus({ requestId, state: "error", message: "No se pudo solicitar la interrupción del audio." });
     }
-  }, []);
+  }, [reportChatTiming]);
 
   useEffect(() => {
     if (isIsolated) {
@@ -623,9 +726,14 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       || (voiceStatus === "error" && !voiceController.getSnapshot().canStart && Boolean(voiceController.getSnapshot().sessionId));
     if (!requestId && !speechRequestId && !captureActive && !followup.getSnapshot()) return;
     followupEligibleRequests.current.clear();
+    const requestTiming = requestId ? chatTimingByRequest.current.get(requestId) : undefined;
+    if (requestId && requestTiming) reportChatTiming(requestId, requestTiming.origin, "stop_requested",
+      performance.now() - requestTiming.startedAt);
     if (speechRequestId && typedVoiceReplyRequests.current.has(speechRequestId)) {
       const timer = acknowledgementTimers.current.get(speechRequestId);
       if (timer !== undefined) window.clearTimeout(timer);
+      const timing = chatTimingByRequest.current.get(speechRequestId);
+      if (timing) reportChatTiming(speechRequestId, timing.origin, "stop_requested", performance.now() - timing.startedAt);
       acknowledgementTimers.current.delete(speechRequestId);
       typedVoiceReplyRequests.current.delete(speechRequestId);
       typedVoiceFinalSpeechRequests.current.delete(speechRequestId);
@@ -671,7 +779,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       cancellationInFlight.current = false;
       setCancellationPending(false);
     }
-  }, [cancelVoiceSpeech, voiceController, followup]);
+  }, [cancelVoiceSpeech, voiceController, followup, reportChatTiming]);
 
   useEffect(() => {
     if (voiceSnapshot.status === "starting" || voiceSnapshot.status === "listening") {

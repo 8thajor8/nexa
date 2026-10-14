@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   VOICE_EVENT_CHANNEL,
   VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL,
+  VOICE_CHAT_TIMING_DIAGNOSTIC_CHANNEL,
   VOICE_DUCKING_END_CHANNEL,
   VOICE_SPEECH_EVENT_CHANNEL,
   VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL,
@@ -238,6 +239,25 @@ describe("Electron Main Voice IPC", () => {
     })).toThrow("invalid_voice_followup_diagnostic_request");
   });
 
+  it("accepts only bounded chat timing phases from the trusted renderer", () => {
+    const window = createWindow("chat-timing-diagnostics");
+    const diagnostics: Array<Record<string, unknown>> = [];
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => makeVoiceFactory() as never,
+      (event) => diagnostics.push(event as unknown as Record<string, unknown>));
+    const requestId = "00000000-0000-4000-8000-000000000058";
+    expect(invoke(VOICE_CHAT_TIMING_DIAGNOSTIC_CHANNEL, trustedEvent(window), {
+      requestId, origin: "typed", phase: "response_final_received", durationMs: 1_234,
+    })).toBe(true);
+    expect(diagnostics[0]).toMatchObject({ requestId, stage: "runtime", state: "success", durationMs: 1_234,
+      metrics: { chatTimingOrigin: "typed", chatTimingPhase: "response_final_received" } });
+    expect(() => invoke(VOICE_CHAT_TIMING_DIAGNOSTIC_CHANNEL, { sender: {}, senderFrame: { url: RENDERER_URL + "/" } }, {
+      requestId, origin: "typed", phase: "request_started",
+    })).toThrow("untrusted_voice_ipc_sender");
+    expect(() => invoke(VOICE_CHAT_TIMING_DIAGNOSTIC_CHANNEL, trustedEvent(window), {
+      requestId, origin: "typed", phase: "response_final_received", message: "private text",
+    })).toThrow("invalid_voice_chat_timing_diagnostic_request");
+  });
+
   it("starts ducking at PTT start, transfers it to the chat request, and restores on Stop", async () => {
     const window = createWindow("audio-ducking");
     const voice = makeVoiceFactory();
@@ -440,6 +460,37 @@ describe("Electron Main Voice IPC", () => {
     expect(JSON.stringify(diagnostics)).not.toContain("Otra respuesta de prueba");
   });
 
+  it("measures typed playback from the final response dispatch", async () => {
+    const window = createWindow("typed-speech-timing");
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    let idFactory = () => "";
+    const speaker = {
+      speak: vi.fn(async () => {
+        const event = { turnId: idFactory(), diagnostics: { metrics: { synthesisMs: 7 } } };
+        listeners.get("voice.speaking")?.(event);
+        listeners.get("voice.playback.started")?.({ ...event, diagnostics: { durationMs: 2 } });
+        listeners.get("voice.speech.completed")?.(event);
+        return { completed: true as const };
+      }),
+      cancel: vi.fn(() => true),
+      on: vi.fn((type: string, listener: (event: Record<string, unknown>) => void) => {
+        listeners.set(type, listener);
+        return () => listeners.delete(type);
+      }),
+    };
+    const api = { createVoiceSpeaker: vi.fn((options: { idFactory: () => string }) => { idFactory = options.idFactory; return speaker; }) };
+    const diagnostics: Array<Record<string, unknown>> = [];
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never,
+      (event) => diagnostics.push(event as unknown as Record<string, unknown>));
+    const requestId = "00000000-0000-4000-8000-000000000059";
+    markVoiceResponseDispatched(requestId, "typed");
+    await speakVoiceResponse(window as never, requestId, "Respuesta escrita hablada", "typed");
+    const playback = diagnostics.find((event) => event.stage === "playback" && event.state === "success"
+      && typeof (event.metrics as Record<string, unknown> | undefined)?.responseDispatchToPlaybackMs === "number");
+    expect(playback?.metrics).toMatchObject({ responseDispatchToPlaybackMs: expect.any(Number) });
+    expect(JSON.stringify(diagnostics)).not.toContain("Respuesta escrita hablada");
+  });
+
   it("remembers Stop received before the response speaker initializes and discards that late response", async () => {
     const window = createWindow("stop-before-speech-owner");
     const speaker = {
@@ -512,6 +563,7 @@ describe("Electron Main Voice IPC", () => {
       speakPrepared: vi.fn(() => {
         currentTurnId = idFactory(); playbackState = "playing"; order.push("ack-started");
         listeners.get("voice.speaking")?.({ turnId: currentTurnId });
+        listeners.get("voice.playback.started")?.({ turnId: currentTurnId });
         return new Promise<null>((resolve) => { finishAcknowledgement = () => { playbackState = "idle";
           listeners.get("voice.speech.cancelled")?.({ turnId: currentTurnId, reason: "superseded" }); resolve(null); }; });
       }),
@@ -519,6 +571,7 @@ describe("Electron Main Voice IPC", () => {
         currentTurnId = idFactory();
         expect(playbackState).toBe("idle");
         order.push("response-started");
+        listeners.get("voice.playback.started")?.({ turnId: currentTurnId });
         listeners.get("voice.speech.completed")?.({ turnId: currentTurnId });
         return { completed: true as const };
       }),
@@ -527,15 +580,23 @@ describe("Electron Main Voice IPC", () => {
         listeners.set(type, listener); return () => listeners.delete(type);
       }),
     };
-    const api = { createVoiceSpeaker: vi.fn(() => speaker) };
-    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never, undefined, async () => makeAudio());
     const requestId = "00000000-0000-4000-8000-000000000073";
+    const api = { createVoiceSpeaker: vi.fn((options: { idFactory: () => string }) => { idFactory = options.idFactory; return speaker; }) };
+    const diagnostics: Array<Record<string, unknown>> = [];
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never,
+      (event) => diagnostics.push(event as unknown as Record<string, unknown>), async () => makeAudio());
+    markVoiceResponseDispatched(requestId, "typed");
+    rememberTypedChatResponse(window as never, requestId, "Respuesta privada no registrada");
     await expect(invoke(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL, trustedEvent(window), { requestId }))
       .resolves.toEqual({ ok: true, requestId, accepted: true });
+    expect(diagnostics).toContainEqual(expect.objectContaining({ stage: "acknowledgement", state: "processing",
+      metrics: { chatTimingPhase: "response_final_available_before_ack", chatTimingOrigin: "typed" } }));
     await vi.waitFor(() => expect(speaker.speakPrepared).toHaveBeenCalledOnce());
     await speakVoiceResponse(window as never, requestId, "Respuesta principal");
     expect(order).toEqual(["ack-started", "ack-stopped", "response-started"]);
     expect(speaker.speak).toHaveBeenCalledOnce();
+    expect(diagnostics).toContainEqual(expect.objectContaining({ stage: "playback", state: "started",
+      metrics: expect.objectContaining({ responseDispatchToPlaybackMs: expect.any(Number) }) }));
   });
 
   it("does not expose an intermediate acknowledgement error as a failed final reply", async () => {

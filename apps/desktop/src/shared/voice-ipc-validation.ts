@@ -12,6 +12,7 @@ import type {
   VoiceSpeechCancelResponse,
   VoiceSpeechAcknowledgementRequest,
   VoiceSpeechAcknowledgementResponse,
+  VoiceChatTimingDiagnosticRequest,
   VoiceSpeechEvent,
   VoiceFollowupDiagnosticRequest,
 } from "./ipc-contract.js";
@@ -122,6 +123,20 @@ export function isVoiceFollowupDiagnosticRequest(value: unknown): value is Voice
   return hasExactKeys(value, keys) && isVoiceId(value.requestId) && outcomes.includes(String(value.outcome))
     && (!Object.hasOwn(value, "durationMs") || (Number.isFinite(value.durationMs)
       && typeof value.durationMs === "number" && value.durationMs >= 0 && value.durationMs <= 60_000));
+}
+
+export function isVoiceChatTimingDiagnosticRequest(value: unknown): value is VoiceChatTimingDiagnosticRequest {
+  if (!isPlainRecord(value)) return false;
+  const keys = ["requestId", "origin", "phase", ...(Object.hasOwn(value, "durationMs") ? ["durationMs"] : [])];
+  const origins = ["typed", "voice"];
+  const phases = ["request_started", "runtime_processing_started", "response_final_received", "response_rendered",
+    "ack_timer_started", "ack_timer_expired", "ack_timer_cancelled_response", "ack_timer_cancelled_terminal",
+    "ack_timer_cancelled_superseded", "stop_requested", "response_arrived_during_ack", "response_after_ack_timer",
+    "response_final_available_before_ack", "ack_release_wait", "runtime_to_final"];
+  return hasExactKeys(value, keys) && isVoiceId(value.requestId) && origins.includes(String(value.origin))
+    && phases.includes(String(value.phase))
+    && (!Object.hasOwn(value, "durationMs") || (typeof value.durationMs === "number"
+      && Number.isFinite(value.durationMs) && value.durationMs >= 0 && value.durationMs <= 600_000));
 }
 
 export function isVoiceSpeechAcknowledgementResponse(value: unknown): value is VoiceSpeechAcknowledgementResponse {

@@ -99,6 +99,7 @@ beforeEach(async () => {
       onEvent: vi.fn((listener) => { chatListeners.add(listener); return () => chatListeners.delete(listener); }),
     },
     voice: {
+      recordChatTiming: vi.fn(async () => true),
       endDucking: vi.fn(async () => true),
       ptt: {
         start: vi.fn(async () => ({ ok: false, requestId: "unused", error: { code: "invalid_request", message: "unused" } })),
@@ -379,6 +380,8 @@ describe("App PTT DOM integration", () => {
       expect(bridge.voice.speech.acknowledge).toHaveBeenCalledOnce();
       expect(bridge.voice.speech.acknowledge).toHaveBeenCalledWith({ requestId: request.requestId });
       expect(bridge.voice.ptt.start).not.toHaveBeenCalled();
+      expect(bridge.voice.recordChatTiming).toHaveBeenCalledWith(expect.objectContaining({ requestId: request.requestId,
+        origin: "typed", phase: "ack_timer_expired", durationMs: expect.any(Number) }));
 
       act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "preparing" })));
       act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "speaking" })));
@@ -404,6 +407,47 @@ describe("App PTT DOM integration", () => {
       await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
       expect(bridge.voice.speech.acknowledge).not.toHaveBeenCalled();
       expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledOnce();
+      expect(bridge.voice.recordChatTiming).toHaveBeenCalledWith(expect.objectContaining({ requestId: request.requestId,
+        origin: "typed", phase: "ack_timer_cancelled_response", durationMs: expect.any(Number) }));
+      expect(bridge.voice.recordChatTiming).toHaveBeenCalledWith(expect.objectContaining({ requestId: request.requestId,
+        origin: "typed", phase: "response_rendered", durationMs: expect.any(Number) }));
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("cancels the typed ACK when the final event arrives just before its threshold", async () => {
+    vi.useFakeTimers();
+    try {
+      await mountApp();
+      fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
+      fireEvent.change(screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" }), { target: { value: "Casi al límite" } });
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
+      await act(async () => { await Promise.resolve(); });
+      const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_999); });
+      act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+        requestId: request.requestId, status: "completed", response: "Llegó antes del límite" })));
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(bridge.voice.speech.acknowledge).not.toHaveBeenCalled();
+      expect(bridge.voice.recordChatTiming).toHaveBeenCalledWith(expect.objectContaining({ requestId: request.requestId,
+        origin: "typed", phase: "ack_timer_cancelled_response" }));
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("records when the ACK timer wins a same-turn race with delivery of the final event", async () => {
+    vi.useFakeTimers();
+    try {
+      await mountApp();
+      fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
+      fireEvent.change(screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" }), { target: { value: "Carrera de límite" } });
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
+      await act(async () => { await Promise.resolve(); });
+      const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+      expect(bridge.voice.speech.acknowledge).toHaveBeenCalledOnce();
+      act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+        requestId: request.requestId, status: "completed", response: "La respuesta ya estaba lista" })));
+      expect(bridge.voice.recordChatTiming).toHaveBeenCalledWith(expect.objectContaining({ requestId: request.requestId,
+        origin: "typed", phase: "response_after_ack_timer" }));
     } finally { vi.useRealTimers(); }
   });
 

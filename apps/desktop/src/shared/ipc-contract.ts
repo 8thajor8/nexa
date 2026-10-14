@@ -18,6 +18,7 @@ export const VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL = "voice:speech:acknowledgemen
 export const VOICE_SPEECH_CHAT_PLAY_CHANNEL = "voice:speech:chat-play" as const;
 export const VOICE_SPEECH_EVENT_CHANNEL = "voice:speech:event" as const;
 export const VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL = "voice:followup:diagnostic" as const;
+export const VOICE_CHAT_TIMING_DIAGNOSTIC_CHANNEL = "voice:chat-timing:diagnostic" as const;
 export const VOICE_DUCKING_END_CHANNEL = "voice:ducking:end" as const;
 export const CHAT_SEND_MESSAGE_CHANNEL = "chat:send-message" as const;
 export const CHAT_CANCEL_REQUEST_CHANNEL = "chat:cancel-request" as const;
@@ -328,11 +329,24 @@ export interface VoiceFollowupDiagnosticRequest {
   outcome: VoiceFollowupDiagnosticOutcome;
   durationMs?: number;
 }
+export type VoiceChatTimingOrigin = "typed" | "voice";
+export type VoiceChatTimingPhase = "request_started" | "runtime_processing_started" | "response_final_received"
+  | "response_rendered" | "ack_timer_started" | "ack_timer_expired" | "ack_timer_cancelled_response"
+  | "ack_timer_cancelled_terminal" | "ack_timer_cancelled_superseded" | "stop_requested"
+  | "response_arrived_during_ack" | "response_after_ack_timer" | "response_final_available_before_ack"
+  | "ack_release_wait" | "runtime_to_final";
+export interface VoiceChatTimingDiagnosticRequest {
+  requestId: string;
+  origin: VoiceChatTimingOrigin;
+  phase: VoiceChatTimingPhase;
+  durationMs?: number;
+}
 export interface VoiceDesktopApi {
   ptt: VoicePttApi;
   speech: VoiceSpeechApi;
   endDucking(requestId: string, reason?: "completed" | "followup_expired" | "stop" | "error"): Promise<boolean>;
   recordFollowupDiagnostic(request: VoiceFollowupDiagnosticRequest): Promise<boolean>;
+  recordChatTiming(request: VoiceChatTimingDiagnosticRequest): Promise<boolean>;
   onEvent: (listener: (event: VoiceEventEnvelope) => void) => () => void;
 }
 

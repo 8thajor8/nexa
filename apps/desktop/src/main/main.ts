@@ -710,6 +710,8 @@ function installWebContentsGuards(): void {
           desktopOperationalDiagnostics.recordVoiceOperation({ requestId: event.requestId, stage: event.stage, state: event.state,
             errorCode: event.errorCode, durationMs: event.durationMs, cancellation: event.cancellation,
             followupOutcome: typeof metrics.followupOutcome === "string" ? metrics.followupOutcome : null,
+            chatTimingPhase: typeof metrics.chatTimingPhase === "string" ? metrics.chatTimingPhase : null,
+            chatTimingOrigin: typeof metrics.chatTimingOrigin === "string" ? metrics.chatTimingOrigin : null,
             ...desktopVoiceConfiguration,
             durations: { ...(stageKey ? { [stageKey]: event.durationMs } : {}), synthesisMs, ttsSdkResponseMs, ttsBodyReadMs, identityProcessingMs,
               identityServerStartupMs, identityBrowserStartupMs, identityRendererPreparationMs, identityDspSetupMs,
@@ -783,7 +785,7 @@ function installWebContentsGuards(): void {
       onVoiceRequestTerminal: (requestId) => { releaseVoiceDuckingForRequest(requestId); },
       onVoiceResponse: (window, requestId, response) => { void speakVoiceResponse(window as never, requestId, response); },
       onTypedResponse: (window, requestId, response) => { rememberTypedChatResponse(window as never, requestId, response); },
-      onVoiceResponseDispatched: (requestId) => markVoiceResponseDispatched(requestId),
+      onResponseDispatched: (requestId, source) => markVoiceResponseDispatched(requestId, source),
       onVoiceRuntimeCompleted: (_window, requestId, durationMs) => {
         desktopOperationalDiagnostics.recordVoiceOperation({ requestId, stage: "runtime", state: "success", durationMs,
           ...desktopVoiceConfiguration, durations: { runtimeMs: durationMs } });

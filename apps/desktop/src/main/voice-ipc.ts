@@ -15,6 +15,7 @@ import {
   VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL,
   VOICE_SPEECH_CHAT_PLAY_CHANNEL,
   VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL,
+  VOICE_CHAT_TIMING_DIAGNOSTIC_CHANNEL,
   VOICE_DUCKING_END_CHANNEL,
   type VoiceEventEnvelope,
   type VoiceIpcErrorCode,
@@ -24,6 +25,7 @@ import {
   type VoiceSpeechEvent,
   type VoiceSpeechAcknowledgementRequest,
   type VoiceSpeechErrorCode,
+  type VoiceChatTimingDiagnosticRequest,
 } from "../shared/ipc-contract.js";
 import { prepareSpokenText } from "./spoken-text.js";
 import {
@@ -35,6 +37,7 @@ import {
   isVoiceSpeechCancelRequest,
   isVoiceSpeechAcknowledgementRequest,
   isVoiceFollowupDiagnosticRequest,
+  isVoiceChatTimingDiagnosticRequest,
   isVoiceSpeechEvent,
 } from "../shared/voice-ipc-validation.js";
 import { isTrustedIpcSender } from "../shared/ipc-security.js";
@@ -194,7 +197,7 @@ export function releaseVoiceDuckingExcept(requestId: string | null): void {
 }
 const perWindowSequence = new WeakMap<VoiceIpcWindow, number>();
 let cachedVoiceApi: Promise<PublicVoiceApi> | null = null;
-type SpeechTiming = { startedAt: number; responseDispatchedAt?: number; synthesisStartedAt?: number;
+type SpeechTiming = { startedAt: number; origin?: "typed" | "voice"; responseDispatchedAt?: number; synthesisStartedAt?: number;
   audioReadyAt?: number; playbackStartedAt?: number; completed?: boolean; completedMetrics?: Record<string, unknown> };
 const speechTimingByRequest = new Map<string, SpeechTiming>();
 
@@ -216,11 +219,13 @@ function correlatedSpeechMetrics(timing: SpeechTiming): Record<string, number | 
   };
 }
 
-/** Marks Main's successful delivery of a final voice response to the Renderer. */
-export function markVoiceResponseDispatched(requestId: string): void {
-  const timing = speechTimingByRequest.get(requestId);
-  if (!timing) return;
-  timing.responseDispatchedAt = performance.now();
+/** Marks Main's successful delivery of a final chat response to the Renderer. */
+export function markVoiceResponseDispatched(requestId: string, origin: "typed" | "voice" = "voice"): void {
+  const dispatchedAt = performance.now();
+  const timing = speechTimingByRequest.get(requestId) ?? { startedAt: dispatchedAt, origin };
+  timing.origin = origin;
+  timing.responseDispatchedAt = dispatchedAt;
+  rememberSpeechTiming(requestId, timing);
   if (timing.playbackStartedAt !== undefined) {
     recordVoice({ requestId, stage: "playback", state: timing.completed ? "success" : "processing",
       durationMs: timing.completed ? Math.max(0, timing.playbackStartedAt - timing.responseDispatchedAt) : null,
@@ -347,7 +352,8 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
         owner.speaker.on("voice.speaking", (event) => {
           if (typeof event.turnId !== "string") return;
           const details = event.diagnostics as Record<string, unknown> | undefined;
-          const timing = speechTimingByRequest.get(event.turnId);
+          const isAcknowledgement = owner.acknowledgementEnd?.requestId === event.turnId;
+          const timing = isAcknowledgement ? undefined : speechTimingByRequest.get(event.turnId);
           const audioReadyAt = performance.now();
           if (timing) timing.audioReadyAt = audioReadyAt;
           recordVoice({ requestId: event.turnId, stage: "playback", state: "processing",
@@ -358,6 +364,10 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
         owner.speaker.on("voice.playback.started", (event) => {
           if (typeof event.turnId !== "string") return;
           emitSpeechEvent(window, { requestId: event.turnId, state: "speaking" });
+          if (owner.acknowledgementEnd?.requestId === event.turnId) {
+            recordVoice({ requestId: event.turnId, stage: "acknowledgement", state: "started" });
+            return;
+          }
           const timing = speechTimingByRequest.get(event.turnId);
           const playbackStartedAt = performance.now();
           if (!timing) return;
@@ -388,7 +398,7 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
           if (responseStillActive) owner.activeKind = "response_preparing";
           else if (!acknowledgementStillActive) emitSpeechEvent(window, { requestId: event.turnId, state: "completed" });
           const details = event.diagnostics as Record<string, unknown> | undefined;
-          const timing = speechTimingByRequest.get(event.turnId);
+          const timing = acknowledgementCompleted ? undefined : speechTimingByRequest.get(event.turnId);
           const completedMetrics = details?.metrics && typeof details.metrics === "object"
             ? details.metrics as Record<string, unknown> : {};
           if (timing) {
@@ -399,7 +409,7 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
             durationMs: typeof details?.durationMs === "number" ? details.durationMs : null,
             metrics: timing ? { ...completedMetrics, ...correlatedSpeechMetrics(timing) }
               : details?.metrics && typeof details.metrics === "object" ? completedMetrics : null });
-          if (timing?.responseDispatchedAt !== undefined) speechTimingByRequest.delete(event.turnId);
+          if (!acknowledgementCompleted && timing?.responseDispatchedAt !== undefined) speechTimingByRequest.delete(event.turnId);
           if (owner.activeRequestId === event.turnId) {
             if (!responseStillActive) { owner.activeRequestId = null; owner.activeKind = null; }
           }
@@ -415,7 +425,7 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
           }
           if (acknowledgementCancelled) recordVoice({ requestId: event.turnId, stage: "acknowledgement", state: "cancelled",
             cancellation: typeof event.reason === "string" ? event.reason : "unknown" });
-          speechTimingByRequest.delete(event.turnId);
+          if (!acknowledgementCancelled) speechTimingByRequest.delete(event.turnId);
           if (responseStillActive) owner.activeKind = "response_preparing";
           else emitSpeechEvent(window, { requestId: event.turnId, state: "cancelled" });
           recordVoice({ requestId: event.turnId, stage: typeof event.phase === "string" && event.phase === "speaking" ? "playback" : "synthesis",
@@ -433,7 +443,7 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
           }
           if (acknowledgementFailed) recordVoice({ requestId: event.turnId, stage: "acknowledgement", state: "error",
             errorCode: safeSpeechErrorCode((event.error as Record<string, unknown> | undefined)?.code) });
-          speechTimingByRequest.delete(event.turnId);
+          if (!acknowledgementFailed) speechTimingByRequest.delete(event.turnId);
           const error = event.error as Record<string, unknown> | undefined;
           if (responseStillActive) owner.activeKind = "response_preparing";
           else emitSpeechEvent(window, { requestId: event.turnId, state: "error",
@@ -554,8 +564,10 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
     releaseVoiceDucking(window, requestId, "error");
     return;
   }
-  recordVoice({ requestId, stage: "playback", state: "requested", metrics: { origin } });
-  rememberSpeechTiming(requestId, { startedAt: performance.now() });
+  recordVoice({ requestId, stage: "playback", state: "requested", metrics: { origin, chatTimingOrigin: origin } });
+  const timing = speechTimingByRequest.get(requestId);
+  rememberSpeechTiming(requestId, { ...(timing ?? {}), startedAt: timing?.startedAt ?? performance.now(), origin,
+    ...(timing?.responseDispatchedAt !== undefined ? { responseDispatchedAt: timing.responseDispatchedAt } : {}) });
   let owner: VoiceSpeechOwner;
   const ownerPreparationStartedAt = performance.now();
   try { owner = await getSpeechOwner(window, loader); }
@@ -568,6 +580,10 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
   }
   recordVoice({ requestId, stage: "synthesis", state: "processing", durationMs: performance.now() - ownerPreparationStartedAt,
     metrics: { speechInitializationMs: performance.now() - ownerPreparationStartedAt } });
+  if (owner.activeKind === "acknowledgement" && owner.activeRequestId) {
+    recordVoice({ requestId, stage: "acknowledgement", state: "processing", metrics: {
+      chatTimingOrigin: origin, chatTimingPhase: "response_arrived_during_ack" } });
+  }
   if (owner.stoppedRequestIds.has(requestId)) {
     speechTimingByRequest.delete(requestId);
     emitSpeechEvent(window, { requestId, state: "cancelled" });
@@ -628,9 +644,13 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
     if (owner.activeKind === "acknowledgement" && owner.activeRequestId) {
       const acknowledgementRequestId = owner.activeRequestId;
       const acknowledgementEnd = owner.acknowledgementEnd;
+      const acknowledgementWaitStartedAt = performance.now();
       if (acknowledgementRequestId === requestId) await stopAcknowledgementForResponse(owner, requestId);
       else cancelVoiceSpeech(window, "superseded", acknowledgementRequestId);
       if (acknowledgementEnd?.requestId === acknowledgementRequestId) await acknowledgementEnd.promise;
+      recordVoice({ requestId, stage: "runtime", state: "processing",
+        durationMs: performance.now() - acknowledgementWaitStartedAt,
+        metrics: { chatTimingOrigin: origin, chatTimingPhase: "ack_release_wait" } });
     }
     if (owner.stoppedRequestIds.has(requestId) || controller.signal.aborted || window.isDestroyed()) {
       preparations.delete(requestId);
@@ -659,8 +679,12 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
   if (owner.activeKind === "acknowledgement" && owner.activeRequestId) {
     const acknowledgementRequestId = owner.activeRequestId;
     const acknowledgementEnd = owner.acknowledgementEnd;
+    const acknowledgementWaitStartedAt = performance.now();
     cancelVoiceSpeech(window, "superseded", acknowledgementRequestId);
     if (acknowledgementEnd?.requestId === acknowledgementRequestId) await acknowledgementEnd.promise;
+    recordVoice({ requestId, stage: "runtime", state: "processing",
+      durationMs: performance.now() - acknowledgementWaitStartedAt,
+      metrics: { chatTimingOrigin: origin, chatTimingPhase: "ack_release_wait" } });
   }
   if (owner.activeRequestId && owner.activeRequestId !== requestId) owner.speaker.cancel("superseded");
   if (owner.stoppedRequestIds.has(requestId)) return;
@@ -830,6 +854,7 @@ export function registerVoiceIpcHandlers(
   ipcMain.removeHandler(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL);
   ipcMain.removeHandler(VOICE_SPEECH_CHAT_PLAY_CHANNEL);
   ipcMain.removeHandler(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL);
+  ipcMain.removeHandler(VOICE_CHAT_TIMING_DIAGNOSTIC_CHANNEL);
   ipcMain.removeHandler(VOICE_DUCKING_END_CHANNEL);
 
   ipcMain.handle(VOICE_PTT_START_CHANNEL, async (event: IpcMainInvokeEvent, payload: unknown) => {
@@ -993,6 +1018,10 @@ export function registerVoiceIpcHandlers(
     if (!isTrustedVoiceSender(event, window, expectedRendererUrl)) throw new Error("untrusted_voice_ipc_sender");
     if (!isVoiceSpeechAcknowledgementRequest(payload)) throw new Error("invalid_voice_speech_acknowledgement_request");
     const request = payload as VoiceSpeechAcknowledgementRequest;
+    if (pendingTypedChatResponse.get(window)?.requestId === request.requestId) {
+      recordVoice({ requestId: request.requestId, stage: "acknowledgement", state: "processing",
+        metrics: { chatTimingPhase: "response_final_available_before_ack", chatTimingOrigin: "typed" } });
+    }
     return { ok: true as const, requestId: request.requestId,
       accepted: await speakVoiceAcknowledgement(window, request.requestId, async () => {
         if (duckingRequestByWindow.get(window) === request.requestId) return;
@@ -1028,6 +1057,22 @@ export function registerVoiceIpcHandlers(
     if (!isVoiceFollowupDiagnosticRequest(payload)) throw new Error("invalid_voice_followup_diagnostic_request");
     recordVoice({ requestId: payload.requestId, stage: "followup", state: "success", durationMs: payload.durationMs,
       metrics: { followupOutcome: payload.outcome } });
+    return true;
+  });
+
+  ipcMain.handle(VOICE_CHAT_TIMING_DIAGNOSTIC_CHANNEL, (event: IpcMainInvokeEvent, payload: unknown) => {
+    const window = getMainWindow();
+    if (!isTrustedVoiceSender(event, window, expectedRendererUrl)) throw new Error("untrusted_voice_ipc_sender");
+    if (!isVoiceChatTimingDiagnosticRequest(payload)) throw new Error("invalid_voice_chat_timing_diagnostic_request");
+    const request = payload as VoiceChatTimingDiagnosticRequest;
+    const acknowledgementPhase = request.phase.startsWith("ack_") || ["response_arrived_during_ack", "response_after_ack_timer",
+      "response_final_available_before_ack"].includes(request.phase);
+    const state = request.phase.endsWith("started") ? "started"
+      : request.phase === "ack_timer_expired" ? "processing"
+        : request.phase.includes("cancelled") || request.phase === "stop_requested" ? "cancelled"
+          : "success";
+    recordVoice({ requestId: request.requestId, stage: acknowledgementPhase ? "acknowledgement" : "runtime", state,
+      durationMs: request.durationMs, metrics: { chatTimingOrigin: request.origin, chatTimingPhase: request.phase } });
     return true;
   });
   ipcMain.handle(VOICE_DUCKING_END_CHANNEL, (event: IpcMainInvokeEvent, payload: unknown) => {
@@ -1070,6 +1115,7 @@ export function removeVoiceIpcHandlers(): void {
   ipcMain.removeHandler(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL);
   ipcMain.removeHandler(VOICE_SPEECH_CHAT_PLAY_CHANNEL);
   ipcMain.removeHandler(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL);
+  ipcMain.removeHandler(VOICE_CHAT_TIMING_DIAGNOSTIC_CHANNEL);
   ipcMain.removeHandler(VOICE_DUCKING_END_CHANNEL);
   for (const [window, speech] of speechOwners) {
     cancelVoiceSpeech(window, "session_ended");

@@ -31,6 +31,7 @@ import {
   WINDOW_SETTINGS_CHANGED_CHANNEL,
   VOICE_EVENT_CHANNEL,
   VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL,
+  VOICE_CHAT_TIMING_DIAGNOSTIC_CHANNEL,
   VOICE_DUCKING_END_CHANNEL,
   VOICE_SPEECH_CANCEL_CHANNEL,
   VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL,
@@ -64,6 +65,7 @@ import {
   isVoiceSpeechCancelResponse,
   isVoiceSpeechAcknowledgementRequest,
   isVoiceFollowupDiagnosticRequest,
+  isVoiceChatTimingDiagnosticRequest,
   isVoiceSpeechAcknowledgementResponse,
   isVoiceSpeechEvent,
 } from "./shared/voice-ipc-validation";
@@ -168,6 +170,10 @@ const api: NexaDesktopApi = {
     async recordFollowupDiagnostic(request) {
       if (!isVoiceFollowupDiagnosticRequest(request)) throw new Error("invalid_voice_followup_diagnostic_request");
       return await ipcRenderer.invoke(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL, request) === true;
+    },
+    async recordChatTiming(request) {
+      if (!isVoiceChatTimingDiagnosticRequest(request)) throw new Error("invalid_voice_chat_timing_diagnostic_request");
+      return await ipcRenderer.invoke(VOICE_CHAT_TIMING_DIAGNOSTIC_CHANNEL, request) === true;
     },
     async endDucking(requestId, reason = "completed") {
       if (!isVoiceId(requestId)) {
