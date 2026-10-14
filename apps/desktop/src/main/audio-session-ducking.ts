@@ -15,12 +15,34 @@ export interface AudioSessionSnapshot {
 }
 
 export interface AudioDuckingAdapter {
-  duck(rootProcessId: number, factor: number): Promise<{ sessions: AudioSessionSnapshot[]; failedSessions: number }>;
+  duck(rootProcessId: number, factor: number): Promise<{
+    sessions: AudioSessionSnapshot[];
+    failedSessions: number;
+    enumeratedSessions: number;
+    activeSessions: number;
+    excludedOwnedSessions: number;
+    excludedSystemSessions: number;
+    attemptedSessions: number;
+    changedSessions: number;
+    spotifySessionsFound: number;
+    spotifySessionsAttempted: number;
+    spotifySessionsChanged: number;
+  }>;
   restore(sessions: readonly AudioSessionSnapshot[]): Promise<{ restored: number; skipped: number; failedSessions: number }>;
 }
 
 export interface AudioDuckingDiagnostics {
-  (event: "started" | "restored" | "failed", details: Readonly<{ stage: "duck" | "restore"; code: string; sessionCount?: number }>): void;
+  (event: "requested" | "started" | "restored" | "failed", details: Readonly<{
+    stage: "duck" | "restore"; code: string; component?: "windows_core_audio"; endpointRole?: "default_render_multimedia";
+    errorStage?: string; sessionCount?: number;
+    enumeratedSessions?: number; activeSessions?: number; excludedOwnedSessions?: number; excludedSystemSessions?: number; attemptedSessions?: number;
+    changedSessions?: number; spotifySessionsFound?: number; spotifySessionsAttempted?: number;
+    spotifySessionsChanged?: number; failedSessions?: number; errorName?: string; errorCode?: number | string;
+  }>): void;
+}
+
+class AudioDuckingOperationError extends Error {
+  constructor(readonly safeCode: string, readonly errorName?: string, readonly errorCode?: number, readonly errorStage?: string) { super(safeCode); }
 }
 
 export function calculateDuckedVolume(originalVolume: number, factor = AUDIO_DUCKING_FACTOR): number {
@@ -49,8 +71,8 @@ export function createAudioSessionDucking(options: {
   let queue: Promise<void> = Promise.resolve();
   let disposed = false;
 
-  const report = (event: "started" | "restored" | "failed", stage: "duck" | "restore", code: string, sessionCount?: number) => {
-    try { diagnostics(event, { stage, code, ...(sessionCount === undefined ? {} : { sessionCount }) }); }
+  const report = (event: "requested" | "started" | "restored" | "failed", details: Parameters<AudioDuckingDiagnostics>[1]) => {
+    try { diagnostics(event, details); }
     catch { /* Diagnostics never affect Voice. */ }
   };
   const enqueue = (operation: () => Promise<void>): Promise<void> => {
@@ -66,26 +88,42 @@ export function createAudioSessionDucking(options: {
     if (!adapter || previous.length === 0) return;
     try {
       const result = await adapter.restore(previous);
-      report("restored", "restore", result.failedSessions > 0 ? "partial_restore" : "ok",
-        result.restored + result.skipped);
-    } catch {
-      report("failed", "restore", "restore_failed", previous.length);
+      report(result.failedSessions > 0 ? "failed" : "restored", {
+        stage: "restore", code: result.failedSessions > 0 ? "partial_restore" : "ok", component: "windows_core_audio",
+        sessionCount: previous.length, changedSessions: result.restored, failedSessions: result.failedSessions,
+      });
+    } catch (error) {
+      report("failed", { stage: "restore", code: safeOperationCode(error), component: "windows_core_audio",
+        errorStage: safeOperationStage(error), sessionCount: previous.length,
+        errorName: safeErrorName(error), errorCode: safeHResult(error) });
     }
   }
 
   async function begin(requestId: string): Promise<void> {
     if (disposed || platform !== "win32" || !adapter || typeof requestId !== "string" || !requestId) return;
     leases.add(requestId);
+    report("requested", { stage: "duck", code: "requested", component: "windows_core_audio",
+      endpointRole: "default_render_multimedia" });
     await enqueue(async () => {
       if (disposed || leases.size === 0 || snapshots !== null) return;
       try {
         const result = await adapter.duck(rootProcessId, AUDIO_DUCKING_FACTOR);
         snapshots = result.sessions;
-        report("started", "duck", result.failedSessions > 0 ? "partial_duck" : "ok", result.sessions.length);
+        report(result.failedSessions > 0 ? "failed" : "started", {
+          stage: "duck", code: result.failedSessions > 0 ? "partial_duck" : "ok", component: "windows_core_audio",
+          endpointRole: "default_render_multimedia",
+          sessionCount: result.sessions.length, enumeratedSessions: result.enumeratedSessions,
+          activeSessions: result.activeSessions, excludedOwnedSessions: result.excludedOwnedSessions,
+          excludedSystemSessions: result.excludedSystemSessions,
+          attemptedSessions: result.attemptedSessions, changedSessions: result.changedSessions,
+          spotifySessionsFound: result.spotifySessionsFound, spotifySessionsAttempted: result.spotifySessionsAttempted,
+          spotifySessionsChanged: result.spotifySessionsChanged, failedSessions: result.failedSessions,
+        });
         await restoreIfIdle();
-      } catch {
+      } catch (error) {
         snapshots = null;
-        report("failed", "duck", "duck_failed");
+        report("failed", { stage: "duck", code: safeOperationCode(error), component: "windows_core_audio",
+          errorStage: safeOperationStage(error), errorName: safeErrorName(error), errorCode: safeHResult(error) });
       }
     });
   }
@@ -141,7 +179,7 @@ function createWindowsCoreAudioAdapter(): AudioDuckingAdapter {
       current.output += chunk.toString("utf8");
       if (Buffer.byteLength(current.output, "utf8") > MAX_BRIDGE_OUTPUT_BYTES) {
         current.output = "";
-        failWorker(current, new Error("audio_duck_bridge_output_limit"));
+        failWorker(current, new AudioDuckingOperationError("audio_duck_bridge_output_limit", "OutputLimitError"));
         void sendCommand("restore", { sessions: [] }).catch(() => undefined);
         return;
       }
@@ -158,16 +196,19 @@ function createWindowsCoreAudioAdapter(): AudioDuckingAdapter {
               pending.delete(id);
               clearTimeout(item.timeout);
               if (reply.ok === true) item.resolve(reply);
-              else item.reject(new Error("core_audio_operation_failed"));
+              else item.reject(new AudioDuckingOperationError(
+                safeBridgeCode(reply.errorCode), safeBridgeErrorName(reply.errorName), safeBridgeHResult(reply.errorCodeValue),
+                safeBridgeStage(reply.errorStage)));
             }
           } catch { /* Invalid helper output is ignored; the bounded request timer handles it. */ }
         }
         newline = current.output.indexOf("\n");
       }
     });
-    child.once("error", () => failWorker(current, new Error("audio_duck_bridge_failed")));
+    child.once("error", (error: NodeJS.ErrnoException) => failWorker(current, new AudioDuckingOperationError(
+      error.code === "ENOENT" ? "powershell_unavailable" : "audio_duck_bridge_failed", "ProcessError")));
     child.once("close", () => {
-      failWorker(current, new Error("audio_duck_bridge_closed"));
+      failWorker(current, new AudioDuckingOperationError("audio_duck_bridge_closed", "ProcessClosedError"));
       current.resolveClosed();
     });
     return current;
@@ -179,7 +220,7 @@ function createWindowsCoreAudioAdapter(): AudioDuckingAdapter {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         pending.delete(requestId);
-        reject(new Error("audio_duck_bridge_timeout"));
+        reject(new AudioDuckingOperationError("audio_duck_bridge_timeout", "TimeoutError"));
         if (action === "duck") void sendCommand("restore", { sessions: [] }).catch(() => undefined);
       }, BRIDGE_TIMEOUT_MS);
       pending.set(requestId, { resolve, reject, timeout });
@@ -187,7 +228,7 @@ function createWindowsCoreAudioAdapter(): AudioDuckingAdapter {
       if (!input) {
         pending.delete(requestId);
         clearTimeout(timeout);
-        reject(new Error("audio_duck_bridge_failed"));
+        reject(new AudioDuckingOperationError("audio_duck_bridge_failed", "ProcessError"));
         return;
       }
       input.write(`${JSON.stringify({ ...values, action, requestId })}\n`, "utf8", (error) => {
@@ -196,7 +237,7 @@ function createWindowsCoreAudioAdapter(): AudioDuckingAdapter {
         if (!item) return;
         pending.delete(requestId);
         clearTimeout(item.timeout);
-        item.reject(new Error("audio_duck_bridge_failed"));
+        item.reject(new AudioDuckingOperationError("audio_duck_bridge_failed", "ProcessError"));
       });
     });
   }
@@ -218,7 +259,14 @@ function createWindowsCoreAudioAdapter(): AudioDuckingAdapter {
         const current = worker;
         if (current) await current.closed;
       }
-      return { sessions, failedSessions: safeCount(result.failedSessions) };
+      return {
+        sessions, failedSessions: safeCount(result.failedSessions), enumeratedSessions: safeCount(result.enumeratedSessions),
+        activeSessions: safeCount(result.activeSessions), excludedOwnedSessions: safeCount(result.excludedOwnedSessions),
+        excludedSystemSessions: safeCount(result.excludedSystemSessions),
+        attemptedSessions: safeCount(result.attemptedSessions), changedSessions: safeCount(result.changedSessions),
+        spotifySessionsFound: safeCount(result.spotifySessionsFound), spotifySessionsAttempted: safeCount(result.spotifySessionsAttempted),
+        spotifySessionsChanged: safeCount(result.spotifySessionsChanged),
+      };
     },
     async restore(sessions) {
       if (!worker) return { restored: 0, skipped: sessions.length, failedSessions: 0 };
@@ -229,6 +277,40 @@ function createWindowsCoreAudioAdapter(): AudioDuckingAdapter {
         failedSessions: safeCount(result.failedSessions) };
     },
   };
+}
+
+function safeOperationCode(error: unknown): string {
+  if (!(error instanceof AudioDuckingOperationError)) return "audio_duck_operation_failed";
+  return /^[a-z0-9_]{1,48}$/u.test(error.safeCode) ? error.safeCode : "audio_duck_operation_failed";
+}
+
+function safeErrorName(error: unknown): string | undefined {
+  return error instanceof AudioDuckingOperationError ? error.errorName : undefined;
+}
+
+function safeHResult(error: unknown): number | undefined {
+  return error instanceof AudioDuckingOperationError && Number.isInteger(error.errorCode) ? error.errorCode : undefined;
+}
+
+function safeOperationStage(error: unknown): string | undefined {
+  return error instanceof AudioDuckingOperationError ? error.errorStage : undefined;
+}
+
+function safeBridgeCode(value: unknown): string {
+  return typeof value === "string" && /^[a-z0-9_]{1,48}$/u.test(value) ? value : "core_audio_operation_failed";
+}
+
+function safeBridgeErrorName(value: unknown): string | undefined {
+  return value === "COMException" || value === "InvalidOperationException" || value === "ArgumentOutOfRangeException"
+    || value === "TypeInitializationException" ? value : value === undefined ? undefined : "OtherError";
+}
+
+function safeBridgeHResult(value: unknown): number | undefined {
+  return Number.isInteger(value) && Math.abs(value as number) <= 2_147_483_648 ? value as number : undefined;
+}
+
+function safeBridgeStage(value: unknown): string | undefined {
+  return value === "interop_compile" || value === "core_audio" || value === "restore" ? value : undefined;
 }
 
 function safeCount(value: unknown): number {
@@ -252,6 +334,7 @@ $ErrorActionPreference = 'Stop'
 $source = @'
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 public static class NexaCoreAudioDucking {
@@ -387,7 +470,8 @@ public static class NexaCoreAudioDucking {
     } finally { CloseHandle(snapshot); }
   }
 
-  private static List<SessionRef> GetSessions(IMMDeviceEnumerator enumerator, IMMDevice device, string deviceId) {
+  private static List<SessionRef> GetSessions(IMMDeviceEnumerator enumerator, IMMDevice device, string deviceId,
+      out int enumerated, ref int failures) {
     var iid = SessionManagerId;
     object managerObject;
     Check(device.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero, out managerObject));
@@ -395,7 +479,7 @@ public static class NexaCoreAudioDucking {
     IAudioSessionEnumerator sessions;
     Check(manager.GetSessionEnumerator(out sessions));
     try {
-      int count; Check(sessions.GetCount(out count));
+      int count; Check(sessions.GetCount(out count)); enumerated = count;
       var result = new List<SessionRef>();
       for (int index = 0; index < count; index++) {
         IAudioSessionControl control = null;
@@ -410,7 +494,10 @@ public static class NexaCoreAudioDucking {
           result.Add(new SessionRef { DeviceId = deviceId, SessionId = sessionId, ProcessId = processId,
             Control = control, Control2 = control2, Volume = volume, State = state });
           control = null;
-        } catch { if (control != null && Marshal.IsComObject(control)) Marshal.ReleaseComObject(control); }
+        } catch {
+          failures++;
+          if (control != null && Marshal.IsComObject(control)) Marshal.ReleaseComObject(control);
+        }
       }
       return result;
     } finally {
@@ -419,12 +506,13 @@ public static class NexaCoreAudioDucking {
     }
   }
 
-  private static List<SessionRef> GetDefaultOutputSessions(IMMDeviceEnumerator enumerator, out string deviceId) {
+  private static List<SessionRef> GetDefaultOutputSessions(IMMDeviceEnumerator enumerator, out string deviceId,
+      out int enumerated, ref int failures) {
     IMMDevice device;
     Check(enumerator.GetDefaultAudioEndpoint(0, 1, out device));
     try {
       Check(device.GetId(out deviceId));
-      return GetSessions(enumerator, device, deviceId);
+      return GetSessions(enumerator, device, deviceId, out enumerated, ref failures);
     } finally { if (Marshal.IsComObject(device)) Marshal.ReleaseComObject(device); }
   }
 
@@ -433,22 +521,38 @@ public static class NexaCoreAudioDucking {
     var owned = GetOwnedProcessIds((uint)rootProcessId);
     var enumerator = CreateEnumerator();
     var changed = new List<Dictionary<string, object>>();
-    int failures = 0;
+    int failures = 0, enumerated = 0, active = 0, excludedOwned = 0, excludedSystem = 0, attempted = 0;
+    int spotifyFound = 0, spotifyAttempted = 0, spotifyChanged = 0;
     try {
       string deviceId;
-      var sessions = GetDefaultOutputSessions(enumerator, out deviceId);
+      var sessions = GetDefaultOutputSessions(enumerator, out deviceId, out enumerated, ref failures);
       foreach (var session in sessions) {
         try {
-          if (session.State != 1 || session.ProcessId == InvalidProcessId || owned.Contains(session.ProcessId)) continue;
+          if (session.State != 1) continue;
+          active++;
+          bool isSpotify = false;
+          if (session.ProcessId != InvalidProcessId) {
+            try { using (var process = Process.GetProcessById((int)session.ProcessId))
+              isSpotify = String.Equals(process.ProcessName, "spotify", StringComparison.OrdinalIgnoreCase); }
+            catch { }
+          }
+          if (isSpotify) spotifyFound++;
+          if (session.ProcessId == InvalidProcessId) { excludedSystem++; continue; }
+          if (owned.Contains(session.ProcessId)) { excludedOwned++; continue; }
           bool muted; float original;
           Check(session.Volume.GetMute(out muted));
           Check(session.Volume.GetMasterVolume(out original));
           if (muted || original <= 0.0001f) continue;
           var ducked = (float)(original * factor);
+          attempted++;
+          if (isSpotify) spotifyAttempted++;
           var snapshot = new Dictionary<string, object> { { "deviceId", session.DeviceId }, { "sessionId", session.SessionId },
             { "processId", (int)session.ProcessId }, { "originalVolume", (double)original }, { "duckedVolume", (double)ducked } };
           var context = Guid.Empty;
-          try { Check(session.Volume.SetMasterVolume(ducked, ref context)); changed.Add(snapshot); }
+          try {
+            Check(session.Volume.SetMasterVolume(ducked, ref context)); changed.Add(snapshot);
+            if (isSpotify) spotifyChanged++;
+          }
           catch {
             failures++;
             try { float current; Check(session.Volume.GetMasterVolume(out current)); if (Math.Abs(current - ducked) <= 0.005f) Check(session.Volume.SetMasterVolume(original, ref context)); }
@@ -457,7 +561,13 @@ public static class NexaCoreAudioDucking {
         } catch { failures++; }
         finally { if (Marshal.IsComObject(session.Control)) Marshal.ReleaseComObject(session.Control); }
       }
-      return new Dictionary<string, object> { { "sessions", changed.ToArray() }, { "failedSessions", failures } };
+      return new Dictionary<string, object> {
+        { "sessions", changed.ToArray() }, { "failedSessions", failures }, { "enumeratedSessions", enumerated },
+        { "activeSessions", active }, { "excludedOwnedSessions", excludedOwned }, { "excludedSystemSessions", excludedSystem },
+        { "attemptedSessions", attempted },
+        { "changedSessions", changed.Count }, { "spotifySessionsFound", spotifyFound },
+        { "spotifySessionsAttempted", spotifyAttempted }, { "spotifySessionsChanged", spotifyChanged }
+      };
     } finally { if (Marshal.IsComObject(enumerator)) Marshal.ReleaseComObject(enumerator); }
   }
 
@@ -472,7 +582,8 @@ public static class NexaCoreAudioDucking {
         IMMDevice device = null;
         try {
           Check(enumerator.GetDevice(deviceIds[index], out device));
-          var sessions = GetSessions(enumerator, device, deviceIds[index]);
+          int enumerated, ignoredFailures = 0;
+          var sessions = GetSessions(enumerator, device, deviceIds[index], out enumerated, ref ignoredFailures);
           var session = sessions.Find(item => item.ProcessId == (uint)processIds[index]
             && String.Equals(item.SessionId, sessionIds[index], StringComparison.Ordinal));
           foreach (var item in sessions) if (!Object.ReferenceEquals(item, session) && Marshal.IsComObject(item.Control)) Marshal.ReleaseComObject(item.Control);
@@ -492,16 +603,30 @@ public static class NexaCoreAudioDucking {
   }
 }
 '@
-$null = Add-Type -TypeDefinition $source -Language CSharp
+$interopReady = $false
 $activeSnapshots = @()
 try {
   while ($null -ne ($line = [Console]::In.ReadLine())) {
     $request = $line | ConvertFrom-Json
     try {
       if ($request.action -eq 'duck') {
+        if (-not $interopReady) {
+          try { $null = Add-Type -TypeDefinition $source -Language CSharp; $interopReady = $true }
+          catch {
+            $errorName = $_.Exception.GetType().Name
+            if ($errorName -notin @('COMException', 'InvalidOperationException', 'ArgumentOutOfRangeException', 'TypeInitializationException')) { $errorName = 'OtherError' }
+            $reply = @{ requestId = [string]$request.requestId; ok = $false; errorCode = 'interop_compile_failed'; errorStage = 'interop_compile'; errorName = $errorName; errorCodeValue = [int]$_.Exception.HResult }
+            [Console]::Out.WriteLine((ConvertTo-Json -InputObject $reply -Depth 3 -Compress)); [Console]::Out.Flush(); continue
+          }
+        }
         $result = [NexaCoreAudioDucking]::Duck([int]$request.rootProcessId, [double]$request.factor)
         $activeSnapshots = @($result.sessions)
-        $reply = @{ requestId = [string]$request.requestId; ok = $true; sessions = $activeSnapshots; failedSessions = [int]$result.failedSessions }
+        $reply = @{ requestId = [string]$request.requestId; ok = $true; sessions = $activeSnapshots; failedSessions = [int]$result.failedSessions;
+          enumeratedSessions = [int]$result.enumeratedSessions; activeSessions = [int]$result.activeSessions;
+          excludedOwnedSessions = [int]$result.excludedOwnedSessions; attemptedSessions = [int]$result.attemptedSessions;
+          excludedSystemSessions = [int]$result.excludedSystemSessions;
+          changedSessions = [int]$result.changedSessions; spotifySessionsFound = [int]$result.spotifySessionsFound;
+          spotifySessionsAttempted = [int]$result.spotifySessionsAttempted; spotifySessionsChanged = [int]$result.spotifySessionsChanged }
         [Console]::Out.WriteLine((ConvertTo-Json -InputObject $reply -Depth 5 -Compress))
         [Console]::Out.Flush()
       } elseif ($request.action -eq 'restore') {
@@ -519,7 +644,11 @@ try {
         break
       } else { throw 'invalid_audio_duck_request' }
     } catch {
-      $reply = @{ requestId = [string]$request.requestId; ok = $false; error = 'core_audio_operation_failed' }
+      $errorName = $_.Exception.GetType().Name
+      if ($errorName -notin @('COMException', 'InvalidOperationException', 'ArgumentOutOfRangeException', 'TypeInitializationException')) { $errorName = 'OtherError' }
+      $stage = if ($request.action -eq 'restore') { 'restore' } else { 'core_audio' }
+      $reply = @{ requestId = [string]$request.requestId; ok = $false; errorCode = 'core_audio_operation_failed';
+        errorStage = $stage; errorName = $errorName; errorCodeValue = [int]$_.Exception.HResult }
       [Console]::Out.WriteLine((ConvertTo-Json -InputObject $reply -Depth 3 -Compress))
       [Console]::Out.Flush()
       if ($request.action -eq 'restore') { break }

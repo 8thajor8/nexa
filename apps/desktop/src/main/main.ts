@@ -181,10 +181,24 @@ const syntheticMemoryStoreCandidate = process.env.LOCALAPPDATA
   ? join(process.env.LOCALAPPDATA, "Nexa", "Temporary", "memory-desktop-01", "nexa-memory2-synthetic-desktop-v5.json")
   : undefined;
 const desktopDiagnosticsEnabled = process.env.NEXA_DIAGNOSTICS === "true";
+const audioDuckingDiagnosticsEnabled = process.env.NEXA_AUDIO_DUCKING_DIAGNOSTICS === "true";
 let audioDuckingShutdownStarted = false;
 let audioDuckingClosed = false;
 const desktopAudioDucking = createAudioSessionDucking({ diagnostics: (event, details) => {
-  writeSafeTrace("voice_audio", `audio_ducking_${event}`, { ...details });
+  const traceEvent = `audio_ducking_${event}`;
+  if (!audioDuckingDiagnosticsEnabled) {
+    writeSafeTrace("voice_audio", traceEvent, { ...details });
+    return;
+  }
+  const safeDetails = Object.fromEntries(Object.entries(details).filter(([key, value]) =>
+    ["stage", "code", "component", "endpointRole", "errorStage", "sessionCount", "enumeratedSessions", "activeSessions", "excludedOwnedSessions", "excludedSystemSessions",
+      "attemptedSessions", "changedSessions", "spotifySessionsFound", "spotifySessionsAttempted", "spotifySessionsChanged",
+    "failedSessions", "errorName", "errorCode"].includes(key)
+    && (value === null || ["string", "number", "boolean"].includes(typeof value))));
+  const line = `[nexa-desktop] ${JSON.stringify({ area: "voice_audio", event: traceEvent,
+    timestamp: new Date().toISOString(), ...safeDetails })}`;
+  if (event === "failed") console.error(line);
+  else console.info(line);
 } });
 if (startupPolicy.registerAuthorization) microsoftAuth.configureCachePath(resolveMicrosoftTokenPath(repositoryRoot));
 const rendererFile = resolve(appRoot, "dist", "index.html");

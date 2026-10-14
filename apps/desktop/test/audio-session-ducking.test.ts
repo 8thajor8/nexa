@@ -19,7 +19,9 @@ const snapshot = (sessionId: string, originalVolume: number): AudioSessionSnapsh
 function adapter(sessions = [snapshot("spotify", 0.7), snapshot("browser", 0.4)]) {
   return {
     sessions,
-    duck: vi.fn<AudioDuckingAdapter["duck"]>(async () => ({ sessions, failedSessions: 0 })),
+    duck: vi.fn<AudioDuckingAdapter["duck"]>(async () => ({ sessions, failedSessions: 0, enumeratedSessions: sessions.length,
+      activeSessions: sessions.length, excludedOwnedSessions: 0, excludedSystemSessions: 0, attemptedSessions: sessions.length,
+      changedSessions: sessions.length, spotifySessionsFound: 1, spotifySessionsAttempted: 1, spotifySessionsChanged: 1 })),
     restore: vi.fn<AudioDuckingAdapter["restore"]>(async () => ({ restored: sessions.length, skipped: 0, failedSessions: 0 })),
   } satisfies AudioDuckingAdapter & { sessions: AudioSessionSnapshot[] };
 }
@@ -85,12 +87,29 @@ describe("Main Windows audio session ducking", () => {
 
     await expect(controller.begin("voice-request")).resolves.toBeUndefined();
     await controller.end("voice-request");
-    expect(diagnostic).toHaveBeenCalledWith("failed", expect.objectContaining({ stage: "duck", code: "duck_failed" }));
+    expect(diagnostic).toHaveBeenCalledWith("failed", expect.objectContaining({ stage: "duck", code: "audio_duck_operation_failed" }));
     expect(failedAdapter.restore).not.toHaveBeenCalled();
 
     const nonWindowsAdapter = adapter();
     const nonWindows = createAudioSessionDucking({ platform: "darwin", adapter: nonWindowsAdapter });
     await nonWindows.begin("voice-request");
     expect(nonWindowsAdapter.duck).not.toHaveBeenCalled();
+  });
+
+  it("reports opt-in-safe aggregate results for the Windows helper without session identifiers", async () => {
+    const windowsAudio = adapter();
+    const diagnostic = vi.fn();
+    const controller = createAudioSessionDucking({ platform: "win32", adapter: windowsAudio, diagnostics: diagnostic });
+
+    await controller.begin("request-private-id");
+    expect(diagnostic).toHaveBeenNthCalledWith(1, "requested", expect.objectContaining({
+      stage: "duck", code: "requested", component: "windows_core_audio", endpointRole: "default_render_multimedia",
+    }));
+    expect(diagnostic).toHaveBeenNthCalledWith(2, "started", expect.objectContaining({
+      enumeratedSessions: 2, activeSessions: 2, attemptedSessions: 2, changedSessions: 2,
+      spotifySessionsFound: 1, spotifySessionsAttempted: 1, spotifySessionsChanged: 1,
+    }));
+    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain("request-private-id");
+    await controller.end("request-private-id");
   });
 });
