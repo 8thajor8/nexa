@@ -693,6 +693,7 @@ function installWebContentsGuards(): void {
             .filter((value): value is number => value !== null).reduce((sum, value) => sum + value, 0);
           desktopOperationalDiagnostics.recordVoiceOperation({ requestId: event.requestId, stage: event.stage, state: event.state,
             errorCode: event.errorCode, durationMs: event.durationMs, cancellation: event.cancellation,
+            followupOutcome: typeof metrics.followupOutcome === "string" ? metrics.followupOutcome : null,
             ...desktopVoiceConfiguration,
             durations: { ...(stageKey ? { [stageKey]: event.durationMs } : {}), synthesisMs, identityProcessingMs,
               identityServerStartupMs, identityBrowserStartupMs, identityRendererPreparationMs, identityDspSetupMs,
@@ -702,6 +703,9 @@ function installWebContentsGuards(): void {
               speechInitializationMs: duration(metrics.speechInitializationMs),
               playbackCommandStartMs: duration(metrics.playbackCommandStartMs),
               responseDispatchToPlaybackMs: duration(metrics.responseDispatchToPlaybackMs),
+              responseDispatchToSynthesisMs: duration(metrics.responseDispatchToSynthesisMs),
+              responseDispatchToAudioReadyMs: duration(metrics.responseDispatchToAudioReadyMs),
+              audioReadyToPlaybackMs: duration(metrics.audioReadyToPlaybackMs),
               playbackMs: event.stage === "playback" ? event.durationMs : null },
           });
         },

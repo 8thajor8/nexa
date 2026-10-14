@@ -28,6 +28,7 @@ import {
   WINDOW_SETTINGS_SET_CHANNEL,
   WINDOW_SETTINGS_CHANGED_CHANNEL,
   VOICE_EVENT_CHANNEL,
+  VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL,
   VOICE_SPEECH_CANCEL_CHANNEL,
   VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL,
   VOICE_SPEECH_EVENT_CHANNEL,
@@ -57,6 +58,7 @@ import {
   isVoiceSpeechCancelRequest,
   isVoiceSpeechCancelResponse,
   isVoiceSpeechAcknowledgementRequest,
+  isVoiceFollowupDiagnosticRequest,
   isVoiceSpeechAcknowledgementResponse,
   isVoiceSpeechEvent,
 } from "./shared/voice-ipc-validation";
@@ -152,6 +154,10 @@ const api: NexaDesktopApi = {
         }
         return response;
       },
+    },
+    async recordFollowupDiagnostic(request) {
+      if (!isVoiceFollowupDiagnosticRequest(request)) throw new Error("invalid_voice_followup_diagnostic_request");
+      return await ipcRenderer.invoke(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL, request) === true;
     },
     speech: {
       async acknowledge(request) {

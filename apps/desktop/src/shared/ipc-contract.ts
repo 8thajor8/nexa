@@ -15,6 +15,7 @@ export const VOICE_EVENT_CHANNEL = "voice:event" as const;
 export const VOICE_SPEECH_CANCEL_CHANNEL = "voice:speech:cancel" as const;
 export const VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL = "voice:speech:acknowledgement" as const;
 export const VOICE_SPEECH_EVENT_CHANNEL = "voice:speech:event" as const;
+export const VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL = "voice:followup:diagnostic" as const;
 export const CHAT_SEND_MESSAGE_CHANNEL = "chat:send-message" as const;
 export const CHAT_CANCEL_REQUEST_CHANNEL = "chat:cancel-request" as const;
 export const CHAT_CREATE_CONVERSATION_CHANNEL = "chat:create-conversation" as const;
@@ -313,9 +314,19 @@ export interface VoiceSpeechApi {
   cancel(request: VoiceSpeechCancelRequest): Promise<VoiceSpeechCancelResponse>;
   onEvent(listener: (event: VoiceSpeechEvent) => void): () => void;
 }
+export type VoiceFollowupDiagnosticOutcome = "window_opened" | "vad_speech_detected" | "vad_misfire"
+  | "window_expired_no_speech" | "window_expired_after_speech" | "transcription_submitted"
+  | "transcript_empty" | "prefix_rejected" | "prefix_accepted" | "chat_submission_requested"
+  | "transcription_error" | "cancelled";
+export interface VoiceFollowupDiagnosticRequest {
+  requestId: string;
+  outcome: VoiceFollowupDiagnosticOutcome;
+  durationMs?: number;
+}
 export interface VoiceDesktopApi {
   ptt: VoicePttApi;
   speech: VoiceSpeechApi;
+  recordFollowupDiagnostic(request: VoiceFollowupDiagnosticRequest): Promise<boolean>;
   onEvent: (listener: (event: VoiceEventEnvelope) => void) => () => void;
 }
 

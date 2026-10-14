@@ -13,6 +13,7 @@ import type {
   VoiceSpeechAcknowledgementRequest,
   VoiceSpeechAcknowledgementResponse,
   VoiceSpeechEvent,
+  VoiceFollowupDiagnosticRequest,
 } from "./ipc-contract.js";
 
 export const MAX_VOICE_PTT_AUDIO_BYTES = 1_048_576;
@@ -109,6 +110,17 @@ export function isVoiceSpeechCancelRequest(value: unknown): value is VoiceSpeech
 
 export function isVoiceSpeechAcknowledgementRequest(value: unknown): value is VoiceSpeechAcknowledgementRequest {
   return isPlainRecord(value) && hasExactKeys(value, ["requestId"]) && isVoiceId(value.requestId);
+}
+
+export function isVoiceFollowupDiagnosticRequest(value: unknown): value is VoiceFollowupDiagnosticRequest {
+  if (!isPlainRecord(value)) return false;
+  const keys = ["requestId", "outcome", ...(Object.hasOwn(value, "durationMs") ? ["durationMs"] : [])];
+  const outcomes = ["window_opened", "vad_speech_detected", "vad_misfire", "window_expired_no_speech",
+    "window_expired_after_speech", "transcription_submitted", "transcript_empty", "prefix_rejected",
+    "prefix_accepted", "chat_submission_requested", "transcription_error", "cancelled"];
+  return hasExactKeys(value, keys) && isVoiceId(value.requestId) && outcomes.includes(String(value.outcome))
+    && (!Object.hasOwn(value, "durationMs") || (Number.isFinite(value.durationMs)
+      && typeof value.durationMs === "number" && value.durationMs >= 0 && value.durationMs <= 60_000));
 }
 
 export function isVoiceSpeechAcknowledgementResponse(value: unknown): value is VoiceSpeechAcknowledgementResponse {

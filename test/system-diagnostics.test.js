@@ -42,6 +42,7 @@ test('Voice diagnostics retain bounded safe stage metadata and omit conversation
         identityProfile: 'nova-portena', identityProcessing: true,
         durations: { pttFinalizationMs: 31, audioConversionMs: 8, speechInitializationMs: 22,
             synthesisMs: 800, identityProcessingMs: 17, playbackCommandStartMs: 14, responseDispatchToPlaybackMs: 1200,
+            responseDispatchToSynthesisMs: 80, responseDispatchToAudioReadyMs: 1150, audioReadyToPlaybackMs: 50,
             identityBrowserStartupMs: 900,
             identityRendererPreparationMs: 120, identityDspSetupMs: 40, identityDspProcessingMs: 7000,
             identityAudioCaptureWaitMs: 6800, identityPostProcessingMs: 15, audioReadyMs: 10300, audioPreparationMs: 2 },
@@ -57,6 +58,9 @@ test('Voice diagnostics retain bounded safe stage metadata and omit conversation
     assert.equal(report.voice.last.durations.speechInitializationMs, 22);
     assert.equal(report.voice.last.durations.playbackCommandStartMs, 14);
     assert.equal(report.voice.last.durations.responseDispatchToPlaybackMs, 1200);
+    assert.equal(report.voice.last.durations.responseDispatchToSynthesisMs, 80);
+    assert.equal(report.voice.last.durations.responseDispatchToAudioReadyMs, 1150);
+    assert.equal(report.voice.last.durations.audioReadyToPlaybackMs, 50);
     assert.equal(report.voice.last.durations.identityBrowserStartupMs, 900);
     assert.equal(report.voice.last.durations.identityAudioCaptureWaitMs, 6800);
     assert.equal(report.voice.last.durations.audioReadyMs, 10300);
@@ -64,6 +68,19 @@ test('Voice diagnostics retain bounded safe stage metadata and omit conversation
     assert.doesNotMatch(JSON.stringify(report), /private utterance|private response|secret|"apiKey"|"transcript"|C:\\Users\\/iu);
     for (let index = 0; index < 12; index++) diagnostics.recordVoiceOperation({ requestId: `req-${index}`, stage: 'playback', state: 'success' });
     assert.equal(diagnostics.snapshot().voice.recent.length, 8);
+});
+
+test('follow-up diagnostics retain only an allowlisted outcome and bounded duration', () => {
+    const diagnostics = createOperationalDiagnostics();
+    diagnostics.recordVoiceOperation({ requestId: '00000000-0000-4000-8000-000000000002', stage: 'followup', state: 'success',
+        durationMs: 5000, followupOutcome: 'prefix_rejected', transcript: 'private transcript' });
+    const report = JSON.parse(createTechnicalDiagnosticReport(diagnostics.snapshot(), 'voice'));
+    assert.equal(report.voice.last.stage, 'followup');
+    assert.equal(report.voice.last.followupOutcome, 'prefix_rejected');
+    assert.doesNotMatch(JSON.stringify(report), /private transcript/u);
+    diagnostics.recordVoiceOperation({ requestId: '00000000-0000-4000-8000-000000000003', stage: 'followup', state: 'success',
+        followupOutcome: 'private transcript' });
+    assert.equal(diagnostics.snapshot().voice.last.followupOutcome, null);
 });
 
 test('diagnostic evidence is bounded, in-memory and retained when later reports are requested', () => {

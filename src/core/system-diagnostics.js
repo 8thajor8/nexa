@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 const MAX_RECENT_OPERATIONS = 12;
 const MAX_RECENT_VOICE_OPERATIONS = 8;
-const SAFE_VOICE_STAGES = new Set(['ptt', 'transcription', 'runtime', 'synthesis', 'identity_processing', 'audio_preparation', 'playback']);
+const SAFE_VOICE_STAGES = new Set(['ptt', 'transcription', 'runtime', 'synthesis', 'identity_processing', 'audio_preparation', 'playback', 'followup']);
 const SAFE_VOICE_STATES = new Set(['started', 'processing', 'success', 'error', 'cancelled', 'interrupted']);
 const SAFE_VOICE_ERRORS = new Set(['VOICE_PTT_INVALID_AUDIO', 'VOICE_PTT_UNSUPPORTED_FORMAT', 'VOICE_PTT_TOO_LARGE',
     'VOICE_PTT_TOO_LONG', 'VOICE_PTT_INVALID_STATE', 'VOICE_PTT_TRANSCRIPTION_FAILED', 'voice_audio_storage_unavailable',
@@ -11,6 +11,9 @@ const SAFE_VOICE_ERRORS = new Set(['VOICE_PTT_INVALID_AUDIO', 'VOICE_PTT_UNSUPPO
     'voice_speech_start_timeout', 'voice_speech_stop_failed', 'voice_speech_stop_timeout', 'voice_speech_busy',
     'voice_speech_degraded', 'voice_speech_too_long',
 ]);
+const SAFE_FOLLOWUP_OUTCOMES = new Set(['window_opened', 'vad_speech_detected', 'vad_misfire', 'window_expired_no_speech',
+    'window_expired_after_speech', 'transcription_submitted', 'transcript_empty', 'prefix_rejected', 'prefix_accepted',
+    'chat_submission_requested', 'transcription_error', 'cancelled']);
 const SAFE_MEMORY_ERRORS = new Set([
     'memory_store_missing', 'memory_store_invalid', 'memory_schema_unsupported', 'memory_store_changed',
     'memory_reader_closed', 'memory_read_failed', 'memory_facade_closed', 'memory_store_unreadable',
@@ -80,7 +83,11 @@ export function createOperationalDiagnostics({ runtimeId = randomUUID(), memoryM
                 speechInitializationMs: duration(event.durations?.speechInitializationMs),
                 playbackCommandStartMs: duration(event.durations?.playbackCommandStartMs),
                 responseDispatchToPlaybackMs: duration(event.durations?.responseDispatchToPlaybackMs),
+                responseDispatchToSynthesisMs: duration(event.durations?.responseDispatchToSynthesisMs),
+                responseDispatchToAudioReadyMs: duration(event.durations?.responseDispatchToAudioReadyMs),
+                audioReadyToPlaybackMs: duration(event.durations?.audioReadyToPlaybackMs),
                 audioPreparationMs: duration(event.durations?.audioPreparationMs), playbackMs: duration(event.durations?.playbackMs) }),
+            followupOutcome: SAFE_FOLLOWUP_OUTCOMES.has(event.followupOutcome) ? event.followupOutcome : null,
             cancellation: ['user', 'superseded', 'session_ended', 'timeout'].includes(event.cancellation) ? event.cancellation : null,
             at: new Date().toISOString() });
         voiceOperations.push(entry);
@@ -479,10 +486,12 @@ export function createTechnicalDiagnosticReport(snapshot, kind = 'memory') {
         errorDescription: voiceErrorDescription(item.errorCode),
         durations: Object.fromEntries(['pttFinalizationMs', 'audioConversionMs', 'transcriptionMs', 'runtimeMs', 'speechInitializationMs',
             'synthesisMs', 'identityProcessingMs', 'playbackCommandStartMs', 'responseDispatchToPlaybackMs',
+            'responseDispatchToSynthesisMs', 'responseDispatchToAudioReadyMs', 'audioReadyToPlaybackMs',
             'identityServerStartupMs', 'identityBrowserStartupMs', 'identityRendererPreparationMs', 'identityDspProcessingMs',
             'identityDspSetupMs', 'identityAudioCaptureWaitMs', 'identityPostProcessingMs', 'audioReadyMs',
             'audioPreparationMs', 'playbackMs']
             .map(key => [key, Number.isSafeInteger(item.durations?.[key]) ? item.durations[key] : null])),
+        followupOutcome: SAFE_FOLLOWUP_OUTCOMES.has(item.followupOutcome) ? item.followupOutcome : null,
         model: allowedString(item.model), voice: allowedString(item.voice), identityProfile: allowedString(item.identityProfile),
         identityProcessing: typeof item.identityProcessing === 'boolean' ? item.identityProcessing : 'unknown',
         cancellation: allowedString(item.cancellation), at: allowedString(item.at),

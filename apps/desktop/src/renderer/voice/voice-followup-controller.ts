@@ -1,4 +1,4 @@
-import type { VoiceDesktopApi, VoiceEventEnvelope } from "../../shared/ipc-contract";
+import type { VoiceDesktopApi, VoiceEventEnvelope, VoiceFollowupDiagnosticOutcome } from "../../shared/ipc-contract";
 import { encodePcm16MonoWav, PTT_MAX_DURATION_SECONDS } from "../audio/ptt-microphone-capture";
 
 const FOLLOWUP_WINDOW_MS = 5_000;
@@ -78,6 +78,8 @@ export class VoiceFollowupController {
   private finishing = false;
   private windowDeadline = 0;
   private completionAllowed = false;
+  private followupStartedAt = 0;
+  private vadSpeechDetected = false;
   private pendingStart: Promise<Awaited<ReturnType<VoiceDesktopApi["ptt"]["start"]>>> | null = null;
   private stopInFlight: Promise<void> | null = null;
   private prepared: { generation: number; promise: Promise<VadPort> } | null = null;
@@ -104,9 +106,18 @@ export class VoiceFollowupController {
     if (this.active || this.prepared || this.stopInFlight) return;
     const generation = ++this.generation;
     const promise = this.createVad({
-      onSpeechRealStart: () => { if (this.isCurrent(generation)) this.clearWindowTimer(); },
+      onSpeechRealStart: () => {
+        if (!this.isCurrent(generation)) return;
+        this.vadSpeechDetected = true;
+        this.diagnose(this.startRequestId, "vad_speech_detected", performance.now() - this.followupStartedAt);
+        this.clearWindowTimer();
+      },
       onSpeechEnd: (audio) => { void this.finish(audio, generation); },
-      onVADMisfire: () => { if (this.isCurrent(generation)) this.armWindowTimer(generation); },
+      onVADMisfire: () => {
+        if (!this.isCurrent(generation)) return;
+        this.diagnose(this.startRequestId, "vad_misfire", performance.now() - this.followupStartedAt);
+        this.armWindowTimer(generation);
+      },
     });
     this.prepared = { generation, promise };
     void promise.catch((error: unknown) => {
@@ -124,12 +135,15 @@ export class VoiceFollowupController {
     this.prepared = null;
     const generation = prepared.generation;
     this.active = true;
+    this.followupStartedAt = performance.now();
+    this.vadSpeechDetected = false;
     this.status = "preparing";
     this.completionAllowed = false;
     this.unsubscribe = this.voice.onEvent((event) => this.onVoiceEvent(event));
     this.notify();
     const requestId = crypto.randomUUID();
     this.startRequestId = requestId;
+    this.diagnose(requestId, "window_opened");
     let vadClaimed = false;
     let stage: VoiceFollowupFailure["stage"] = "main_session_start";
     const releasePrepared = async () => {
@@ -170,6 +184,9 @@ export class VoiceFollowupController {
   }
 
   async stop(reason: "cancel" | "complete" = "cancel"): Promise<void> {
+    if (reason === "cancel" && this.active && this.startRequestId) {
+      this.diagnose(this.startRequestId, "cancelled", performance.now() - this.followupStartedAt);
+    }
     if (reason === "cancel") this.completionAllowed = false;
     if (this.stopInFlight) return this.stopInFlight;
     if (!this.active && !this.prepared) return;
@@ -235,6 +252,7 @@ export class VoiceFollowupController {
     const wav = encodePcm16MonoWav(audio);
     const requestId = crypto.randomUUID();
     this.finishRequestId = requestId;
+    this.diagnose(requestId, "transcription_submitted", performance.now() - this.followupStartedAt);
     try {
       const response = await this.voice.ptt.finish({ requestId, sessionId, audio: wav, format: "wav" });
       if (!response.ok || response.requestId !== requestId || response.sessionId !== sessionId) await this.stop();
@@ -250,6 +268,9 @@ export class VoiceFollowupController {
     if (envelope.event.type === "voice.transcript.final") {
       const generation = this.generation;
       const command = extractNexaFollowup(envelope.event.text);
+      if (!envelope.event.text.trim()) this.diagnose(envelope.requestId, "transcript_empty");
+      else if (!command) this.diagnose(envelope.requestId, "prefix_rejected");
+      else this.diagnose(envelope.requestId, "prefix_accepted");
       const transcript = command && envelope.turnId ? {
         text: command, sessionId: envelope.sessionId, requestId: envelope.requestId, turnId: envelope.turnId,
       } : null;
@@ -257,11 +278,13 @@ export class VoiceFollowupController {
       void this.stop("complete").then(() => {
         if (transcript && this.completionAllowed && this.generation === generation + 1) {
           this.completionAllowed = false;
+          this.diagnose(transcript.requestId, "chat_submission_requested");
           this.dependencies.onAcceptedTranscript(transcript);
         }
       });
     } else if (envelope.event.type === "voice.error" || envelope.event.type === "voice.cancelled"
       || envelope.event.type === "voice.session.ended") {
+      if (envelope.event.type === "voice.error") this.diagnose(envelope.requestId, "transcription_error");
       void this.stop();
     }
   }
@@ -280,7 +303,20 @@ export class VoiceFollowupController {
     this.clearWindowTimer();
     const remaining = this.windowDeadline - performance.now();
     if (remaining <= 0) { void this.stop(); return; }
-    this.timer = this.schedule(() => { if (this.isCurrent(generation)) void this.stop(); }, remaining);
+    this.timer = this.schedule(() => {
+      if (!this.isCurrent(generation)) return;
+      if (!this.vadSpeechDetected && this.startRequestId) {
+        this.diagnose(this.startRequestId, "window_expired_no_speech", performance.now() - this.followupStartedAt);
+      } else if (this.startRequestId) {
+        this.diagnose(this.startRequestId, "window_expired_after_speech", performance.now() - this.followupStartedAt);
+      }
+      void this.stop();
+    }, remaining);
+  }
+
+  private diagnose(requestId: string | null, outcome: VoiceFollowupDiagnosticOutcome, durationMs?: number): void {
+    if (!requestId || !this.voice.recordFollowupDiagnostic) return;
+    void this.voice.recordFollowupDiagnostic({ requestId, outcome, ...(durationMs === undefined ? {} : { durationMs }) }).catch(() => undefined);
   }
 
   private isCurrent(generation: number): boolean { return this.active && generation === this.generation; }

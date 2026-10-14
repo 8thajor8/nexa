@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   VOICE_EVENT_CHANNEL,
+  VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL,
   VOICE_SPEECH_EVENT_CHANNEL,
   VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL,
   VOICE_SPEECH_CANCEL_CHANNEL,
@@ -22,6 +23,7 @@ import {
   cancelVoiceSpeech,
   registerVoiceWindowNavigation,
   registerVoiceIpcHandlers,
+  markVoiceResponseDispatched,
   registerVoiceMicrophonePermissions,
   removeVoiceIpcHandlers,
   speakVoiceResponse,
@@ -151,6 +153,25 @@ describe("Electron Main Voice IPC", () => {
     vi.clearAllMocks();
   });
 
+  it("accepts only bounded follow-up diagnostic outcomes from the trusted renderer", () => {
+    const window = createWindow("followup-diagnostics");
+    const diagnostics: Array<Record<string, unknown>> = [];
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => makeVoiceFactory() as never,
+      (event) => diagnostics.push(event as unknown as Record<string, unknown>));
+    const requestId = "00000000-0000-4000-8000-000000000058";
+    expect(invoke(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL, trustedEvent(window), {
+      requestId, outcome: "prefix_rejected", durationMs: 123,
+    })).toBe(true);
+    expect(diagnostics[0]).toMatchObject({ requestId, stage: "followup", state: "success", durationMs: 123,
+      metrics: { followupOutcome: "prefix_rejected" } });
+    expect(() => invoke(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL, { sender: {}, senderFrame: { url: RENDERER_URL + "/" } }, {
+      requestId, outcome: "prefix_accepted",
+    })).toThrow("untrusted_voice_ipc_sender");
+    expect(() => invoke(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL, trustedEvent(window), {
+      requestId, outcome: "prefix_accepted", transcript: "must not be accepted",
+    })).toThrow("invalid_voice_followup_diagnostic_request");
+  });
+
   it("starts ducking at PTT start, transfers it to the chat request, and restores on Stop", async () => {
     const window = createWindow("audio-ducking");
     const voice = makeVoiceFactory();
@@ -217,6 +238,41 @@ describe("Electron Main Voice IPC", () => {
       { requestId: "00000000-0000-4000-8000-000000000051", state: "completed" },
     ]);
     expect(cancelVoiceSpeech(window as never, "user", "00000000-0000-4000-8000-000000000051")).toBe(false);
+  });
+
+  it("records response-to-synthesis, audio-ready, and playback intervals without response content", async () => {
+    const window = createWindow("speech-timing");
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    let idFactory = () => "";
+    const speaker = {
+      speak: vi.fn(async () => {
+        const event = { turnId: idFactory(), diagnostics: { metrics: { synthesisMs: 11, identityProcessingMs: 17 } } };
+        listeners.get("voice.speaking")?.(event);
+        listeners.get("voice.playback.started")?.({ ...event, diagnostics: { durationMs: 2 } });
+        listeners.get("voice.speech.completed")?.(event);
+        return { completed: true as const };
+      }),
+      cancel: vi.fn(() => true),
+      on: vi.fn((type: string, listener: (event: Record<string, unknown>) => void) => {
+        listeners.set(type, listener);
+        return () => listeners.delete(type);
+      }),
+    };
+    const api = { createVoiceSpeaker: vi.fn((options: { idFactory: () => string }) => { idFactory = options.idFactory; return speaker; }) };
+    const diagnostics: Array<Record<string, unknown>> = [];
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never,
+      (event) => diagnostics.push(event as unknown as Record<string, unknown>));
+    const requestId = "00000000-0000-4000-8000-000000000057";
+    await speakVoiceResponse(window as never, requestId, "Respuesta de prueba");
+    markVoiceResponseDispatched(requestId);
+    const timing = diagnostics.find((event) => event.state === "success" && event.stage === "playback"
+      && typeof (event.metrics as Record<string, unknown> | undefined)?.responseDispatchToPlaybackMs === "number");
+    expect(timing?.metrics).toMatchObject({
+      responseDispatchToPlaybackMs: expect.any(Number),
+      responseDispatchToAudioReadyMs: expect.any(Number),
+      audioReadyToPlaybackMs: expect.any(Number),
+    });
+    expect(JSON.stringify(diagnostics)).not.toContain("Respuesta de prueba");
   });
 
   it("remembers Stop received before the response speaker initializes and discards that late response", async () => {

@@ -7,6 +7,7 @@ function harness(transcript = "Nexa, seguí contando") {
   let callbacks: { onSpeechRealStart(): void; onSpeechEnd(audio: Float32Array): void; onVADMisfire(): void } | null = null;
   let finishId = "";
   const accepted = vi.fn();
+  const diagnostics = vi.fn(async () => true);
   const vad = { start: vi.fn(async () => undefined), pause: vi.fn(async () => undefined), destroy: vi.fn(async () => undefined) };
   const createVad = vi.fn(async (next: NonNullable<typeof callbacks>) => { callbacks = next; return vad; });
   const voice = {
@@ -20,6 +21,7 @@ function harness(transcript = "Nexa, seguí contando") {
       cancel: vi.fn(async ({ requestId, sessionId, targetRequestId }: { requestId: string; sessionId: string; targetRequestId: string }) =>
         ({ ok: true as const, requestId, sessionId, targetRequestId, cancelled: true })),
     },
+    recordFollowupDiagnostic: diagnostics,
   } as unknown as VoiceDesktopApi;
   const controller = new VoiceFollowupController(voice, {
     createVad, onAcceptedTranscript: accepted,
@@ -34,7 +36,7 @@ function harness(transcript = "Nexa, seguí contando") {
     event: { type: "voice.transcript.final", sessionId: "session-1", turnId: "turn-1", timestamp: 1,
       text, language: "es" },
   });
-  return { controller, voice, vad, createVad, accepted, speak, emit, get callbacks() { return callbacks; } };
+  return { controller, voice, vad, createVad, accepted, diagnostics, speak, emit, get callbacks() { return callbacks; } };
 }
 
 afterEach(() => { vi.useRealTimers(); });
@@ -46,6 +48,40 @@ describe("bounded Voice follow-up", () => {
     expect(extractNexaFollowup("Hola Nexa, seguí")).toBeNull();
     expect(extractNexaFollowup("Nexabyte, seguí")).toBeNull();
     expect(extractNexaFollowup("Nexa")).toBeNull();
+  });
+
+  it("records bounded follow-up outcomes without retaining transcript content", async () => {
+    const h = harness();
+    await h.controller.open();
+    h.callbacks?.onSpeechRealStart();
+    await h.speak();
+    h.emit("Nexa, seguí contando información privada de prueba");
+    await vi.waitFor(() => expect(h.accepted).toHaveBeenCalledOnce());
+    const outcomes = h.diagnostics.mock.calls.map(([event]) => event.outcome);
+    expect(outcomes).toEqual(expect.arrayContaining(["window_opened", "vad_speech_detected", "transcription_submitted",
+      "prefix_accepted", "chat_submission_requested"]));
+    expect(JSON.stringify(h.diagnostics.mock.calls)).not.toContain("información privada de prueba");
+    await h.controller.stop();
+  });
+
+  it("distinguishes a rejected wake prefix from an empty transcript", async () => {
+    const h = harness();
+    await h.controller.open();
+    await h.speak();
+    h.emit("Mexa, seguí contando");
+    await vi.waitFor(() => expect(h.controller.getSnapshot()).toBe("idle"));
+    expect(h.diagnostics.mock.calls.map(([event]) => event.outcome)).toContain("prefix_rejected");
+    expect(h.diagnostics.mock.calls.map(([event]) => event.outcome)).not.toContain("transcript_empty");
+    expect(h.accepted).not.toHaveBeenCalled();
+  });
+
+  it("records a bounded expiry when VAD detects no speech", async () => {
+    vi.useFakeTimers();
+    const h = harness();
+    await h.controller.open();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(h.diagnostics.mock.calls.map(([event]) => event.outcome)).toContain("window_expired_no_speech");
+    expect(h.controller.getSnapshot()).toBe("idle");
   });
 
   it("expires after five seconds and cancels the Main session for ducking restoration", async () => {
