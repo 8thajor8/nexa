@@ -102,9 +102,10 @@ function createRendererServer() {
     });
 }
 
-// Signalsmith's official Worklet currently emits silence in OfflineAudioContext,
-// so use an active, inaudible AudioContext and capture its exact output in memory.
-export function createSignalsmithVoiceRenderer({ browserType = chromium } = {}) {
+// Render the official Worklet offline, then capture its output in memory without
+// waiting for the audio clock to advance in real time.
+export function createSignalsmithVoiceRenderer({ browserType = chromium, renderingMode = 'offline' } = {}) {
+    if (!['realtime', 'offline'].includes(renderingMode)) throw new TypeError('voice_identity_render_mode_invalid');
     let lastMetrics = null;
     let browserPromise = null;
     let serverPromise = null;
@@ -167,10 +168,12 @@ export function createSignalsmithVoiceRenderer({ browserType = chromium } = {}) 
         const preparedPage = await ensurePage(server);
         let rendered;
         try {
-            rendered = await preparedPage.page.evaluate(async ({ source, sampleRate: rate, pitch, formant, baseHz }) => {
+            rendered = await preparedPage.page.evaluate(async ({ source, sampleRate: rate, pitch, formant, baseHz, mode }) => {
                     const input = Float32Array.from(source);
                     const started = performance.now();
-                    const context = new AudioContext({ sampleRate: rate });
+                    const context = mode === 'offline'
+                        ? new OfflineAudioContext(1, input.length + rate * 2, rate)
+                        : new AudioContext({ sampleRate: rate });
             try {
                 const contextCreatedAt = performance.now();
                     const audioBuffer = context.createBuffer(1, input.length, rate);
@@ -202,7 +205,7 @@ export function createSignalsmithVoiceRenderer({ browserType = chromium } = {}) 
                         if (requiredEndFrame !== null && firstFrame + capturedSamples >= requiredEndFrame) resolveCapture(true);
                     };
                     stretch.connect(capture);
-                    await context.resume();
+                    if (mode === 'realtime') await context.resume();
                     const outputTime = context.currentTime + 0.2;
                     const outputFrame = Math.round(outputTime * rate);
                     requiredEndFrame = outputFrame + audioBuffer.length;
@@ -218,8 +221,16 @@ export function createSignalsmithVoiceRenderer({ browserType = chromium } = {}) 
                     const captureDeadline = new Promise(resolve => {
                         captureTimer = setTimeout(() => resolve(false), Math.max(5_000, (audioBuffer.duration + 2) * 1_000));
                     });
-                    const capturedAllFrames = await Promise.race([captureComplete, captureDeadline]);
-                    clearTimeout(captureTimer);
+                    let capturedAllFrames;
+                    try {
+                        if (mode === 'offline') {
+                            const rendering = context.startRendering();
+                            capturedAllFrames = await Promise.race([
+                                Promise.all([rendering, captureComplete]).then(() => true),
+                                captureDeadline,
+                            ]);
+                        } else capturedAllFrames = await Promise.race([captureComplete, captureDeadline]);
+                    } finally { clearTimeout(captureTimer); }
                     if (!capturedAllFrames) throw new Error('signalsmith_capture_timeout');
                     const captured = new Float32Array(chunks.reduce((count, chunk) => count + chunk.length, 0));
                     let offset = 0;
@@ -233,13 +244,14 @@ export function createSignalsmithVoiceRenderer({ browserType = chromium } = {}) 
             return { output: Array.from(output), latencySeconds, processingMs, setupMs,
                 captureWaitMs: performance.now() - captureStartedAt, capturedFrames: captured.length, alignedOffset };
             } finally {
-                await context.close();
+                if (typeof context.close === 'function') await context.close();
             }
                 }, {
                     source: Array.from(samples), sampleRate,
                     pitch: settings.pitchSemitones,
                     formant: settings.formantSemitones,
                     baseHz: settings.formantBaseHz,
+                    mode: renderingMode,
                 });
         } catch (error) {
             const failedPage = pagePromise;

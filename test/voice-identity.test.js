@@ -64,13 +64,43 @@ test('injected provider-independent renderer produces duration-preserving stereo
 
 test('official Signalsmith WASM renderer processes on an inaudible real-time AudioContext without TTS or audible playback', async () => {
     const source = sourceTone(720);
-    const renderer = createSignalsmithVoiceRenderer();
+    const renderer = createSignalsmithVoiceRenderer({ renderingMode: 'realtime' });
     try {
         const shifted = await renderer.render(source.samples, source.sampleRate);
         assert.equal(shifted.length, source.samples.length);
         assert.ok(measureSamples(shifted, source.samples).rmsDifference > 0.002);
         assert.ok(measureSamples(shifted).peak < 1);
         assert.equal(measureSamples(shifted).nonFiniteSamples, 0);
+    } finally { await renderer.close(); }
+});
+
+test('offline Signalsmith rendering preserves the realtime sample output and captures faster than audio duration', async () => {
+    const source = sourceTone(720);
+    const realtimeRenderer = createSignalsmithVoiceRenderer({ renderingMode: 'realtime' });
+    const offlineRenderer = createSignalsmithVoiceRenderer({ renderingMode: 'offline' });
+    try {
+        const realtime = await realtimeRenderer.render(source.samples, source.sampleRate);
+        const offline = await offlineRenderer.render(source.samples, source.sampleRate);
+        assert.equal(offline.length, source.samples.length);
+        assert.ok(measureSamples(offline).peak < 1);
+        assert.equal(measureSamples(offline).nonFiniteSamples, 0);
+        assert.ok(measureSamples(offline, realtime).rmsDifference < 0.0001);
+        assert.ok(offlineRenderer.getLastMetrics().audioCaptureWaitMs < source.samples.length / source.sampleRate * 500);
+    } finally {
+        await Promise.all([realtimeRenderer.close(), offlineRenderer.close()]);
+    }
+});
+
+test('offline identity rendering preserves all frames for a long response', async () => {
+    const source = sourceTone(5_200);
+    const renderer = createSignalsmithVoiceRenderer({ renderingMode: 'offline' });
+    try {
+        const shifted = await renderer.render(source.samples, source.sampleRate);
+        assert.equal(shifted.length, source.samples.length);
+        assert.equal(measureSamples(shifted).nonFiniteSamples, 0);
+        assert.ok(measureSamples(shifted).peak < 1);
+        assert.ok(renderer.getLastMetrics().dspProcessingMs < source.samples.length / source.sampleRate * 1_000);
+        assert.ok(renderer.getLastMetrics().audioCaptureWaitMs < source.samples.length / source.sampleRate * 500);
     } finally { await renderer.close(); }
 });
 
