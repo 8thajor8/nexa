@@ -113,8 +113,12 @@ function makeVoiceFactory() {
   };
 }
 
-function register(window: ReturnType<typeof createWindow>, voice = makeVoiceFactory()) {
-  registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => voice as never);
+function register(window: ReturnType<typeof createWindow>, voice = makeVoiceFactory(), audioDucking?: {
+  begin: ReturnType<typeof vi.fn>; transfer: ReturnType<typeof vi.fn>; end: ReturnType<typeof vi.fn>;
+  endExcept: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn>;
+}) {
+  registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => voice as never,
+    undefined, undefined, undefined, audioDucking as never);
   return voice;
 }
 
@@ -145,6 +149,26 @@ describe("Electron Main Voice IPC", () => {
   beforeEach(() => {
     removeVoiceIpcHandlers();
     vi.clearAllMocks();
+  });
+
+  it("starts ducking at PTT start, transfers it to the chat request, and restores on Stop", async () => {
+    const window = createWindow("audio-ducking");
+    const voice = makeVoiceFactory();
+    const audioDucking = {
+      begin: vi.fn(async () => undefined), transfer: vi.fn(), end: vi.fn(async () => undefined),
+      endExcept: vi.fn(async () => undefined), close: vi.fn(async () => undefined),
+    };
+    register(window, voice, audioDucking);
+
+    const started = await startSession(window, "ptt-request");
+    expect(audioDucking.begin).toHaveBeenCalledWith("ptt-request");
+    expect(finish(window, started.sessionId!, "chat-request")).toMatchObject({ accepted: true });
+    expect(audioDucking.transfer).toHaveBeenCalledWith("ptt-request", "chat-request");
+    expect(invoke(VOICE_PTT_CANCEL_CHANNEL, trustedEvent(window), {
+      requestId: "stop-request", sessionId: started.sessionId, targetRequestId: "chat-request",
+    })).toMatchObject({ ok: true, cancelled: true });
+    await vi.waitFor(() => expect(audioDucking.end).toHaveBeenCalledWith("chat-request"));
+    expect(audioDucking.end).toHaveBeenCalledOnce();
   });
 
   it("synthesizes only through the Main-owned speaker and emits request-correlated playback states", async () => {

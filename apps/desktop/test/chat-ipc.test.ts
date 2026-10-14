@@ -436,13 +436,16 @@ describe("Main chat IPC to Conversation Runtime", () => {
 
   it("maps Runtime busy and conversation errors without inventing assistant responses", async () => {
     const { runtime, listeners } = fakeRuntime(new Promise(() => undefined));
-    const h = harness(runtime);
+    const onVoiceRequestTerminal = vi.fn();
+    const h = harness(runtime, undefined, { onVoiceRequestTerminal });
     h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
-    await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, request);
-    listeners.forEach((listener) => listener({ conversationId, requestId: request.requestId, status: "error", error: { code: "agent_error", message: "Runtime failed" } }));
+    const voiceRequest = { ...request, source: "voice" as const };
+    await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, voiceRequest);
+    listeners.forEach((listener) => listener({ conversationId, requestId: voiceRequest.requestId, status: "error", error: { code: "agent_error", message: "Runtime failed" } }));
     expect(h.contents.send).toHaveBeenLastCalledWith(CHAT_EVENT_CHANNEL, expect.objectContaining({
       status: "error", error: { code: "operation_failed", message: "Runtime failed" },
     }));
+    expect(onVoiceRequestTerminal).toHaveBeenCalledWith(voiceRequest.requestId, "error");
     expect(h.contents.send.mock.calls.some((call) => (call[1] as ChatEventEnvelope).status === "completed")).toBe(false);
   });
 

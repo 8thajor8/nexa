@@ -62,6 +62,8 @@ import {
   cancelVoiceSpeech,
   speakVoiceResponse,
   markVoiceResponseDispatched,
+  releaseVoiceDuckingExcept,
+  releaseVoiceDuckingForRequest,
   registerVoiceWindowNavigation,
   registerVoiceIpcHandlers,
   registerVoiceMicrophonePermissions,
@@ -69,6 +71,7 @@ import {
   type PublicVoiceApi,
   type PreparedVoiceResponseAudio,
 } from "./voice-ipc.js";
+import { createAudioSessionDucking } from "./audio-session-ducking.js";
 
 interface DesktopSpeechService {
   generate(input: { text: string; style?: string; persist?: boolean; signal?: AbortSignal; includeAudio?: boolean }): Promise<unknown>;
@@ -178,6 +181,11 @@ const syntheticMemoryStoreCandidate = process.env.LOCALAPPDATA
   ? join(process.env.LOCALAPPDATA, "Nexa", "Temporary", "memory-desktop-01", "nexa-memory2-synthetic-desktop-v5.json")
   : undefined;
 const desktopDiagnosticsEnabled = process.env.NEXA_DIAGNOSTICS === "true";
+let audioDuckingShutdownStarted = false;
+let audioDuckingClosed = false;
+const desktopAudioDucking = createAudioSessionDucking({ diagnostics: (event, details) => {
+  writeSafeTrace("voice_audio", `audio_ducking_${event}`, { ...details });
+} });
 if (startupPolicy.registerAuthorization) microsoftAuth.configureCachePath(resolveMicrosoftTokenPath(repositoryRoot));
 const rendererFile = resolve(appRoot, "dist", "index.html");
 const rendererEntryPoint = selectRendererEntryPoint(
@@ -657,6 +665,7 @@ function installWebContentsGuards(): void {
         },
         (id) => readPreparedVoiceAcknowledgement(id),
         (text, signal) => prepareDesktopVoiceResponseAudio(text, signal),
+        desktopAudioDucking,
       );
     }
   }
@@ -703,7 +712,11 @@ function installWebContentsGuards(): void {
     registerChatIpcHandlers(() => mainWindow, () => conversationRuntime, ipcMain, (event, details) => {
       writeSafeTrace("chat_ipc", event, details);
     }, {
-      onNewInteraction: () => { cancelVoiceSpeech(mainWindow as never, "superseded"); },
+      onNewInteraction: (requestId) => {
+        cancelVoiceSpeech(mainWindow as never, "superseded");
+        releaseVoiceDuckingExcept(requestId);
+      },
+      onVoiceRequestTerminal: (requestId) => { releaseVoiceDuckingForRequest(requestId); },
       onVoiceResponse: (window, requestId, response) => { void speakVoiceResponse(window as never, requestId, response); },
       onVoiceResponseDispatched: (requestId) => markVoiceResponseDispatched(requestId),
       onVoiceRuntimeCompleted: (_window, requestId, durationMs) => {
@@ -785,6 +798,17 @@ app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0 && app.isReady()) createMainWindow();
 });
 app.on("before-quit", (event) => {
+  if (!audioDuckingClosed) {
+    event.preventDefault();
+    if (audioDuckingShutdownStarted) return;
+    audioDuckingShutdownStarted = true;
+    void desktopAudioDucking.close().finally(() => {
+      audioDuckingClosed = true;
+      audioDuckingShutdownStarted = false;
+      app.quit();
+    });
+    return;
+  }
   if (conversationRuntime && !runtimeClosed) {
     event.preventDefault();
     if (closingRuntime) return;

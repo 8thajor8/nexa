@@ -38,10 +38,11 @@ type Handler = (event: IpcMainInvokeEvent, payload: unknown) => unknown;
 type ChatDiagnostic = (event: string, details: Readonly<Record<string, string | number | boolean | null>>) => void;
 export type ChatCleanupOrigin = "navigation" | "window_closed" | "app_quit";
 export interface ChatVoiceHooks {
-  onNewInteraction?(): void;
+  onNewInteraction?(requestId: string): void;
   onVoiceResponse?(window: ChatWindowContext, requestId: string, response: string): void;
   onVoiceRuntimeCompleted?(window: ChatWindowContext, requestId: string, durationMs: number): void;
   onVoiceResponseDispatched?(requestId: string): void;
+  onVoiceRequestTerminal?(requestId: string, status: "cancelled" | "error"): void;
 }
 interface IpcMainLike {
   handle(channel: string, listener: Handler): void;
@@ -117,26 +118,30 @@ export class ChatIpcService {
       typeof (payload as { requestId?: unknown } | null)?.requestId === "string" ? (payload as { requestId: string }).requestId : "",
       "invalid_request", "The chat request is invalid.",
     );
-    if (this.runtimeSwitching) return failure(payload.requestId, "busy", "Runtime is changing memory mode.", payload.conversationId);
+    const reject = (code: ChatIpcErrorCode, message: string) => {
+      if (payload.source === "voice") {
+        try { this.voiceHooks.onVoiceRequestTerminal?.(payload.requestId, "error"); } catch { /* Voice cleanup cannot block chat IPC. */ }
+      }
+      return failure(payload.requestId, code, message, payload.conversationId);
+    };
+    if (this.runtimeSwitching) return reject("busy", "Runtime is changing memory mode.");
     const request = Object.freeze({ ...payload });
     const runtime = this.getRuntime();
-    if (!runtime) return failure(request.requestId, "runtime_unavailable", "Runtime is not connected.", request.conversationId);
-    if (!this.conversationId || request.conversationId !== this.conversationId) return failure(
-      request.requestId, "conversation_not_found", "The conversation is not available to this window.", request.conversationId,
+    if (!runtime) return reject("runtime_unavailable", "Runtime is not connected.");
+    if (!this.conversationId || request.conversationId !== this.conversationId) return reject(
+      "conversation_not_found", "The conversation is not available to this window.",
     );
     const seen = this.seenRequestIds.get(window as object) ?? new Set<string>();
-    if (seen.has(request.requestId)) return failure(request.requestId, "busy", "This request identifier was already used.", request.conversationId);
+    if (seen.has(request.requestId)) return reject("busy", "This request identifier was already used.");
     // Runtime enforces one active request across all conversations it owns.
-    if (this.activeByRequest.size > 0) return failure(
-      request.requestId, "busy", "Runtime is processing another conversation request.", request.conversationId,
-    );
+    if (this.activeByRequest.size > 0) return reject("busy", "Runtime is processing another conversation request.");
     seen.add(request.requestId);
     if (seen.size > 1_024) seen.delete(seen.values().next().value as string);
     this.seenRequestIds.set(window as object, seen);
     const active: ActiveRequest = { window, request, terminal: false, cancelPending: false, startedAt: performance.now() };
     this.activeByRequest.set(request.requestId, active);
     if (request.source === "typed" || request.source === "voice") {
-      try { this.voiceHooks.onNewInteraction?.(); } catch { /* Speech cancellation must not block chat. */ }
+      try { this.voiceHooks.onNewInteraction?.(request.requestId); } catch { /* Speech cancellation must not block chat. */ }
     }
     let operation: Promise<RuntimeMessageResult>;
     try {
@@ -277,6 +282,10 @@ export class ChatIpcService {
     };
     this.emit(active, safeEvent);
     this.activeByRequest.delete(active.request.requestId);
+    if (active.request.source === "voice" && (safeEvent.status === "cancelled" || safeEvent.status === "error")) {
+      try { this.voiceHooks.onVoiceRequestTerminal?.(active.request.requestId, safeEvent.status); }
+      catch { /* Voice cleanup cannot affect the terminal chat result. */ }
+    }
   }
 
   private emit(active: ActiveRequest, payload: ChatEventEnvelope): void {
