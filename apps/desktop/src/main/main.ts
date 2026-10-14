@@ -193,7 +193,8 @@ const desktopAudioDucking = createAudioSessionDucking({ diagnostics: (event, det
   const safeDetails = Object.fromEntries(Object.entries(details).filter(([key, value]) =>
     ["stage", "code", "component", "endpointRole", "errorStage", "sessionCount", "enumeratedSessions", "activeSessions", "excludedOwnedSessions", "excludedSystemSessions",
       "attemptedSessions", "changedSessions", "spotifySessionsFound", "spotifySessionsAttempted", "spotifySessionsChanged",
-    "failedSessions", "errorName", "errorCode"].includes(key)
+      "spotifyPreflightSkipped", "spotifyFailureStage", "spotifyFailureHResult",
+      "failedSessions", "failureStage", "failureHResult", "errorName", "errorCode"].includes(key)
     && (value === null || ["string", "number", "boolean"].includes(typeof value))));
   const line = `[nexa-desktop] ${JSON.stringify({ area: "voice_audio", event: traceEvent,
     timestamp: new Date().toISOString(), ...safeDetails })}`;

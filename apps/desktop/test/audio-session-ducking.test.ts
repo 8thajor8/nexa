@@ -21,7 +21,8 @@ function adapter(sessions = [snapshot("spotify", 0.7), snapshot("browser", 0.4)]
     sessions,
     duck: vi.fn<AudioDuckingAdapter["duck"]>(async () => ({ sessions, failedSessions: 0, enumeratedSessions: sessions.length,
       activeSessions: sessions.length, excludedOwnedSessions: 0, excludedSystemSessions: 0, attemptedSessions: sessions.length,
-      changedSessions: sessions.length, spotifySessionsFound: 1, spotifySessionsAttempted: 1, spotifySessionsChanged: 1 })),
+      changedSessions: sessions.length, spotifySessionsFound: 1, spotifySessionsAttempted: 1, spotifySessionsChanged: 1,
+      spotifyPreflightSkipped: 0 })),
     restore: vi.fn<AudioDuckingAdapter["restore"]>(async () => ({ restored: sessions.length, skipped: 0, failedSessions: 0 })),
   } satisfies AudioDuckingAdapter & { sessions: AudioSessionSnapshot[] };
 }
@@ -111,5 +112,24 @@ describe("Main Windows audio session ducking", () => {
     }));
     expect(JSON.stringify(diagnostic.mock.calls)).not.toContain("request-private-id");
     await controller.end("request-private-id");
+  });
+
+  it("preserves only the bounded failure stage and HRESULT from the pre-volume session phase", async () => {
+    const windowsAudio = adapter([]);
+    windowsAudio.duck.mockResolvedValueOnce({ sessions: [], failedSessions: 1, enumeratedSessions: 10,
+      activeSessions: 2, excludedOwnedSessions: 1, excludedSystemSessions: 0, attemptedSessions: 0,
+      changedSessions: 0, spotifySessionsFound: 1, spotifySessionsAttempted: 0, spotifySessionsChanged: 0,
+      spotifyPreflightSkipped: 0, failureStage: "get_session_volume", failureHResult: -2_147_467_259,
+      spotifyFailureStage: "get_session_volume", spotifyFailureHResult: -2_147_467_259 });
+    const diagnostic = vi.fn();
+    const controller = createAudioSessionDucking({ platform: "win32", adapter: windowsAudio, diagnostics: diagnostic });
+
+    await controller.begin("synthetic-request");
+    expect(diagnostic).toHaveBeenLastCalledWith("failed", expect.objectContaining({
+      code: "partial_duck", failureStage: "get_session_volume", failureHResult: -2_147_467_259,
+      spotifySessionsFound: 1, spotifySessionsAttempted: 0, spotifyPreflightSkipped: 0, attemptedSessions: 0,
+      spotifyFailureStage: "get_session_volume", spotifyFailureHResult: -2_147_467_259,
+    }));
+    await controller.end("synthetic-request");
   });
 });

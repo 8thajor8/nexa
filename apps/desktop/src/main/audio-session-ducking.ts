@@ -27,6 +27,11 @@ export interface AudioDuckingAdapter {
     spotifySessionsFound: number;
     spotifySessionsAttempted: number;
     spotifySessionsChanged: number;
+    spotifyPreflightSkipped: number;
+    spotifyFailureStage?: string;
+    spotifyFailureHResult?: number;
+    failureStage?: string;
+    failureHResult?: number;
   }>;
   restore(sessions: readonly AudioSessionSnapshot[]): Promise<{ restored: number; skipped: number; failedSessions: number }>;
 }
@@ -37,7 +42,8 @@ export interface AudioDuckingDiagnostics {
     errorStage?: string; sessionCount?: number;
     enumeratedSessions?: number; activeSessions?: number; excludedOwnedSessions?: number; excludedSystemSessions?: number; attemptedSessions?: number;
     changedSessions?: number; spotifySessionsFound?: number; spotifySessionsAttempted?: number;
-    spotifySessionsChanged?: number; failedSessions?: number; errorName?: string; errorCode?: number | string;
+    spotifySessionsChanged?: number; spotifyPreflightSkipped?: number; spotifyFailureStage?: string; spotifyFailureHResult?: number;
+    failedSessions?: number; failureHResult?: number; errorName?: string; errorCode?: number | string; failureStage?: string;
   }>): void;
 }
 
@@ -118,6 +124,10 @@ export function createAudioSessionDucking(options: {
           attemptedSessions: result.attemptedSessions, changedSessions: result.changedSessions,
           spotifySessionsFound: result.spotifySessionsFound, spotifySessionsAttempted: result.spotifySessionsAttempted,
           spotifySessionsChanged: result.spotifySessionsChanged, failedSessions: result.failedSessions,
+          spotifyPreflightSkipped: result.spotifyPreflightSkipped,
+          failureStage: safeFailureStage(result.failureStage), failureHResult: safeBridgeHResult(result.failureHResult),
+          spotifyFailureStage: safeFailureStage(result.spotifyFailureStage),
+          spotifyFailureHResult: safeBridgeHResult(result.spotifyFailureHResult),
         });
         await restoreIfIdle();
       } catch (error) {
@@ -266,6 +276,10 @@ function createWindowsCoreAudioAdapter(): AudioDuckingAdapter {
         attemptedSessions: safeCount(result.attemptedSessions), changedSessions: safeCount(result.changedSessions),
         spotifySessionsFound: safeCount(result.spotifySessionsFound), spotifySessionsAttempted: safeCount(result.spotifySessionsAttempted),
         spotifySessionsChanged: safeCount(result.spotifySessionsChanged),
+        spotifyPreflightSkipped: safeCount(result.spotifyPreflightSkipped),
+        failureStage: safeFailureStage(result.failureStage), failureHResult: safeBridgeHResult(result.failureHResult),
+        spotifyFailureStage: safeFailureStage(result.spotifyFailureStage),
+        spotifyFailureHResult: safeBridgeHResult(result.spotifyFailureHResult),
       };
     },
     async restore(sessions) {
@@ -311,6 +325,13 @@ function safeBridgeHResult(value: unknown): number | undefined {
 
 function safeBridgeStage(value: unknown): string | undefined {
   return value === "interop_compile" || value === "core_audio" || value === "restore" ? value : undefined;
+}
+
+function safeFailureStage(value: unknown): string | undefined {
+  return value === "get_session" || value === "query_session_control" || value === "get_session_state"
+    || value === "get_process_id" || value === "get_session_identifier" || value === "query_simple_audio_volume"
+    || value === "get_mute" || value === "get_session_volume" || value === "set_session_volume"
+    || value === "process_tree" || value === "default_endpoint" ? value : undefined;
 }
 
 function safeCount(value: unknown): number {
@@ -471,7 +492,7 @@ public static class NexaCoreAudioDucking {
   }
 
   private static List<SessionRef> GetSessions(IMMDeviceEnumerator enumerator, IMMDevice device, string deviceId,
-      out int enumerated, ref int failures) {
+      out int enumerated, ref int failures, ref string firstFailureStage, ref int firstFailureHResult) {
     var iid = SessionManagerId;
     object managerObject;
     Check(device.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero, out managerObject));
@@ -483,19 +504,26 @@ public static class NexaCoreAudioDucking {
       var result = new List<SessionRef>();
       for (int index = 0; index < count; index++) {
         IAudioSessionControl control = null;
+        string stage = "get_session";
         try {
           Check(sessions.GetSession(index, out control));
+          stage = "query_session_control";
           var control2 = (IAudioSessionControl2)control;
           int state; uint processId; string sessionId;
+          stage = "get_session_state";
           Check(control2.GetState(out state));
+          stage = "get_process_id";
           Check(control2.GetProcessId(out processId));
+          stage = "get_session_identifier";
           Check(control2.GetSessionInstanceIdentifier(out sessionId));
+          stage = "query_simple_audio_volume";
           var volume = (ISimpleAudioVolume)control;
           result.Add(new SessionRef { DeviceId = deviceId, SessionId = sessionId, ProcessId = processId,
             Control = control, Control2 = control2, Volume = volume, State = state });
           control = null;
-        } catch {
+        } catch (Exception error) {
           failures++;
+          if (firstFailureStage == null) { firstFailureStage = stage; firstFailureHResult = error.HResult; }
           if (control != null && Marshal.IsComObject(control)) Marshal.ReleaseComObject(control);
         }
       }
@@ -507,12 +535,12 @@ public static class NexaCoreAudioDucking {
   }
 
   private static List<SessionRef> GetDefaultOutputSessions(IMMDeviceEnumerator enumerator, out string deviceId,
-      out int enumerated, ref int failures) {
+      out int enumerated, ref int failures, ref string firstFailureStage, ref int firstFailureHResult) {
     IMMDevice device;
     Check(enumerator.GetDefaultAudioEndpoint(0, 1, out device));
     try {
       Check(device.GetId(out deviceId));
-      return GetSessions(enumerator, device, deviceId, out enumerated, ref failures);
+      return GetSessions(enumerator, device, deviceId, out enumerated, ref failures, ref firstFailureStage, ref firstFailureHResult);
     } finally { if (Marshal.IsComObject(device)) Marshal.ReleaseComObject(device); }
   }
 
@@ -522,15 +550,20 @@ public static class NexaCoreAudioDucking {
     var enumerator = CreateEnumerator();
     var changed = new List<Dictionary<string, object>>();
     int failures = 0, enumerated = 0, active = 0, excludedOwned = 0, excludedSystem = 0, attempted = 0;
-    int spotifyFound = 0, spotifyAttempted = 0, spotifyChanged = 0;
+    int spotifyFound = 0, spotifyAttempted = 0, spotifyChanged = 0, spotifyPreflightSkipped = 0;
+    string failureStage = null;
+    int failureHResult = 0;
+    string spotifyFailureStage = null;
+    int spotifyFailureHResult = 0;
     try {
       string deviceId;
-      var sessions = GetDefaultOutputSessions(enumerator, out deviceId, out enumerated, ref failures);
+      var sessions = GetDefaultOutputSessions(enumerator, out deviceId, out enumerated, ref failures, ref failureStage, ref failureHResult);
       foreach (var session in sessions) {
+        bool isSpotify = false;
+        string stage = "session_state";
         try {
           if (session.State != 1) continue;
           active++;
-          bool isSpotify = false;
           if (session.ProcessId != InvalidProcessId) {
             try { using (var process = Process.GetProcessById((int)session.ProcessId))
               isSpotify = String.Equals(process.ProcessName, "spotify", StringComparison.OrdinalIgnoreCase); }
@@ -540,9 +573,11 @@ public static class NexaCoreAudioDucking {
           if (session.ProcessId == InvalidProcessId) { excludedSystem++; continue; }
           if (owned.Contains(session.ProcessId)) { excludedOwned++; continue; }
           bool muted; float original;
+          stage = "get_mute";
           Check(session.Volume.GetMute(out muted));
+          stage = "get_session_volume";
           Check(session.Volume.GetMasterVolume(out original));
-          if (muted || original <= 0.0001f) continue;
+          if (muted || original <= 0.0001f) { if (isSpotify) spotifyPreflightSkipped++; continue; }
           var ducked = (float)(original * factor);
           attempted++;
           if (isSpotify) spotifyAttempted++;
@@ -550,6 +585,7 @@ public static class NexaCoreAudioDucking {
             { "processId", (int)session.ProcessId }, { "originalVolume", (double)original }, { "duckedVolume", (double)ducked } };
           var context = Guid.Empty;
           try {
+            stage = "set_session_volume";
             Check(session.Volume.SetMasterVolume(ducked, ref context)); changed.Add(snapshot);
             if (isSpotify) spotifyChanged++;
           }
@@ -558,7 +594,11 @@ public static class NexaCoreAudioDucking {
             try { float current; Check(session.Volume.GetMasterVolume(out current)); if (Math.Abs(current - ducked) <= 0.005f) Check(session.Volume.SetMasterVolume(original, ref context)); }
             catch { }
           }
-        } catch { failures++; }
+        } catch (Exception error) {
+          failures++;
+          if (failureStage == null) { failureStage = stage; failureHResult = error.HResult; }
+          if (isSpotify && spotifyFailureStage == null) { spotifyFailureStage = stage; spotifyFailureHResult = error.HResult; }
+        }
         finally { if (Marshal.IsComObject(session.Control)) Marshal.ReleaseComObject(session.Control); }
       }
       return new Dictionary<string, object> {
@@ -566,7 +606,10 @@ public static class NexaCoreAudioDucking {
         { "activeSessions", active }, { "excludedOwnedSessions", excludedOwned }, { "excludedSystemSessions", excludedSystem },
         { "attemptedSessions", attempted },
         { "changedSessions", changed.Count }, { "spotifySessionsFound", spotifyFound },
-        { "spotifySessionsAttempted", spotifyAttempted }, { "spotifySessionsChanged", spotifyChanged }
+        { "spotifySessionsAttempted", spotifyAttempted }, { "spotifySessionsChanged", spotifyChanged },
+        { "spotifyPreflightSkipped", spotifyPreflightSkipped }, { "failureStage", failureStage },
+        { "failureHResult", failureHResult }, { "spotifyFailureStage", spotifyFailureStage },
+        { "spotifyFailureHResult", spotifyFailureHResult }
       };
     } finally { if (Marshal.IsComObject(enumerator)) Marshal.ReleaseComObject(enumerator); }
   }
@@ -582,8 +625,10 @@ public static class NexaCoreAudioDucking {
         IMMDevice device = null;
         try {
           Check(enumerator.GetDevice(deviceIds[index], out device));
-          int enumerated, ignoredFailures = 0;
-          var sessions = GetSessions(enumerator, device, deviceIds[index], out enumerated, ref ignoredFailures);
+          int enumerated, ignoredFailures = 0, ignoredHResult = 0;
+          string ignoredStage = null;
+          var sessions = GetSessions(enumerator, device, deviceIds[index], out enumerated,
+            ref ignoredFailures, ref ignoredStage, ref ignoredHResult);
           var session = sessions.Find(item => item.ProcessId == (uint)processIds[index]
             && String.Equals(item.SessionId, sessionIds[index], StringComparison.Ordinal));
           foreach (var item in sessions) if (!Object.ReferenceEquals(item, session) && Marshal.IsComObject(item.Control)) Marshal.ReleaseComObject(item.Control);
@@ -626,7 +671,10 @@ try {
           excludedOwnedSessions = [int]$result.excludedOwnedSessions; attemptedSessions = [int]$result.attemptedSessions;
           excludedSystemSessions = [int]$result.excludedSystemSessions;
           changedSessions = [int]$result.changedSessions; spotifySessionsFound = [int]$result.spotifySessionsFound;
-          spotifySessionsAttempted = [int]$result.spotifySessionsAttempted; spotifySessionsChanged = [int]$result.spotifySessionsChanged }
+          spotifySessionsAttempted = [int]$result.spotifySessionsAttempted; spotifySessionsChanged = [int]$result.spotifySessionsChanged;
+          spotifyPreflightSkipped = [int]$result.spotifyPreflightSkipped; failureStage = $result.failureStage;
+          failureHResult = [int]$result.failureHResult; spotifyFailureStage = $result.spotifyFailureStage;
+          spotifyFailureHResult = [int]$result.spotifyFailureHResult }
         [Console]::Out.WriteLine((ConvertTo-Json -InputObject $reply -Depth 5 -Compress))
         [Console]::Out.Flush()
       } elseif ($request.action -eq 'restore') {
