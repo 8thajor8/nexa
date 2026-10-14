@@ -34,6 +34,7 @@ import {
   VOICE_DUCKING_END_CHANNEL,
   VOICE_SPEECH_CANCEL_CHANNEL,
   VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL,
+  VOICE_SPEECH_CHAT_PLAY_CHANNEL,
   VOICE_SPEECH_EVENT_CHANNEL,
   VOICE_PTT_CANCEL_CHANNEL,
   VOICE_PTT_FINISH_CHANNEL,
@@ -178,6 +179,12 @@ const api: NexaDesktopApi = {
       return response;
     },
     speech: {
+      async playChatResponse(requestId) {
+        if (!isVoiceId(requestId)) throw new Error("invalid_voice_chat_play_request_id");
+        const response: unknown = await ipcRenderer.invoke(VOICE_SPEECH_CHAT_PLAY_CHANNEL, { requestId });
+        if (typeof response !== "boolean") throw new Error("invalid_voice_chat_play_response");
+        return response;
+      },
       async acknowledge(request) {
         if (!isVoiceSpeechAcknowledgementRequest(request)) throw new Error("invalid_voice_speech_acknowledgement_request");
         const response: unknown = await ipcRenderer.invoke(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL, request);

@@ -40,6 +40,7 @@ export type ChatCleanupOrigin = "navigation" | "window_closed" | "app_quit";
 export interface ChatVoiceHooks {
   onNewInteraction?(requestId: string, source: "typed" | "voice"): void;
   onVoiceResponse?(window: ChatWindowContext, requestId: string, response: string): void;
+  onTypedResponse?(window: ChatWindowContext, requestId: string, response: string): void;
   onVoiceRuntimeCompleted?(window: ChatWindowContext, requestId: string, durationMs: number): void;
   onVoiceResponseDispatched?(requestId: string): void;
   onVoiceRequestTerminal?(requestId: string, status: "cancelled" | "error"): void;
@@ -256,6 +257,10 @@ export class ChatIpcService {
         catch { /* Diagnostic failures do not change the final answer. */ }
         try { this.voiceHooks.onVoiceResponse?.(active.window, result.requestId, result.text); }
         catch { /* A speech output failure must not change the completed text response. */ }
+      }
+      else if (active.request.source === "typed") {
+        try { this.voiceHooks.onTypedResponse?.(active.window, result.requestId, result.text); }
+        catch { /* Optional speech must not change the completed text response. */ }
       }
       this.complete(active, {
         conversationId: result.conversationId, requestId: result.requestId, status: "completed", response: result.text,

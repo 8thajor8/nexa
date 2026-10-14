@@ -63,6 +63,8 @@ import {
   cleanupVoiceWindow,
   cancelVoiceSpeech,
   speakVoiceResponse,
+  rememberTypedChatResponse,
+  discardTypedChatVoiceResponse,
   markVoiceResponseDispatched,
   releaseVoiceDuckingExcept,
   continueVoiceDuckingForRequest,
@@ -773,12 +775,14 @@ function installWebContentsGuards(): void {
       writeSafeTrace("chat_ipc", event, details);
     }, {
       onNewInteraction: (requestId, source) => {
+        if (mainWindow) discardTypedChatVoiceResponse(mainWindow as never);
         cancelVoiceSpeech(mainWindow as never, "superseded");
         if (source === "voice") continueVoiceDuckingForRequest(requestId);
         else releaseVoiceDuckingExcept(requestId);
       },
       onVoiceRequestTerminal: (requestId) => { releaseVoiceDuckingForRequest(requestId); },
       onVoiceResponse: (window, requestId, response) => { void speakVoiceResponse(window as never, requestId, response); },
+      onTypedResponse: (window, requestId, response) => { rememberTypedChatResponse(window as never, requestId, response); },
       onVoiceResponseDispatched: (requestId) => markVoiceResponseDispatched(requestId),
       onVoiceRuntimeCompleted: (_window, requestId, durationMs) => {
         desktopOperationalDiagnostics.recordVoiceOperation({ requestId, stage: "runtime", state: "success", durationMs,

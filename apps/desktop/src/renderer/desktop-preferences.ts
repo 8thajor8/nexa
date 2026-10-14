@@ -9,6 +9,7 @@ export interface DesktopPreferences {
   readonly clocks: readonly ClockPreference[];
   readonly weatherLocation: string;
   readonly wallpaperEnabled: boolean;
+  readonly voiceRepliesEnabled: boolean;
 }
 
 export const DESKTOP_PREFERENCES_KEY = "nexa.desktop.preferences.v1";
@@ -24,6 +25,7 @@ export const DEFAULT_DESKTOP_PREFERENCES: DesktopPreferences = Object.freeze({
   clocks: DEFAULT_CLOCKS,
   weatherLocation: "Barcelona",
   wallpaperEnabled: true,
+  voiceRepliesEnabled: false,
 });
 
 const FALLBACK_TIME_ZONES = [
@@ -85,6 +87,7 @@ export function normalizeDesktopPreferences(value: unknown): DesktopPreferences 
     clocks,
     weatherLocation: isSafeWeatherLocation(record.weatherLocation) ? record.weatherLocation.trim() : "Barcelona",
     wallpaperEnabled: typeof record.wallpaperEnabled === "boolean" ? record.wallpaperEnabled : true,
+    voiceRepliesEnabled: typeof record.voiceRepliesEnabled === "boolean" ? record.voiceRepliesEnabled : false,
   };
 }
 

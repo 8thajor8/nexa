@@ -96,7 +96,8 @@ describe("Main chat IPC to Conversation Runtime", () => {
     }));
     const onNewInteraction = vi.fn();
     const onVoiceResponse = vi.fn();
-    const h = harness(runtime, undefined, { onNewInteraction, onVoiceResponse });
+    const onTypedResponse = vi.fn();
+    const h = harness(runtime, undefined, { onNewInteraction, onVoiceResponse, onTypedResponse });
     const created = h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL) as { ok: true; conversationId: string };
     const send = async (requestId: string, source: "typed" | "voice") => {
       await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, conversationId: created.conversationId, requestId, source });
@@ -110,11 +111,13 @@ describe("Main chat IPC to Conversation Runtime", () => {
     expect(onNewInteraction).toHaveBeenCalledOnce();
     expect(onNewInteraction).toHaveBeenNthCalledWith(1, id("51"), "typed");
     expect(onVoiceResponse).not.toHaveBeenCalled();
+    expect(onTypedResponse).toHaveBeenCalledWith(h.window, id("51"), "respuesta typed");
     await send(id("52"), "voice");
     expect(onNewInteraction).toHaveBeenCalledTimes(2);
     expect(onNewInteraction).toHaveBeenNthCalledWith(2, id("52"), "voice");
     expect(onVoiceResponse).toHaveBeenCalledOnce();
     expect(onVoiceResponse).toHaveBeenCalledWith(h.window, id("52"), "respuesta voice");
+    expect(onTypedResponse).toHaveBeenCalledOnce();
   });
 
   it("does not dispatch speech for intermediate tool or Spotify events before the final voice result", async () => {

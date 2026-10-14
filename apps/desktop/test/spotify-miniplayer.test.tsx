@@ -17,6 +17,20 @@ const playingStatus = {
 };
 
 describe("Spotify mini-player", () => {
+  it("shows a keyboard-accessible voice replies switch after the six existing tools", () => {
+    const onVoiceRepliesChange = vi.fn();
+    const { rerender } = render(createElement(DashboardModules, { assistantState: "En espera", onVoiceRepliesChange }));
+    const tools = screen.getByRole("list", { name: "Capacidades futuras, aún no conectadas" });
+    expect(tools.children).toHaveLength(6);
+    const voiceReplies = screen.getByRole("switch", { name: /Respuestas por voz/ });
+    expect((voiceReplies as HTMLInputElement).checked).toBe(false);
+    expect(screen.getByText("Nexa lee sus respuestas en voz alta, incluso cuando escribís por chat")).toBeTruthy();
+    fireEvent.click(voiceReplies);
+    expect(onVoiceRepliesChange).toHaveBeenCalledWith(true);
+    rerender(createElement(DashboardModules, { assistantState: "En espera", voiceRepliesEnabled: true,
+      onVoiceRepliesChange }));
+    expect((screen.getByRole("switch", { name: /Respuestas por voz/ }) as HTMLInputElement).checked).toBe(true);
+  });
   it("keeps artwork, stacked track metadata, and accessible controls in one horizontal row", () => {
     const onControl = vi.fn();
     render(createElement(DashboardModules, { assistantState: "En espera", spotifyStatus: playingStatus,

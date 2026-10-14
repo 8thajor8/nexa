@@ -116,6 +116,9 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const [voiceSpeechStatus, setVoiceSpeechStatus] = useState<{ requestId: string; state: "preparing" | "speaking" | "cancelling" | "error"; message?: string } | null>(null);
   const [cancellationPending, setCancellationPending] = useState(false);
   const activeVoiceSpeechRequest = useRef<string | null>(null);
+  const typedVoiceSpeechRequest = useRef<string | null>(null);
+  const voiceRepliesEnabledRef = useRef(preferences.voiceRepliesEnabled);
+  voiceRepliesEnabledRef.current = preferences.voiceRepliesEnabled;
   const cancellingVoiceSpeechRequests = useRef(new Set<string>());
   const cancellationInFlight = useRef(false);
   const seenTranscriptKeys = useRef(new Set<string>());
@@ -133,6 +136,17 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     setPreferences(next);
     saveDesktopPreferences(next);
   }, []);
+  const changeVoiceReplies = useCallback((enabled: boolean) => {
+    updatePreferences({ ...preferences, voiceRepliesEnabled: enabled });
+    voiceRepliesEnabledRef.current = enabled;
+    if (!enabled && typedVoiceSpeechRequest.current) {
+      const requestId = typedVoiceSpeechRequest.current;
+      typedVoiceSpeechRequest.current = null;
+      void window.nexaDesktop.voice.speech.cancel({ requestId })
+        .catch(() => undefined)
+        .finally(() => { void window.nexaDesktop.voice.endDucking(requestId, "stop").catch(() => false); });
+    }
+  }, [preferences, updatePreferences]);
   const closeSettings = useCallback(() => setSettingsOpen(false), []);
   const changeMemoryMode = useCallback(async (mode: DesktopMemoryMode): Promise<DesktopMemoryModeResult> => {
     const result = await window.nexaDesktop.memory.setMode(mode);
@@ -307,6 +321,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       return;
     }
     terminalChatRequests.current.add(event.requestId);
+    const fromVoice = voiceChatRequests.current.has(event.requestId);
     const acknowledgementTimer = acknowledgementTimers.current.get(event.requestId);
     if (event.status === "completed" && voiceChatRequests.current.has(event.requestId)) {
       completedVoiceChatRequests.current.add(event.requestId);
@@ -331,6 +346,14 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         ? { ...entry, status: "completed" as const } : entry), {
         ...responseMessage,
       }].slice(-MAX_CHAT_HISTORY));
+      if (!fromVoice && voiceRepliesEnabledRef.current) {
+        typedVoiceSpeechRequest.current = event.requestId;
+        void window.nexaDesktop.voice.speech.playChatResponse(event.requestId).then((accepted) => {
+          if (!accepted && typedVoiceSpeechRequest.current === event.requestId) typedVoiceSpeechRequest.current = null;
+        }).catch(() => {
+          if (typedVoiceSpeechRequest.current === event.requestId) typedVoiceSpeechRequest.current = null;
+        });
+      }
     } else if (event.status === "cancelled") {
       setChatMessages((current) => current.map((entry) => entry.requestId === event.requestId
         ? { ...entry, status: "cancelled" } : entry));
@@ -387,9 +410,11 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     if (!speech) return;
     return speech.onEvent((event: VoiceSpeechEvent) => {
       if (event.state === "preparing") {
-        void followup.stop().then(() => {
-          if (followupEligibleRequests.current.has(event.requestId)) followup.prepare();
-        });
+        if (followupEligibleRequests.current.has(event.requestId)) {
+          void followup.stop().then(() => {
+            if (followupEligibleRequests.current.has(event.requestId)) followup.prepare();
+          });
+        }
         activeVoiceSpeechRequest.current = event.requestId;
         setVoiceSpeechStatus({ requestId: event.requestId, state: "preparing" });
         return;
@@ -404,8 +429,10 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         setVoiceSpeechStatus({ requestId: event.requestId, state: "speaking" });
       }
       else if (event.state === "error") {
+        if (typedVoiceSpeechRequest.current === event.requestId) typedVoiceSpeechRequest.current = null;
+        const wasVoiceFollowupEligible = followupEligibleRequests.current.has(event.requestId);
         followupEligibleRequests.current.delete(event.requestId);
-        void followup.stop();
+        if (wasVoiceFollowupEligible) void followup.stop();
         const timer = acknowledgementTimers.current.get(event.requestId);
         if (timer !== undefined) window.clearTimeout(timer);
         acknowledgementTimers.current.delete(event.requestId);
@@ -417,6 +444,8 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
           message: VOICE_SPEECH_ERRORS[event.error?.code ?? "voice_speech_playback_failed"] });
       }
       else {
+        if (typedVoiceSpeechRequest.current === event.requestId) typedVoiceSpeechRequest.current = null;
+        const wasVoiceFollowupEligible = followupEligibleRequests.current.has(event.requestId);
         const shouldFollowup = event.state === "completed" && followupEligibleRequests.current.delete(event.requestId)
           && !cancellingVoiceSpeechRequests.current.has(event.requestId);
         followupEligibleRequests.current.delete(event.requestId);
@@ -433,7 +462,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
           void followup.open(event.requestId);
         }
         else {
-          void followup.stop();
+          if (wasVoiceFollowupEligible) void followup.stop();
           void window.nexaDesktop.voice.endDucking(event.requestId).catch(() => false);
         }
       }
@@ -660,6 +689,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       </main>
       <DashboardModules assistantState={ASSISTANT_STATE_LABELS[assistantState]} spotifyStatus={spotifyLiveStatus}
         spotifyBusyAction={spotifyControlBusy} spotifyError={spotifyControlError}
+        voiceRepliesEnabled={preferences.voiceRepliesEnabled} onVoiceRepliesChange={changeVoiceReplies}
         onSpotifyControl={(action) => { void controlSpotify(action); }} onOpenSpotifyTrack={(url) => { void openSpotifyTrack(url); }} />
       {settingsOpen && <SettingsModal preferences={preferences} onPreferencesChange={updatePreferences}
         microphoneDevices={microphoneDevices}

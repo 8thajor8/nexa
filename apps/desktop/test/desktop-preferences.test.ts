@@ -35,6 +35,16 @@ describe("Desktop preferences and international time", () => {
     expect(invalid.clocks.length).toBeGreaterThan(0);
   });
 
+  it("defaults voice replies off and persists the switch without changing other preferences", () => {
+    let stored: string | null = null;
+    const storage = { getItem: () => stored, setItem: (_key: string, value: string) => { stored = value; } };
+    expect(loadDesktopPreferences(storage).voiceRepliesEnabled).toBe(false);
+    const enabled = { ...loadDesktopPreferences(storage), voiceRepliesEnabled: true };
+    expect(saveDesktopPreferences(enabled, storage)).toBe(true);
+    expect(loadDesktopPreferences(storage)).toEqual(enabled);
+    expect(normalizeDesktopPreferences({ voiceRepliesEnabled: "true" }).voiceRepliesEnabled).toBe(false);
+  });
+
   it("accepts ordinary city names but rejects URLs and command-shaped input", () => {
     expect(isSafeWeatherLocation("San José, Costa Rica")).toBe(true);
     expect(isSafeWeatherLocation("New York")).toBe(true);

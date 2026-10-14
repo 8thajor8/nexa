@@ -28,7 +28,8 @@ async function loadPreload() {
   return mocks.exposed as {
     voice: {
       ptt: { start: (request: unknown) => Promise<unknown>; finish: (request: unknown) => Promise<unknown>; cancel: (request: unknown) => Promise<unknown> };
-      speech: { acknowledge: (request: unknown) => Promise<unknown>; cancel: (request: unknown) => Promise<unknown>; onEvent: (listener: (event: unknown) => void) => () => void };
+      speech: { acknowledge: (request: unknown) => Promise<unknown>; playChatResponse: (requestId: string) => Promise<boolean>;
+        cancel: (request: unknown) => Promise<unknown>; onEvent: (listener: (event: unknown) => void) => () => void };
       onEvent: (listener: (event: unknown) => void) => () => void;
       endDucking: (requestId: string, reason?: string) => Promise<boolean>;
     };
@@ -43,7 +44,7 @@ describe("Voice preload API", () => {
     const api = await loadPreload();
     expect(Object.keys(api.voice).sort()).toEqual(["endDucking", "onEvent", "ptt", "recordFollowupDiagnostic", "speech"]);
     expect(Object.keys(api.voice.ptt).sort()).toEqual(["cancel", "finish", "start"]);
-    expect(Object.keys(api.voice.speech).sort()).toEqual(["acknowledge", "cancel", "onEvent"]);
+    expect(Object.keys(api.voice.speech).sort()).toEqual(["acknowledge", "cancel", "onEvent", "playChatResponse"]);
     expect(api).not.toHaveProperty("ipcRenderer");
     expect(api).not.toHaveProperty("send");
 
@@ -79,6 +80,16 @@ describe("Voice preload API", () => {
     expect(received).toHaveBeenCalledWith({ requestId: request.requestId, state: "completed" });
     unsubscribe();
     expect(mocks.removeListener).toHaveBeenCalledWith("voice:speech:event", listener);
+  });
+
+  it("requests playback of a completed typed response by ID without accepting renderer text", async () => {
+    const api = await loadPreload();
+    mocks.invoke.mockResolvedValueOnce(true);
+    await expect(api.voice.speech.playChatResponse("request-1")).resolves.toBe(true);
+    expect(mocks.invoke).toHaveBeenLastCalledWith("voice:speech:chat-play", { requestId: "request-1" });
+    await expect(api.voice.speech.playChatResponse("")).rejects.toThrow("invalid_voice_chat_play_request_id");
+    mocks.invoke.mockResolvedValueOnce({ text: "unexpected" });
+    await expect(api.voice.speech.playChatResponse("request-2")).rejects.toThrow("invalid_voice_chat_play_response");
   });
 
   it("ends only an identified ducking lease through fixed IPC with a bounded reason", async () => {

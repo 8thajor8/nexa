@@ -15,6 +15,7 @@ export const VOICE_PTT_CANCEL_CHANNEL = "voice:ptt:cancel" as const;
 export const VOICE_EVENT_CHANNEL = "voice:event" as const;
 export const VOICE_SPEECH_CANCEL_CHANNEL = "voice:speech:cancel" as const;
 export const VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL = "voice:speech:acknowledgement" as const;
+export const VOICE_SPEECH_CHAT_PLAY_CHANNEL = "voice:speech:chat-play" as const;
 export const VOICE_SPEECH_EVENT_CHANNEL = "voice:speech:event" as const;
 export const VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL = "voice:followup:diagnostic" as const;
 export const VOICE_DUCKING_END_CHANNEL = "voice:ducking:end" as const;
@@ -313,6 +314,7 @@ export type VoiceSpeechCancelResponse =
   | { ok: false; requestId: string; error: "request_not_found" | "operation_failed" };
 export interface VoiceSpeechApi {
   acknowledge(request: VoiceSpeechAcknowledgementRequest): Promise<VoiceSpeechAcknowledgementResponse>;
+  playChatResponse(requestId: string): Promise<boolean>;
   cancel(request: VoiceSpeechCancelRequest): Promise<VoiceSpeechCancelResponse>;
   onEvent(listener: (event: VoiceSpeechEvent) => void): () => void;
 }

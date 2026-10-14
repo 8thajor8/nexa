@@ -65,6 +65,7 @@ function setScrollMetrics(element: HTMLElement, values: { scrollHeight: number; 
 }
 
 beforeEach(async () => {
+  window.localStorage.clear();
   controller = new FakeVoiceController();
   microphoneDevices = new MicrophoneDeviceStore({
     mediaDevices: { enumerateDevices: vi.fn(async () => [
@@ -105,6 +106,7 @@ beforeEach(async () => {
         cancel: vi.fn(async () => ({ ok: false, requestId: "unused", error: { code: "invalid_request", message: "unused" } })),
       },
       speech: {
+        playChatResponse: vi.fn(async () => true),
         acknowledge: vi.fn(async ({ requestId }: { requestId: string }) => ({ ok: true as const, requestId, accepted: true })),
         cancel: vi.fn(async ({ requestId }: { requestId: string }) => ({ ok: true as const, requestId, cancelled: true as const })),
         onEvent: vi.fn((listener: (event: import("../src/shared/ipc-contract").VoiceSpeechEvent) => void) => {
@@ -338,6 +340,46 @@ describe("App PTT DOM integration", () => {
     act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId, requestId: request.requestId, status: "completed", response: "Respuesta real" })));
     expect((await screen.findByText("Respuesta real")).closest("[data-message-source='runtime']")).toBeTruthy();
     expect(bridge.chat.sendMessage).toHaveBeenCalledOnce();
+    expect(bridge.voice.speech.playChatResponse).not.toHaveBeenCalled();
+  });
+
+  it("speaks a new typed reply only when enabled, keeps visible text, and opens no follow-up", async () => {
+    const view = await mountApp();
+    fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
+    expect((screen.getByRole("switch", { name: /Respuestas por voz/ }) as HTMLInputElement).checked).toBe(true);
+    fireEvent.change(screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" }), { target: { value: "Hola" } });
+    fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
+    await waitFor(() => expect(bridge.chat.sendMessage).toHaveBeenCalledOnce());
+    const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+    act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+      requestId: request.requestId, status: "completed", response: "Respuesta nueva" })));
+    expect(await screen.findByText("Respuesta nueva")).toBeTruthy();
+    await waitFor(() => expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledOnce());
+    expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledWith(request.requestId);
+    act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "preparing" })));
+    act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "completed" })));
+    expect(bridge.voice.ptt.start).not.toHaveBeenCalled();
+    expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledOnce();
+    view.rerender(createElement(App, { voiceController: controller as unknown as PttVoiceController, microphoneDevices }));
+    expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledOnce();
+  });
+
+  it("stops an active typed reply when the switch is turned off without cancelling chat", async () => {
+    await mountApp();
+    fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" }), { target: { value: "Hola" } });
+    fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
+    await waitFor(() => expect(bridge.chat.sendMessage).toHaveBeenCalledOnce());
+    const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+    act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+      requestId: request.requestId, status: "completed", response: "Texto conservado" })));
+    await waitFor(() => expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledWith(request.requestId));
+    act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "speaking" })));
+    fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
+    await waitFor(() => expect(bridge.voice.speech.cancel).toHaveBeenCalledWith({ requestId: request.requestId }));
+    await waitFor(() => expect(bridge.voice.endDucking).toHaveBeenCalledWith(request.requestId, "stop"));
+    expect(bridge.chat.cancelRequest).not.toHaveBeenCalled();
+    expect(await screen.findByText("Texto conservado")).toBeTruthy();
   });
 
   it("hides a stale Spotify uncertainty notice when a compatible state is observed", async () => {
@@ -378,6 +420,7 @@ describe("App PTT DOM integration", () => {
 
   it("opens one follow-up only after the spoken response completes", async () => {
     await mountApp();
+    fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
     act(() => controller.publish({ status: "transcript-ready", canStart: true, sessionId: "session-followup",
       requestId: "voice-followup", turnId: "turn-followup", transcript: "Explicame algo", language: "es" }));
     await waitFor(() => expect(bridge.chat.sendMessage).toHaveBeenCalledOnce());
@@ -402,6 +445,7 @@ describe("App PTT DOM integration", () => {
     expect(screen.getByRole("button", { name: "Detener interacción" })).toBeTruthy();
     act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "completed" })));
     expect(bridge.voice.ptt.start).toHaveBeenCalledOnce();
+    expect(bridge.voice.speech.playChatResponse).not.toHaveBeenCalled();
   });
 
   it("plays no acknowledgement when a voice request completes before the delay", async () => {

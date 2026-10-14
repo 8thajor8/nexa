@@ -5,6 +5,7 @@ import {
   VOICE_DUCKING_END_CHANNEL,
   VOICE_SPEECH_EVENT_CHANNEL,
   VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL,
+  VOICE_SPEECH_CHAT_PLAY_CHANNEL,
   VOICE_SPEECH_CANCEL_CHANNEL,
   VOICE_PTT_CANCEL_CHANNEL,
   VOICE_PTT_FINISH_CHANNEL,
@@ -22,6 +23,8 @@ vi.mock("electron", () => ({ ipcMain: ipcMock }));
 import {
   cleanupVoiceWindow,
   cancelVoiceSpeech,
+  rememberTypedChatResponse,
+  discardTypedChatVoiceResponse,
   continueVoiceDuckingForRequest,
   registerVoiceWindowNavigation,
   registerVoiceIpcHandlers,
@@ -153,6 +156,67 @@ describe("Electron Main Voice IPC", () => {
   beforeEach(() => {
     removeVoiceIpcHandlers();
     vi.clearAllMocks();
+  });
+
+  it("plays only the stored completed typed reply once, using the existing speaker and ducking", async () => {
+    const window = createWindow("typed-reply");
+    const audioDucking = { begin: vi.fn(async () => undefined), transfer: vi.fn(), end: vi.fn(async () => undefined),
+      endExcept: vi.fn(async () => undefined), close: vi.fn(async () => undefined) };
+    const speaker = { speak: vi.fn(async () => ({ completed: true as const })), speakPrepared: vi.fn(),
+      cancel: vi.fn(() => true), on: vi.fn(() => () => undefined) };
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL,
+      async () => ({ ...makeVoiceFactory(), createVoiceSpeaker: () => speaker }) as never,
+      undefined, undefined, undefined, audioDucking);
+    const requestId = "00000000-0000-4000-8000-000000000111";
+    rememberTypedChatResponse(window as never, requestId, "Respuesta escrita con https://example.com");
+    expect(await invoke(VOICE_SPEECH_CHAT_PLAY_CHANNEL, trustedEvent(window), { requestId })).toBe(true);
+    await vi.waitFor(() => expect(speaker.speak).toHaveBeenCalledOnce());
+    expect(audioDucking.begin).toHaveBeenCalledWith(requestId);
+    expect(await invoke(VOICE_SPEECH_CHAT_PLAY_CHANNEL, trustedEvent(window), { requestId })).toBe(false);
+    expect(speaker.speak).toHaveBeenCalledOnce();
+    expect(audioDucking.end).not.toHaveBeenCalled();
+    expect(invoke(VOICE_DUCKING_END_CHANNEL, trustedEvent(window), { requestId, reason: "completed" })).toBe(true);
+    expect(audioDucking.end).toHaveBeenCalledWith(requestId, "completed");
+    await expect(invoke(VOICE_SPEECH_CHAT_PLAY_CHANNEL, { sender: {} }, { requestId }))
+      .rejects.toThrow("untrusted_voice_ipc_sender");
+  });
+
+  it("discards an obsolete typed reply and stops its audio without releasing a later owner", async () => {
+    const window = createWindow("obsolete-typed-reply");
+    const audioDucking = { begin: vi.fn(async () => undefined), transfer: vi.fn(), end: vi.fn(async () => undefined),
+      endExcept: vi.fn(async () => undefined), close: vi.fn(async () => undefined) };
+    const speaker = { speak: vi.fn(async () => ({ completed: true as const })), speakPrepared: vi.fn(),
+      cancel: vi.fn(() => true), on: vi.fn(() => () => undefined) };
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL,
+      async () => ({ ...makeVoiceFactory(), createVoiceSpeaker: () => speaker }) as never,
+      undefined, undefined, undefined, audioDucking);
+    const oldId = "00000000-0000-4000-8000-000000000112";
+    const newId = "00000000-0000-4000-8000-000000000113";
+    rememberTypedChatResponse(window as never, oldId, "Vieja");
+    discardTypedChatVoiceResponse(window as never);
+    expect(await invoke(VOICE_SPEECH_CHAT_PLAY_CHANNEL, trustedEvent(window), { requestId: oldId })).toBe(false);
+    rememberTypedChatResponse(window as never, newId, "Nueva");
+    expect(await invoke(VOICE_SPEECH_CHAT_PLAY_CHANNEL, trustedEvent(window), { requestId: newId })).toBe(true);
+    await vi.waitFor(() => expect(speaker.speak).toHaveBeenCalledOnce());
+    expect(invoke(VOICE_DUCKING_END_CHANNEL, trustedEvent(window), { requestId: oldId, reason: "stop" })).toBe(false);
+    expect(audioDucking.end).not.toHaveBeenCalled();
+  });
+
+  it("restores ducking after a typed TTS failure without changing the completed chat response", async () => {
+    const window = createWindow("typed-tts-error");
+    const audioDucking = { begin: vi.fn(async () => undefined), transfer: vi.fn(), end: vi.fn(async () => undefined),
+      endExcept: vi.fn(async () => undefined), close: vi.fn(async () => undefined) };
+    const speaker = { speak: vi.fn(), speakPrepared: vi.fn(), cancel: vi.fn(() => true), on: vi.fn(() => () => undefined) };
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL,
+      async () => ({ ...makeVoiceFactory(), createVoiceSpeaker: () => speaker }) as never,
+      undefined, async () => makeAudio(), async () => ({ audio: null, errorCode: "voice_audio_processing_failed" }), audioDucking);
+    const requestId = "00000000-0000-4000-8000-000000000114";
+    rememberTypedChatResponse(window as never, requestId, "Respuesta visible");
+    expect(await invoke(VOICE_SPEECH_CHAT_PLAY_CHANNEL, trustedEvent(window), { requestId })).toBe(true);
+    await vi.waitFor(() => expect(audioDucking.end).toHaveBeenCalledWith(requestId, "error"));
+    expect(speaker.speak).not.toHaveBeenCalled();
+    expect(window.webContents.send).toHaveBeenCalledWith(VOICE_SPEECH_EVENT_CHANNEL,
+      { requestId, state: "error", error: { code: "voice_audio_processing_failed" } });
   });
 
   it("accepts only bounded follow-up diagnostic outcomes from the trusted renderer", () => {

@@ -24,6 +24,8 @@ interface DashboardModulesProps {
   spotifyError?: string | null;
   onSpotifyControl?: (action: SpotifyPlaybackControl) => void;
   onOpenSpotifyTrack?: (url: string) => void;
+  voiceRepliesEnabled?: boolean;
+  onVoiceRepliesChange?: (enabled: boolean) => void;
 }
 
 function SpotifyMiniPlayer({ status, busyAction, error, onControl, onOpenTrack }: {
@@ -64,7 +66,7 @@ function SpotifyMiniPlayer({ status, busyAction, error, onControl, onOpenTrack }
 }
 
 export function DashboardModules({ assistantState, spotifyStatus, spotifyBusyAction = null, spotifyError = null,
-  onSpotifyControl, onOpenSpotifyTrack }: DashboardModulesProps) {
+  onSpotifyControl, onOpenSpotifyTrack, voiceRepliesEnabled = false, onVoiceRepliesChange }: DashboardModulesProps) {
   return (
     <section className="dashboard-modules" aria-label="Módulos del Command Center">
       <section className="dashboard-module surface-panel" aria-labelledby="activity-title">
@@ -93,6 +95,13 @@ export function DashboardModules({ assistantState, spotifyStatus, spotifyBusyAct
             </li>
           ))}
         </ul>
+        <label className="tool-voice-replies">
+          <span className="tool-voice-replies__copy"><strong>Respuestas por voz</strong>
+            <small>Nexa lee sus respuestas en voz alta, incluso cuando escribís por chat</small></span>
+          <input type="checkbox" role="switch" checked={voiceRepliesEnabled}
+            onChange={(event) => onVoiceRepliesChange?.(event.target.checked)} />
+          <span className="tool-voice-replies__switch" aria-hidden="true" />
+        </label>
       </section>
 
       <section className="dashboard-module dashboard-module--system surface-panel" aria-labelledby="system-title">

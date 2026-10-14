@@ -13,6 +13,7 @@ import {
   VOICE_PTT_FINISH_CHANNEL,
   VOICE_PTT_START_CHANNEL,
   VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL,
+  VOICE_SPEECH_CHAT_PLAY_CHANNEL,
   VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL,
   VOICE_DUCKING_END_CHANNEL,
   type VoiceEventEnvelope,
@@ -134,6 +135,8 @@ const stoppedVoiceRequests = new WeakMap<VoiceIpcWindow, Set<string>>();
 const navigatingWindows = new WeakSet<VoiceIpcWindow>();
 const navigationHooks = new WeakSet<VoiceIpcWindow>();
 const duckingRequestByWindow = new Map<VoiceIpcWindow, string>();
+const pendingTypedChatResponse = new WeakMap<VoiceIpcWindow, { requestId: string; text: string }>();
+const activeTypedChatSpeech = new WeakMap<VoiceIpcWindow, string>();
 let configuredAudioDucking: VoiceAudioDuckingPort | null = null;
 type VoiceDiagnosticEvent = { requestId: string; stage: string; state: string; errorCode?: string; durationMs?: number | null;
   cancellation?: string; metrics?: Record<string, unknown> | null };
@@ -147,6 +150,19 @@ function releaseVoiceDucking(window: VoiceIpcWindow, requestId?: string, reason:
   if (!activeRequestId || (requestId !== undefined && requestId !== activeRequestId)) return;
   duckingRequestByWindow.delete(window);
   void configuredAudioDucking?.end(activeRequestId, reason).catch(() => undefined);
+}
+
+export function rememberTypedChatResponse(window: VoiceIpcWindow, requestId: string, text: string): void {
+  if (isVoiceId(requestId) && typeof text === "string") pendingTypedChatResponse.set(window, { requestId, text });
+}
+
+export function discardTypedChatVoiceResponse(window: VoiceIpcWindow): void {
+  pendingTypedChatResponse.delete(window);
+  const activeRequestId = activeTypedChatSpeech.get(window);
+  if (!activeRequestId) return;
+  activeTypedChatSpeech.delete(window);
+  cancelVoiceSpeech(window, "user", activeRequestId);
+  releaseVoiceDucking(window, activeRequestId, "superseded");
 }
 
 function transferVoiceDucking(window: VoiceIpcWindow, requestId: string): boolean {
@@ -784,6 +800,7 @@ export function registerVoiceIpcHandlers(
   ipcMain.removeHandler(VOICE_PTT_CANCEL_CHANNEL);
   ipcMain.removeHandler(VOICE_SPEECH_CANCEL_CHANNEL);
   ipcMain.removeHandler(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL);
+  ipcMain.removeHandler(VOICE_SPEECH_CHAT_PLAY_CHANNEL);
   ipcMain.removeHandler(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL);
   ipcMain.removeHandler(VOICE_DUCKING_END_CHANNEL);
 
@@ -937,6 +954,7 @@ export function registerVoiceIpcHandlers(
     if (!isVoiceSpeechCancelRequest(payload)) throw new Error("invalid_voice_speech_cancel_request");
     const requestId = payload.requestId;
     const cancelled = cancelVoiceSpeech(window, "user", requestId);
+    if (activeTypedChatSpeech.get(window) === requestId) activeTypedChatSpeech.delete(window);
     if (cancelled) releaseVoiceDucking(window, requestId, "stop");
     return cancelled ? { ok: true as const, requestId, cancelled: true as const }
       : { ok: false as const, requestId, error: "request_not_found" as const };
@@ -949,6 +967,23 @@ export function registerVoiceIpcHandlers(
     const request = payload as VoiceSpeechAcknowledgementRequest;
     return { ok: true as const, requestId: request.requestId,
       accepted: await speakVoiceAcknowledgement(window, request.requestId) };
+  });
+  ipcMain.handle(VOICE_SPEECH_CHAT_PLAY_CHANNEL, async (event: IpcMainInvokeEvent, payload: unknown) => {
+    const window = getMainWindow();
+    if (!isTrustedVoiceSender(event, window, expectedRendererUrl)) throw new Error("untrusted_voice_ipc_sender");
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)
+      || Object.keys(payload).length !== 1 || !Object.hasOwn(payload, "requestId")
+      || !isVoiceId((payload as { requestId: unknown }).requestId)) throw new Error("invalid_voice_chat_play_request");
+    const requestId = (payload as { requestId: string }).requestId;
+    const pending = pendingTypedChatResponse.get(window);
+    if (!pending || pending.requestId !== requestId) return false;
+    pendingTypedChatResponse.delete(window);
+    activeTypedChatSpeech.set(window, requestId);
+    duckingRequestByWindow.set(window, requestId);
+    await configuredAudioDucking?.begin(requestId).catch(() => undefined);
+    if (activeTypedChatSpeech.get(window) !== requestId) return false;
+    void speakVoiceResponse(window, requestId, pending.text);
+    return true;
   });
   ipcMain.handle(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL, (event: IpcMainInvokeEvent, payload: unknown) => {
     const window = getMainWindow();
@@ -977,6 +1012,8 @@ export function registerVoiceIpcHandlers(
 }
 
 export function cleanupVoiceWindow(window: VoiceIpcWindow): void {
+  pendingTypedChatResponse.delete(window);
+  activeTypedChatSpeech.delete(window);
   releaseVoiceDucking(window);
   cancelVoiceSpeech(window, "session_ended");
   const state = activeSessions.get(window);
@@ -994,6 +1031,7 @@ export function removeVoiceIpcHandlers(): void {
   ipcMain.removeHandler(VOICE_PTT_CANCEL_CHANNEL);
   ipcMain.removeHandler(VOICE_SPEECH_CANCEL_CHANNEL);
   ipcMain.removeHandler(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL);
+  ipcMain.removeHandler(VOICE_SPEECH_CHAT_PLAY_CHANNEL);
   ipcMain.removeHandler(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL);
   ipcMain.removeHandler(VOICE_DUCKING_END_CHANNEL);
   for (const [window, speech] of speechOwners) {
