@@ -18,6 +18,7 @@
     "smoke:distribution": "node scripts/smoke-distribution.mjs"
   },
   "dependencies": {
+    "@ricky0123/vad-web": "0.0.31",
     "react": "19.3.0",
     "react-dom": "19.3.0"
   },

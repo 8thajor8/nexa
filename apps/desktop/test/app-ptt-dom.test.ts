@@ -7,6 +7,11 @@ import type { NexaDesktopApi, VoiceEventEnvelope } from "../src/shared/ipc-contr
 import App from "../src/renderer/App";
 import type { PttVoiceController, PttVoiceSnapshot } from "../src/renderer/voice/ptt-voice-controller";
 import { MicrophoneDeviceStore } from "../src/renderer/audio/microphone-device-store";
+import { MicVAD } from "@ricky0123/vad-web";
+
+vi.mock("@ricky0123/vad-web", () => ({ MicVAD: { new: vi.fn(async () => ({
+  start: vi.fn(async () => undefined), pause: vi.fn(async () => undefined), destroy: vi.fn(async () => undefined),
+})) } }));
 
 class FakeVoiceController {
   snapshot: PttVoiceSnapshot = { status: "idle", canStart: true };
@@ -330,7 +335,7 @@ describe("App PTT DOM integration", () => {
     expect(request).toMatchObject({ text: "Hola Nexa", source: "typed" });
     expect(screen.getByText("Hola Nexa").closest("[data-message-source='typed']")).toBeTruthy();
     act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId, requestId: request.requestId, status: "completed", response: "Respuesta real" })));
-    expect(screen.getByText("Respuesta real").closest("[data-message-source='runtime']")).toBeTruthy();
+    expect((await screen.findByText("Respuesta real")).closest("[data-message-source='runtime']")).toBeTruthy();
     expect(bridge.chat.sendMessage).toHaveBeenCalledOnce();
   });
 
@@ -368,6 +373,26 @@ describe("App PTT DOM integration", () => {
       turnId: "voice-turn", transcript: "Mensaje hablado", language: "es" }));
     expect(bridge.chat.sendMessage).toHaveBeenCalledOnce();
     expect(screen.getAllByText("Mensaje hablado")).toHaveLength(1);
+  });
+
+  it("opens one follow-up only after the spoken response completes", async () => {
+    await mountApp();
+    act(() => controller.publish({ status: "transcript-ready", canStart: true, sessionId: "session-followup",
+      requestId: "voice-followup", turnId: "turn-followup", transcript: "Explicame algo", language: "es" }));
+    await waitFor(() => expect(bridge.chat.sendMessage).toHaveBeenCalledOnce());
+    const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+    act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+      requestId: request.requestId, status: "completed", response: "Respuesta hablada" })));
+    act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "preparing" })));
+    await waitFor(() => expect(MicVAD.new).toHaveBeenCalledWith(expect.objectContaining({
+      startOnLoad: false, baseAssetPath: "nexa-vad://assets/", onnxWASMBasePath: "nexa-vad://assets/",
+    })));
+    act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "speaking" })));
+    expect(bridge.voice.ptt.start).not.toHaveBeenCalled();
+    act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "completed" })));
+    await waitFor(() => expect(bridge.voice.ptt.start).toHaveBeenCalledOnce());
+    act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "completed" })));
+    expect(bridge.voice.ptt.start).toHaveBeenCalledOnce();
   });
 
   it("plays no acknowledgement when a voice request completes before the delay", async () => {

@@ -89,9 +89,9 @@ export function createContentSecurityPolicy(development: boolean): string {
   return [
     "default-src 'self'", "base-uri 'self'", "object-src 'none'",
     "frame-ancestors 'none'", "form-action 'self'",
-    "script-src 'self'" + developmentScriptSources,
+    "script-src 'self' nexa-vad: 'wasm-unsafe-eval'" + developmentScriptSources,
     "style-src 'self'" + developmentStyleSources,
     "img-src 'self' data: https://i.scdn.co", "font-src 'self'",
-    "connect-src 'self'" + developmentConnections,
+    "connect-src 'self' nexa-vad:" + developmentConnections,
   ].join("; ");
 }

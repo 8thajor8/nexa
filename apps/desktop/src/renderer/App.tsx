@@ -5,6 +5,7 @@ import type { AuthorizationProvider, ChatAuthorizationRequirement, ChatEventEnve
 import { ASSISTANT_STATE_LABELS, createMockAssistantStateProvider } from "../shared/assistant-state";
 import { loadDesktopPreferences, saveDesktopPreferences, type DesktopPreferences } from "./desktop-preferences";
 import type { PttVoiceControllerPort, PttVoiceSnapshot, PttVoiceStatus } from "./voice/ptt-voice-controller";
+import { VoiceFollowupController, type FollowupTranscript } from "./voice/voice-followup-controller";
 import { ConversationPanel, type ConversationChatMessage, type VoiceTranscriptItem } from "./components/ConversationPanel";
 import { PresencePanel } from "./components/PresencePanel";
 import { Sidebar } from "./components/Sidebar";
@@ -71,6 +72,13 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const voiceSnapshot = useSyncExternalStore(
     voiceController.subscribe, voiceController.getSnapshot, voiceController.getSnapshot,
   );
+  const followupSubmit = useRef<(value: FollowupTranscript) => void>(() => undefined);
+  const followup = useMemo(() => new VoiceFollowupController(window.nexaDesktop.voice, {
+    getDeviceId: () => microphoneDevices.getSnapshot().selectedDeviceId,
+    onAcceptedTranscript: (value) => followupSubmit.current(value),
+  }), [microphoneDevices]);
+  const followupActive = useSyncExternalStore(followup.subscribe, followup.getSnapshot, followup.getSnapshot);
+  const followupEligibleRequests = useRef(new Set<string>());
   const [chatMessages, setChatMessages] = useState<ConversationChatMessage[]>([]);
   const [chatNotice, setChatNotice] = useState<string | null>(null);
   const [authorizationRequirements, setAuthorizationRequirements] = useState<Record<string, ChatAuthorizationRequirement>>({});
@@ -189,6 +197,10 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       return;
     }
     const requestId = voice?.requestId ?? globalThis.crypto.randomUUID();
+    if (source === "typed") {
+      followupEligibleRequests.current.clear();
+      void followup.stop();
+    }
     if (activeChatRequest.current && source === "typed") {
       setChatNotice("Ya hay una solicitud activa en esta conversación.");
       return;
@@ -215,6 +227,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     setChatNotice(null);
     if (source === "voice") {
       voiceChatRequests.current.add(requestId);
+      followupEligibleRequests.current.add(requestId);
       const timer = window.setTimeout(() => {
         acknowledgementTimers.current.delete(requestId);
         const completed = completedVoiceChatRequests.current.has(requestId);
@@ -234,6 +247,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         acknowledgementTimers.current.delete(requestId);
         terminalChatRequests.current.add(requestId);
         voiceChatRequests.current.delete(requestId);
+        followupEligibleRequests.current.delete(requestId);
         completedVoiceChatRequests.current.delete(requestId);
         if (activeChatRequest.current === requestId) activeChatRequest.current = null;
         setChatMessages((current) => current.map((entry) => entry.requestId === requestId
@@ -250,6 +264,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       acknowledgementTimers.current.delete(requestId);
       terminalChatRequests.current.add(requestId);
       voiceChatRequests.current.delete(requestId);
+      followupEligibleRequests.current.delete(requestId);
       completedVoiceChatRequests.current.delete(requestId);
       if (activeChatRequest.current === requestId) activeChatRequest.current = null;
       setChatMessages((current) => current.map((entry) => entry.requestId === requestId
@@ -257,7 +272,10 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         : entry));
       setChatNotice("No se confirmó el envío. No se reintentó automáticamente.");
     }
-  }, [chatConversationId]);
+  }, [chatConversationId, followup]);
+  followupSubmit.current = (value) => {
+    void submitChatMessage(value.text, "voice", value);
+  };
 
   const handleChatEvent = useCallback((event: ChatEventEnvelope) => {
     if (event.conversationId !== chatConversationIdRef.current || !knownChatRequests.current.has(event.requestId)
@@ -356,6 +374,9 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     if (!speech) return;
     return speech.onEvent((event: VoiceSpeechEvent) => {
       if (event.state === "preparing") {
+        void followup.stop().then(() => {
+          if (followupEligibleRequests.current.has(event.requestId)) followup.prepare();
+        });
         activeVoiceSpeechRequest.current = event.requestId;
         setVoiceSpeechStatus({ requestId: event.requestId, state: "preparing" });
         return;
@@ -370,6 +391,8 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         setVoiceSpeechStatus({ requestId: event.requestId, state: "speaking" });
       }
       else if (event.state === "error") {
+        followupEligibleRequests.current.delete(event.requestId);
+        void followup.stop();
         const timer = acknowledgementTimers.current.get(event.requestId);
         if (timer !== undefined) window.clearTimeout(timer);
         acknowledgementTimers.current.delete(event.requestId);
@@ -381,6 +404,9 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
           message: VOICE_SPEECH_ERRORS[event.error?.code ?? "voice_speech_playback_failed"] });
       }
       else {
+        const shouldFollowup = event.state === "completed" && followupEligibleRequests.current.delete(event.requestId)
+          && !cancellingVoiceSpeechRequests.current.has(event.requestId);
+        followupEligibleRequests.current.delete(event.requestId);
         const timer = acknowledgementTimers.current.get(event.requestId);
         if (timer !== undefined) window.clearTimeout(timer);
         acknowledgementTimers.current.delete(event.requestId);
@@ -389,14 +415,17 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         activeVoiceSpeechRequest.current = null;
         cancellingVoiceSpeechRequests.current.delete(event.requestId);
         setVoiceSpeechStatus(null);
+        if (shouldFollowup) void followup.open();
+        else void followup.stop();
       }
     });
-  }, []);
+  }, [followup]);
 
   useEffect(() => () => {
+    void followup.stop();
     for (const timer of acknowledgementTimers.current.values()) window.clearTimeout(timer);
     acknowledgementTimers.current.clear();
-  }, []);
+  }, [followup]);
 
   const cancelVoiceSpeech = useCallback(async () => {
     const requestId = activeVoiceSpeechRequest.current;
@@ -472,11 +501,13 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     const voiceStatus = voiceController.getSnapshot().status;
     const captureActive = ["starting", "listening", "finishing", "processing"].includes(voiceStatus)
       || (voiceStatus === "error" && !voiceController.getSnapshot().canStart && Boolean(voiceController.getSnapshot().sessionId));
-    if (!requestId && !speechRequestId && !captureActive) return;
+    if (!requestId && !speechRequestId && !captureActive && !followup.getSnapshot()) return;
+    followupEligibleRequests.current.clear();
     cancellationInFlight.current = true;
     setCancellationPending(true);
     try {
       const cancellations: Promise<void>[] = [];
+      cancellations.push(followup.stop());
       if (requestId) {
         cancellations.push((async () => {
           try {
@@ -512,7 +543,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       cancellationInFlight.current = false;
       setCancellationPending(false);
     }
-  }, [cancelVoiceSpeech, voiceController]);
+  }, [cancelVoiceSpeech, voiceController, followup]);
 
   useEffect(() => {
     if (voiceSnapshot.status === "starting" || voiceSnapshot.status === "listening") {
@@ -593,10 +624,10 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
             onOpenSpotifyTrack={(url) => { void openSpotifyTrack(url); }}
             transcriptNotice={voiceTranscriptNotice}
             voiceSpeechStatus={voiceSpeechStatus}
-            onStart={() => { void voiceController.start(); }}
+            onStart={() => { followupEligibleRequests.current.clear(); void followup.stop().then(() => voiceController.start()); }}
             onFinish={() => { void voiceController.finish(); }}
             onRecover={() => { void voiceController.recoverMainCancellation(); }}
-            interactionCancelable={activeChatRequest.current !== null || activeVoiceSpeechRequest.current !== null
+            interactionCancelable={followupActive || activeChatRequest.current !== null || activeVoiceSpeechRequest.current !== null
               || voiceChatRequests.current.size > 0
               || ["starting", "listening", "finishing", "processing"].includes(voiceSnapshot.status)
               || (voiceSnapshot.status === "error" && !voiceSnapshot.canStart && Boolean(voiceSnapshot.sessionId))}

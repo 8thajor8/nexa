@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Menu, screen, session, shell } from "electron";
+import { app, BrowserWindow, ipcMain, Menu, protocol, screen, session, shell } from "electron";
 import { lstat, mkdir, readFile } from "node:fs/promises";
 // @ts-expect-error The repository's JavaScript Runtime intentionally has no generated declaration file.
 import { createConversationRuntime } from "../../../../src/core/conversation-runtime.js";
@@ -160,6 +160,32 @@ async function prepareDesktopVoiceResponseAudio(text: string, signal: AbortSigna
 }
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
+const vadAssetNames = new Set([
+  "silero_vad_v6.onnx", "vad.worklet.bundle.min.js",
+  "ort-wasm-simd-threaded.mjs", "ort-wasm-simd-threaded.wasm",
+]);
+protocol.registerSchemesAsPrivileged([{ scheme: "nexa-vad", privileges: {
+  standard: true, secure: true, supportFetchAPI: true, corsEnabled: true,
+} }]);
+
+function registerVadAssets(): void {
+  protocol.handle("nexa-vad", async (request) => {
+    const url = new URL(request.url);
+    const name = url.hostname === "assets" && !url.search && !url.hash ? url.pathname.slice(1) : "";
+    if (!vadAssetNames.has(name)) return new Response(null, { status: 404 });
+    const source = name === "silero_vad_v6.onnx" || name === "vad.worklet.bundle.min.js"
+      ? resolve(appRoot, "node_modules", "@ricky0123", "vad-web", "dist", name)
+      : resolve(appRoot, "node_modules", "onnxruntime-web", "dist", name);
+    const path = app.isPackaged ? resolve(appRoot, "dist", "vad", name) : source;
+    try {
+      const bytes = await readFile(path);
+      const contentType = name.endsWith(".js") || name.endsWith(".mjs") ? "text/javascript"
+        : name.endsWith(".wasm") ? "application/wasm" : "application/octet-stream";
+      return new Response(bytes, { headers: { "Content-Type": contentType,
+        "Access-Control-Allow-Origin": "*", "Cross-Origin-Resource-Policy": "cross-origin" } });
+    } catch { return new Response(null, { status: 404 }); }
+  });
+}
 const repositoryRoot = resolve(appRoot, "..", "..");
 async function readPreparedVoiceAcknowledgement(id: "clear" | "review" | "moment"): Promise<Uint8Array | null> {
   const filePath = resolve(repositoryRoot, "apps", "desktop", "resources", "voice-acknowledgements", `${id}.wav`);
@@ -597,6 +623,7 @@ function installWebContentsGuards(): void {
 }
 
   app.whenReady().then(async () => {
+  registerVadAssets();
   if (desktopIsolation?.organicPilot) {
     try {
       organicPilotSession = await createSyntheticOrganicPilotSession({ storePath: desktopIsolation.memoryStorePath,

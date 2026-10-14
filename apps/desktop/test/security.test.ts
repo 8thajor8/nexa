@@ -43,7 +43,9 @@ describe("Electron security configuration", () => {
     expect(productionPolicy).not.toContain("127.0.0.1");
     expect(developmentPolicy).toContain("127.0.0.1:5174");
     expect(developmentPolicy).toContain("ws://127.0.0.1:5174");
-    expect(developmentPolicy).not.toContain("unsafe-eval");
+    expect(developmentPolicy).not.toContain("'unsafe-eval'");
+    expect(developmentPolicy).toContain("'wasm-unsafe-eval'");
+    expect(developmentPolicy).toContain("nexa-vad:");
   });
   it("allows only the configured entry point", () => {
     expect(isAllowedNavigation("file:///app/dist/index.html", "file:///app/dist/index.html")).toBe(true);
