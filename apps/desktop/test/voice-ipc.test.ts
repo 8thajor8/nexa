@@ -317,6 +317,60 @@ describe("Electron Main Voice IPC", () => {
     expect(speaker.speak).toHaveBeenCalledOnce();
   });
 
+  it.each(["quick time-tool result", "quick Spotify action"])(
+    "does not signal follow-up completion when a %s acknowledgement ends before final response preparation",
+    async () => {
+      const window = createWindow("quick-ack-response");
+      const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+      let idFactory = () => "";
+      let turnId = "";
+      let playbackState = "idle";
+      let finishAcknowledgement: (() => void) | undefined;
+      const speaker = {
+        getPlaybackState: () => playbackState,
+        speakPrepared: vi.fn(() => {
+          turnId = idFactory();
+          playbackState = "playing";
+          return new Promise<null>((resolve) => {
+            finishAcknowledgement = () => {
+              playbackState = "idle";
+              listeners.get("voice.speech.completed")?.({ turnId });
+              resolve(null);
+            };
+          });
+        }),
+        speak: vi.fn(async () => {
+          turnId = idFactory();
+          listeners.get("voice.speaking")?.({ turnId });
+          listeners.get("voice.playback.started")?.({ turnId });
+          listeners.get("voice.speech.completed")?.({ turnId });
+          return { completed: true as const };
+        }),
+        cancel: vi.fn(() => { playbackState = "idle"; finishAcknowledgement?.(); return true; }),
+        on: vi.fn((type: string, listener: (event: Record<string, unknown>) => void) => {
+          listeners.set(type, listener); return () => listeners.delete(type);
+        }),
+      };
+      const api = { createVoiceSpeaker: vi.fn((options: { idFactory: () => string }) => {
+        idFactory = options.idFactory; return speaker;
+      }) };
+      registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never,
+        undefined, async () => makeAudio());
+      const requestId = "00000000-0000-4000-8000-000000000074";
+      await invoke(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL, trustedEvent(window), { requestId });
+      await vi.waitFor(() => expect(speaker.speakPrepared).toHaveBeenCalledOnce());
+
+      finishAcknowledgement?.();
+      expect(window.webContents.send.mock.calls.map(([, payload]) => payload))
+        .not.toContainEqual({ requestId, state: "completed" });
+
+      await speakVoiceResponse(window as never, requestId, "Respuesta final del proveedor");
+      expect(window.webContents.send.mock.calls.map(([, payload]) => payload)
+        .filter((payload) => payload && typeof payload === "object" && "state" in payload && payload.state === "completed"))
+        .toHaveLength(1);
+    },
+  );
+
   it("prepares the main response while a cached acknowledgement plays, then stops it before confirmed response playback", async () => {
     const window = createWindow("ack-during-tts");
     const listeners = new Map<string, (event: Record<string, unknown>) => void>();

@@ -314,15 +314,18 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
         }),
         owner.speaker.on("voice.speech.completed", (event) => {
           if (typeof event.turnId !== "string") return;
-          const responseStillActive = owner.activeRequestId === event.turnId
-            && owner.activeKind === "acknowledgement"
+          const matchingRequestActive = owner.activeRequestId === event.turnId;
+          const acknowledgementStillActive = matchingRequestActive && owner.activeKind === "acknowledgement";
+          const responseStillPreparing = matchingRequestActive && owner.activeKind === "response_preparing"
             && pendingResponsePreparations.get(window)?.has(event.turnId) === true;
+          const responseStillActive = responseStillPreparing
+            || (acknowledgementStillActive && pendingResponsePreparations.get(window)?.has(event.turnId) === true);
           if (owner.acknowledgementEnd?.requestId === event.turnId) {
             owner.acknowledgementEnd.resolve();
             owner.acknowledgementEnd = null;
           }
           if (responseStillActive) owner.activeKind = "response_preparing";
-          else emitSpeechEvent(window, { requestId: event.turnId, state: "completed" });
+          else if (!acknowledgementStillActive) emitSpeechEvent(window, { requestId: event.turnId, state: "completed" });
           const details = event.diagnostics as Record<string, unknown> | undefined;
           recordVoice({ requestId: event.turnId, stage: "playback", state: "success",
             durationMs: typeof details?.durationMs === "number" ? details.durationMs : null,
