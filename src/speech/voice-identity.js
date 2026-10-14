@@ -169,7 +169,7 @@ export function createSignalsmithVoiceRenderer({ browserType = chromium, renderi
         let rendered;
         try {
             rendered = await preparedPage.page.evaluate(async ({ source, sampleRate: rate, pitch, formant, baseHz, mode }) => {
-                    const input = Float32Array.from(source);
+                    const input = source;
                     const started = performance.now();
                     const context = mode === 'offline'
                         ? new OfflineAudioContext(1, input.length + rate * 2, rate)
@@ -241,13 +241,13 @@ export function createSignalsmithVoiceRenderer({ browserType = chromium, renderi
                     else output.set(captured.subarray(0, output.length), -alignedOffset);
                     if (firstFrame === null || captured.length < outputFrame - firstFrame + output.length) throw new Error('signalsmith_capture_incomplete');
                     const processingMs = performance.now() - started;
-            return { output: Array.from(output), latencySeconds, processingMs, setupMs,
+            return { output, latencySeconds, processingMs, setupMs,
                 captureWaitMs: performance.now() - captureStartedAt, capturedFrames: captured.length, alignedOffset };
             } finally {
                 if (typeof context.close === 'function') await context.close();
             }
                 }, {
-                    source: Array.from(samples), sampleRate,
+                    source: samples, sampleRate,
                     pitch: settings.pitchSemitones,
                     formant: settings.formantSemitones,
                     baseHz: settings.formantBaseHz,
