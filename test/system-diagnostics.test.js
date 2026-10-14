@@ -14,6 +14,16 @@ test('classifies supported Spanish system and memory questions without matching 
     assert.equal(classifySystemDiagnosticRequest('¿Qué editor de código prefiero?'), null);
     assert.equal(classifySystemDiagnosticRequest('Dame el diagnóstico técnico de Voice'), 'technical_voice');
     assert.equal(classifySystemDiagnosticRequest('¿Cuál es el estado de PTT?'), 'technical_voice');
+    assert.equal(classifySystemDiagnosticRequest('Nexa, dame tu diagnóstico'), 'status');
+    assert.equal(classifySystemDiagnosticRequest('Nexa diagnóstico'), 'status');
+    assert.equal(classifySystemDiagnosticRequest('¿Cómo están tus sistemas?'), 'status');
+    assert.equal(classifySystemDiagnosticRequest('Dame tu estado operativo'), 'status');
+    assert.equal(classifySystemDiagnosticRequest('¿Está funcionando tu memoria?'), 'memory');
+    assert.equal(classifySystemDiagnosticRequest('Diagnóstico de voz'), 'technical_voice');
+    for (const text of ['diagnóstico', '¿Cómo está mi PC?', 'Revisá mi computadora', 'Diagnosticá Windows',
+        'Revisá los procesos de mi computadora', '¿Qué memoria usa mi computadora?']) {
+        assert.equal(classifySystemDiagnosticRequest(text), null, `${text} must not be routed to Nexa status`);
+    }
 });
 
 test('Voice diagnostics retain bounded safe stage metadata and omit conversation, audio, and credentials', () => {

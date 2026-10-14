@@ -194,7 +194,9 @@ export function createConversationRuntime({
         try {
             if (systemDiagnosticKind) {
                 const snapshot = getSystemDiagnosticsSnapshot(conversation);
-                const technical = systemDiagnosticKind.startsWith('technical_');
+                // Spoken diagnostics must remain a concise natural-language summary; the
+                // structured technical detail remains attached for the existing copy action.
+                const technical = systemDiagnosticKind.startsWith('technical_') && source !== 'voice';
                 if (systemDiagnosticKind.startsWith('tool_catalog')) {
                     const catalog = formatToolCatalog(snapshot, { category: systemDiagnosticKind === 'tool_catalog_spotify' ? 'Música y Spotify' : null });
                     const result = { conversationId: entry.conversationId, requestId: entry.requestId,

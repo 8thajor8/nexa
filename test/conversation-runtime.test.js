@@ -328,7 +328,7 @@ test('system status and tool catalog carry per-response technical metadata witho
     const memory = await runtime.sendMessage({ conversationId, requestId: 'format-memory-1',
         text: '¿Qué sistema de memoria estás usando?', source: 'typed' });
     assert.equal(memory.status, 'completed');
-    assert.match(memory.text, /Estado de mi memoria/u);
+    assert.match(memory.text, /Diagnóstico de Nexa/u);
     assert.doesNotMatch(memory.text, /spotify_play|open_app/u);
     assert.equal(memory.presentation.kind, 'diagnostic');
     assert.match(memory.presentation.technicalDetail, /memory2-readonly/u);
@@ -347,4 +347,30 @@ test('system status and tool catalog carry per-response technical metadata witho
     assert.doesNotMatch(spotify.text, /Computadora y aplicaciones|open_app/u);
     assert.match(spotify.text, /No comprobé el estado de conexión/u);
     await runtime.close();
+});
+
+test('explicit Nexa diagnostics bypass the agent and voice diagnostics keep a speakable summary with technical detail attached', async () => {
+    let agentCalls = 0;
+    const runtime = createConversationRuntime({
+        agentFactory: () => { agentCalls++; throw new Error('agent must not start for a direct diagnostic'); },
+        memoryMode: 'memory2-readonly',
+    });
+    const conversationId = runtime.createConversation();
+    try {
+        for (const [requestId, text] of [['nexa-status-1', 'Nexa, dame tu diagnóstico'],
+            ['nexa-status-2', '¿Cómo están tus sistemas?']]) {
+            const result = await runtime.sendMessage({ conversationId, requestId, text, source: 'typed' });
+            assert.equal(result.status, 'completed');
+            assert.match(result.text, /Diagnóstico de Nexa/u);
+            assert.equal(result.presentation.kind, 'diagnostic');
+        }
+        const voice = await runtime.sendMessage({ conversationId, requestId: 'nexa-voice-diagnostic-1',
+            text: 'Diagnóstico de voz', source: 'voice' });
+        assert.equal(voice.status, 'completed');
+        assert.match(voice.text, /Diagnóstico de Nexa/u);
+        assert.doesNotMatch(voice.text, /Herramientas registradas \(|runtime-[0-9a-f-]{36}/iu);
+        assert.equal(voice.presentation.kind, 'diagnostic');
+        assert.match(voice.presentation.technicalDetail, /"schema"/u);
+        assert.equal(agentCalls, 0);
+    } finally { await runtime.close(); }
 });

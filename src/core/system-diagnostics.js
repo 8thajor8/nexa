@@ -25,6 +25,7 @@ export function classifySystemDiagnosticRequest(message) {
     const technical = /\b(informe tecnico|diagnostico tecnico|detalles tecnicos|reporte para soporte|informe para soporte)\b/u.test(text);
     const voice = /\b(voz|voice|ptt|audio hablado)\b/u.test(text);
     const memory = /\b(memoria|memory ?2|recuerdo|recordaste|recuperacion de memoria)\b/u.test(text);
+    const explicitNexaStatus = /\b(?:nexa(?:\s*,)?\s+(?:dame\s+)?diagnostico|dame\s+tu\s+diagnostico|como\s+estan\s+tus\s+sistemas|dame\s+tu\s+estado\s+operativo|tu\s+estado\s+operativo)\b/u.test(text);
     const toolCatalog = /\b(herramientas.*disponibles|que herramientas|herramientas tenes|que podes hacer con spotify|capacidades.*(spotify|windows|correo|calendario))\b/u.test(text);
     const status = toolCatalog || /\b(sistema de memoria|memory ?2 activo|modo.*memoria|capacidades activas|estado del sistema)\b/u.test(text);
     if (technical && memory) return 'technical_memory';
@@ -32,6 +33,7 @@ export function classifySystemDiagnosticRequest(message) {
     if (technical) return 'technical_status';
     if (toolCatalog) return /\bspotify\b/u.test(text) ? 'tool_catalog_spotify' : 'tool_catalog';
     if (memory && (/\bdiagnostic|funcionando|por que|recordaste|recuperacion\b/u.test(text))) return 'memory';
+    if (explicitNexaStatus) return 'status';
     if (status) return 'status';
     return null;
 }
