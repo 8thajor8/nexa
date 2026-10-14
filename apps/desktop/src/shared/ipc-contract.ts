@@ -13,6 +13,7 @@ export const VOICE_PTT_FINISH_CHANNEL = "voice:ptt:finish" as const;
 export const VOICE_PTT_CANCEL_CHANNEL = "voice:ptt:cancel" as const;
 export const VOICE_EVENT_CHANNEL = "voice:event" as const;
 export const VOICE_SPEECH_CANCEL_CHANNEL = "voice:speech:cancel" as const;
+export const VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL = "voice:speech:acknowledgement" as const;
 export const VOICE_SPEECH_EVENT_CHANNEL = "voice:speech:event" as const;
 export const CHAT_SEND_MESSAGE_CHANNEL = "chat:send-message" as const;
 export const CHAT_CANCEL_REQUEST_CHANNEL = "chat:cancel-request" as const;
@@ -302,10 +303,13 @@ export interface VoiceSpeechEvent {
   error?: { code: VoiceSpeechErrorCode };
 }
 export interface VoiceSpeechCancelRequest { requestId: string; }
+export interface VoiceSpeechAcknowledgementRequest { requestId: string; }
+export interface VoiceSpeechAcknowledgementResponse { ok: true; requestId: string; accepted: boolean; }
 export type VoiceSpeechCancelResponse =
   | { ok: true; requestId: string; cancelled: boolean }
   | { ok: false; requestId: string; error: "request_not_found" | "operation_failed" };
 export interface VoiceSpeechApi {
+  acknowledge(request: VoiceSpeechAcknowledgementRequest): Promise<VoiceSpeechAcknowledgementResponse>;
   cancel(request: VoiceSpeechCancelRequest): Promise<VoiceSpeechCancelResponse>;
   onEvent(listener: (event: VoiceSpeechEvent) => void): () => void;
 }

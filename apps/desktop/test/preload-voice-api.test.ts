@@ -28,7 +28,7 @@ async function loadPreload() {
   return mocks.exposed as {
     voice: {
       ptt: { start: (request: unknown) => Promise<unknown>; finish: (request: unknown) => Promise<unknown>; cancel: (request: unknown) => Promise<unknown> };
-      speech: { cancel: (request: unknown) => Promise<unknown>; onEvent: (listener: (event: unknown) => void) => () => void };
+      speech: { acknowledge: (request: unknown) => Promise<unknown>; cancel: (request: unknown) => Promise<unknown>; onEvent: (listener: (event: unknown) => void) => () => void };
       onEvent: (listener: (event: unknown) => void) => () => void;
     };
     [key: string]: unknown;
@@ -42,7 +42,7 @@ describe("Voice preload API", () => {
     const api = await loadPreload();
     expect(Object.keys(api.voice).sort()).toEqual(["onEvent", "ptt", "speech"]);
     expect(Object.keys(api.voice.ptt).sort()).toEqual(["cancel", "finish", "start"]);
-    expect(Object.keys(api.voice.speech).sort()).toEqual(["cancel", "onEvent"]);
+    expect(Object.keys(api.voice.speech).sort()).toEqual(["acknowledge", "cancel", "onEvent"]);
     expect(api).not.toHaveProperty("ipcRenderer");
     expect(api).not.toHaveProperty("send");
 
@@ -78,6 +78,16 @@ describe("Voice preload API", () => {
     expect(received).toHaveBeenCalledWith({ requestId: request.requestId, state: "completed" });
     unsubscribe();
     expect(mocks.removeListener).toHaveBeenCalledWith("voice:speech:event", listener);
+  });
+
+  it("invokes only the fixed acknowledgement IPC with a correlated request", async () => {
+    const api = await loadPreload();
+    const request = { requestId: "00000000-0000-4000-8000-000000000071" };
+    mocks.invoke.mockResolvedValueOnce({ ok: true, requestId: request.requestId, accepted: true });
+    await expect(api.voice.speech.acknowledge(request)).resolves.toEqual({ ok: true, requestId: request.requestId, accepted: true });
+    expect(mocks.invoke).toHaveBeenCalledWith("voice:speech:acknowledgement", request);
+    mocks.invoke.mockResolvedValueOnce({ ok: true, requestId: "00000000-0000-4000-8000-000000000072", accepted: true });
+    await expect(api.voice.speech.acknowledge(request)).rejects.toThrow("invalid_voice_speech_acknowledgement_response");
   });
 
   it("rejects invalid requests and malformed responses without invoking arbitrary IPC", async () => {

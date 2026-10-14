@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, Menu, screen, session, shell } from "electron";
-import { mkdir } from "node:fs/promises";
+import { lstat, mkdir, readFile } from "node:fs/promises";
 // @ts-expect-error The repository's JavaScript Runtime intentionally has no generated declaration file.
 import { createConversationRuntime } from "../../../../src/core/conversation-runtime.js";
 // @ts-expect-error The shared Runtime diagnostics intentionally has no generated declaration file.
@@ -71,6 +71,7 @@ import {
 
 interface DesktopSpeechService {
   generate(input: { text: string; style?: string; persist?: boolean }): Promise<unknown>;
+  prepareAudio(input: Uint8Array): Promise<unknown>;
   play(audioId: string, options?: { playbackId?: string; onStarted?: () => void }): Promise<unknown>;
   stopPlayback(playbackId: string): Promise<unknown>;
   getPlaybackStatus(playbackId: string): unknown;
@@ -110,6 +111,7 @@ async function getDesktopSpeechService(): Promise<DesktopSpeechService> {
 
 const desktopSpeechService: DesktopSpeechService = {
   generate: async (input) => (await getDesktopSpeechService()).generate(input),
+  prepareAudio: async (input) => (await getDesktopSpeechService()).prepareAudio(input),
   play: async (audioId, options) => (await getDesktopSpeechService()).play(audioId, options),
   stopPlayback: async (playbackId) => (await getDesktopSpeechService()).stopPlayback(playbackId),
   getPlaybackStatus: (playbackId) => desktopSpeechServiceInstance?.getPlaybackStatus(playbackId)
@@ -134,6 +136,18 @@ async function loadDesktopVoiceApi(): Promise<PublicVoiceApi> {
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const repositoryRoot = resolve(appRoot, "..", "..");
+async function readPreparedVoiceAcknowledgement(id: "clear" | "review" | "moment"): Promise<Uint8Array | null> {
+  const filePath = resolve(repositoryRoot, "apps", "desktop", "resources", "voice-acknowledgements", `${id}.wav`);
+  try {
+    const info = await lstat(filePath);
+    if (!info.isFile() || info.isSymbolicLink() || info.size < 44 || info.size > 4 * 1024 * 1024) return null;
+    const audio = await readFile(filePath);
+    if (audio.byteLength !== info.size || audio.toString("ascii", 0, 4) !== "RIFF" || audio.toString("ascii", 8, 12) !== "WAVE"
+      || audio.readUInt32LE(4) + 8 !== audio.byteLength || audio.readUInt16LE(20) !== 1
+      || audio.readUInt16LE(22) !== 2 || audio.readUInt16LE(34) !== 16) return null;
+    return audio;
+  } catch { return null; }
+}
 const desktopModuleVersion = "LOG-CLEANUP-01";
 const desktopIsolation = prepareDesktopIsolation({ app, repositoryRoot });
 const startupPolicy = desktopStartupPolicy(Boolean(desktopIsolation), desktopIsolation?.organicPilot ?? false);
@@ -619,6 +633,7 @@ function installWebContentsGuards(): void {
               playbackMs: event.stage === "playback" ? event.durationMs : null },
           });
         },
+        (id) => readPreparedVoiceAcknowledgement(id),
       );
     }
   }

@@ -9,6 +9,7 @@
     "connect:microsoft": "node src/integrations/microsoft/connect.js",
     "test": "node --test",
     "speech:cast": "node src/speech/cast-cli.js",
+    "voice:prepare-acknowledgements": "node scripts/prepare-voice-acknowledgements.mjs",
     "speech:voice-lab": "node src/speech/voice-lab.js",
     "whatsapp:auth": "node src/integrations/whatsapp/auth.js"
   },

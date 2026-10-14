@@ -29,6 +29,7 @@ import {
   WINDOW_SETTINGS_CHANGED_CHANNEL,
   VOICE_EVENT_CHANNEL,
   VOICE_SPEECH_CANCEL_CHANNEL,
+  VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL,
   VOICE_SPEECH_EVENT_CHANNEL,
   VOICE_PTT_CANCEL_CHANNEL,
   VOICE_PTT_FINISH_CHANNEL,
@@ -55,6 +56,8 @@ import {
   isVoicePttStartResponse,
   isVoiceSpeechCancelRequest,
   isVoiceSpeechCancelResponse,
+  isVoiceSpeechAcknowledgementRequest,
+  isVoiceSpeechAcknowledgementResponse,
   isVoiceSpeechEvent,
 } from "./shared/voice-ipc-validation";
 import {
@@ -151,6 +154,14 @@ const api: NexaDesktopApi = {
       },
     },
     speech: {
+      async acknowledge(request) {
+        if (!isVoiceSpeechAcknowledgementRequest(request)) throw new Error("invalid_voice_speech_acknowledgement_request");
+        const response: unknown = await ipcRenderer.invoke(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL, request);
+        if (!isVoiceSpeechAcknowledgementResponse(response) || response.requestId !== request.requestId) {
+          throw new Error("invalid_voice_speech_acknowledgement_response");
+        }
+        return response;
+      },
       async cancel(request) {
         if (!isVoiceSpeechCancelRequest(request)) throw new Error("invalid_voice_speech_cancel_request");
         const response: unknown = await ipcRenderer.invoke(VOICE_SPEECH_CANCEL_CHANNEL, request);

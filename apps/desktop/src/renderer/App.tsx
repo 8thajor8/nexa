@@ -17,6 +17,7 @@ import type { MicrophoneDeviceStore } from "./audio/microphone-device-store";
 interface AppProps { voiceController: PttVoiceControllerPort; microphoneDevices: MicrophoneDeviceStore; }
 
 const MAX_CHAT_HISTORY = 50;
+const VOICE_ACKNOWLEDGEMENT_DELAY_MS = 1_500;
 const CHAT_ERROR_MESSAGES: Partial<Record<ChatIpcErrorCode, string>> = {
   busy: "Ya hay una solicitud activa en esta conversación.",
   conversation_not_found: "La conversación ya no está disponible.",
@@ -86,6 +87,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const activeChatRequest = useRef<string | null>(null);
   const knownChatRequests = useRef(new Set<string>());
   const terminalChatRequests = useRef(new Set<string>());
+  const acknowledgementTimers = useRef(new Map<string, number>());
   const originalRequestTexts = useRef(new Map<string, string>());
   const [voiceTranscriptNotice, setVoiceTranscriptNotice] = useState<string | null>(null);
   const [voiceSpeechStatus, setVoiceSpeechStatus] = useState<{ requestId: string; state: "preparing" | "speaking" | "cancelling" | "error"; message?: string } | null>(null);
@@ -110,6 +112,8 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const changeMemoryMode = useCallback(async (mode: DesktopMemoryMode): Promise<DesktopMemoryModeResult> => {
     const result = await window.nexaDesktop.memory.setMode(mode);
     if (result.ok || result.error === "operation_failed") {
+      for (const timer of acknowledgementTimers.current.values()) window.clearTimeout(timer);
+      acknowledgementTimers.current.clear();
       setChatMessages([]);
       setChatNotice(null);
       setChatConversationId(null);
@@ -199,11 +203,22 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     activeChatRequest.current = requestId;
     setChatMessages((current) => [...current, message].slice(-MAX_CHAT_HISTORY));
     setChatNotice(null);
+    if (source === "voice") {
+      const timer = window.setTimeout(() => {
+        acknowledgementTimers.current.delete(requestId);
+        if (terminalChatRequests.current.has(requestId) || activeChatRequest.current !== requestId) return;
+        void window.nexaDesktop.voice.speech.acknowledge({ requestId }).catch(() => undefined);
+      }, VOICE_ACKNOWLEDGEMENT_DELAY_MS);
+      acknowledgementTimers.current.set(requestId, timer);
+    }
     try {
       const response = await window.nexaDesktop.chat.sendMessage({
         conversationId: chatConversationId, requestId, text, source,
       });
       if (!response.ok) {
+        const timer = acknowledgementTimers.current.get(requestId);
+        if (timer !== undefined) window.clearTimeout(timer);
+        acknowledgementTimers.current.delete(requestId);
         terminalChatRequests.current.add(requestId);
         if (activeChatRequest.current === requestId) activeChatRequest.current = null;
         setChatMessages((current) => current.map((entry) => entry.requestId === requestId
@@ -215,6 +230,9 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
           ? { ...entry, status: "processing" } : entry));
       }
     } catch {
+      const timer = acknowledgementTimers.current.get(requestId);
+      if (timer !== undefined) window.clearTimeout(timer);
+      acknowledgementTimers.current.delete(requestId);
       terminalChatRequests.current.add(requestId);
       if (activeChatRequest.current === requestId) activeChatRequest.current = null;
       setChatMessages((current) => current.map((entry) => entry.requestId === requestId
@@ -241,6 +259,12 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       return;
     }
     terminalChatRequests.current.add(event.requestId);
+    const acknowledgementTimer = acknowledgementTimers.current.get(event.requestId);
+    if (acknowledgementTimer !== undefined) window.clearTimeout(acknowledgementTimer);
+    acknowledgementTimers.current.delete(event.requestId);
+    if (event.status !== "completed" && activeVoiceSpeechRequest.current === event.requestId) {
+      void window.nexaDesktop.voice.speech.cancel({ requestId: event.requestId }).catch(() => undefined);
+    }
     if (activeChatRequest.current === event.requestId) activeChatRequest.current = null;
     if (event.status === "completed") {
       const responseMessage: ConversationChatMessage = {
@@ -327,6 +351,11 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         setVoiceSpeechStatus(null);
       }
     });
+  }, []);
+
+  useEffect(() => () => {
+    for (const timer of acknowledgementTimers.current.values()) window.clearTimeout(timer);
+    acknowledgementTimers.current.clear();
   }, []);
 
   const cancelVoiceSpeech = useCallback(async () => {

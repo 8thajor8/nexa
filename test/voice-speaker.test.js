@@ -38,6 +38,20 @@ test('speaker delegates synthesis and playback and correlates speaking/completed
     assert.ok(events.every(event => event.sessionId === 'speaker-session' && event.turnId === 'turn-1' && event.timestamp === 42));
 });
 
+test('speaker plays locally prepared audio without requesting TTS synthesis', async () => {
+    const calls = [];
+    const service = {
+        async generate() { calls.push('generate'); throw new Error('acknowledgements must not call TTS'); },
+        async prepareAudio(audio) { calls.push(['prepare', Buffer.from(audio).toString('ascii', 0, 4)]); return { success: true, audioId: 'cached_ack' }; },
+        async play(id) { calls.push(['play', id]); return { success: true, released: true }; },
+        async removeTemporary(id) { calls.push(['remove', id]); return true; },
+    };
+    const speaker = createVoiceSpeaker({ speechService: service, idFactory: () => 'ack-turn' });
+    const result = await speaker.speakPrepared(Buffer.from('RIFFcached-audio'));
+    assert.deepEqual(calls, [['prepare', 'RIFF'], ['play', 'cached_ack']]);
+    assert.deepEqual(result, { sessionId: speaker.sessionId, turnId: 'ack-turn', completed: true });
+});
+
 test('speaker emits sanitized generation and playback errors', async () => {
     const generationSpeaker = createVoiceSpeaker({ speechService: {
         async generate() { return { success: false, error: { code: 'provider_error', message: 'api_key=secret' } }; },

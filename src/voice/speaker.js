@@ -84,11 +84,11 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
         bucket.add(listener);
         return () => bucket.delete(listener);
     }
-    function makeOperation(text, options) {
+    function makeOperation(text, options, preparedAudio = null) {
         let resolveCancellation;
         const cancellation = new Promise(resolve => { resolveCancellation = resolve; });
         const controller = new AbortController();
-        return { turnId: idFactory(), text, options, phase: 'synthesizing', startedAt: performance.now(), phaseStartedAt: performance.now(),
+        return { turnId: idFactory(), text, options, preparedAudio, phase: 'synthesizing', startedAt: performance.now(), phaseStartedAt: performance.now(),
             cancelled: false, cancellation, resolveCancellation, controller };
     }
     function discardGenerated(operation) {
@@ -183,7 +183,9 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
         try {
             service = await resolveService();
             if (active !== operation) return null;
-            generated = await enqueueSynthesis(operation, service);
+            generated = operation.preparedAudio
+                ? await service.prepareAudio(operation.preparedAudio)
+                : await enqueueSynthesis(operation, service);
             if (active !== operation) {
                 operation.service = service;
                 operation.generatedAudioId = generated?.audioId;
@@ -263,10 +265,7 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
         }
     }
 
-    function speak(text, options = {}) {
-        if (typeof text !== 'string' || !text.trim()) throw new VoiceError('voice_speech_invalid_input');
-        const normalizedOptions = normalizeOptions(options);
-        const operation = makeOperation(text, normalizedOptions);
+    function start(operation) {
         if (playbackState === 'degraded') return failFast(operation, 'voice_speech_degraded');
         if (active || cleanupInFlight || playbackState === 'playing') return failFast(operation, 'voice_speech_busy');
         active = operation;
@@ -274,5 +273,15 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
         return Promise.race([work, operation.cancellation]);
     }
 
-    return Object.freeze({ sessionId, on, speak, cancel, getPlaybackState: () => playbackState });
+    function speak(text, options = {}) {
+        if (typeof text !== 'string' || !text.trim()) throw new VoiceError('voice_speech_invalid_input');
+        return start(makeOperation(text, normalizeOptions(options)));
+    }
+
+    function speakPrepared(audio, options = {}) {
+        if (!(Buffer.isBuffer(audio) || audio instanceof Uint8Array) || audio.byteLength === 0) throw new VoiceError('voice_speech_invalid_input');
+        return start(makeOperation('', normalizeOptions(options), Buffer.from(audio)));
+    }
+
+    return Object.freeze({ sessionId, on, speak, speakPrepared, cancel, getPlaybackState: () => playbackState });
 }

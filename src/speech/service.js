@@ -119,6 +119,19 @@ export function createSpeechService({
         }
     }
 
+    async function prepareAudio(audio) {
+        if (!(Buffer.isBuffer(audio) || audio instanceof Uint8Array) || audio.byteLength === 0 || audio.byteLength > maxAudioBytes) {
+            return failure('invalid_provider_audio', 'El audio preparado no es válido.');
+        }
+        const initialized = await initialize();
+        if (!initialized.success) return initialized;
+        try {
+            return { success: true, ...(await store.save(Buffer.from(audio), false)) };
+        } catch {
+            return failure('audio_storage_failed', 'No pude guardar el audio preparado.');
+        }
+    }
+
     async function play(audioId, { playbackId = randomUUID(), onStarted } = {}) {
         const initialized = await initialize();
         if (!initialized.success) return initialized;
@@ -184,7 +197,7 @@ export function createSpeechService({
 
     function getLastMetrics() { return lastMetrics ? { ...lastMetrics } : null; }
 
-    return { initialize, generate, play, stopPlayback, getPlaybackStatus, removeTemporary, close, getLastMetrics };
+    return { initialize, generate, prepareAudio, play, stopPlayback, getPlaybackStatus, removeTemporary, close, getLastMetrics };
 }
 
 const speechService = createSpeechService();

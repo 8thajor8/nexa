@@ -72,6 +72,7 @@ beforeEach(async () => {
   await microphoneDevices.refresh();
   const eventListeners = new Set<(event: VoiceEventEnvelope) => void>();
   chatListeners = new Set();
+  speechListeners = new Set();
   bridge = {
     isIsolated: false,
     ping: vi.fn(async () => ({ ok: true, message: "pong" })),
@@ -96,6 +97,14 @@ beforeEach(async () => {
         start: vi.fn(async () => ({ ok: false, requestId: "unused", error: { code: "invalid_request", message: "unused" } })),
         finish: vi.fn(async () => ({ ok: false, requestId: "unused", error: { code: "invalid_request", message: "unused" } })),
         cancel: vi.fn(async () => ({ ok: false, requestId: "unused", error: { code: "invalid_request", message: "unused" } })),
+      },
+      speech: {
+        acknowledge: vi.fn(async ({ requestId }: { requestId: string }) => ({ ok: true as const, requestId, accepted: true })),
+        cancel: vi.fn(async ({ requestId }: { requestId: string }) => ({ ok: true as const, requestId, cancelled: true as const })),
+        onEvent: vi.fn((listener: (event: import("../src/shared/ipc-contract").VoiceSpeechEvent) => void) => {
+          speechListeners.add(listener);
+          return () => speechListeners.delete(listener);
+        }),
       },
       onEvent: vi.fn((listener: (event: VoiceEventEnvelope) => void) => {
         eventListeners.add(listener);
@@ -359,6 +368,53 @@ describe("App PTT DOM integration", () => {
       turnId: "voice-turn", transcript: "Mensaje hablado", language: "es" }));
     expect(bridge.chat.sendMessage).toHaveBeenCalledOnce();
     expect(screen.getAllByText("Mensaje hablado")).toHaveLength(1);
+  });
+
+  it("plays no acknowledgement when a voice request completes before the delay", async () => {
+    vi.useFakeTimers();
+    try {
+      await mountApp();
+      act(() => controller.publish({ status: "transcript-ready", canStart: true, sessionId: "session-fast", requestId: "voice-fast",
+        turnId: "voice-turn-fast", transcript: "Hola", language: "es" }));
+      await act(async () => { await Promise.resolve(); });
+      const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+      act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+        requestId: request.requestId, status: "completed", response: "Respuesta rápida" })));
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
+      expect(bridge.voice.speech.acknowledge).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("requests one acknowledgement after the delayed voice processing threshold", async () => {
+    vi.useFakeTimers();
+    try {
+      await mountApp();
+      act(() => controller.publish({ status: "transcript-ready", canStart: true, sessionId: "session-slow", requestId: "voice-slow",
+        turnId: "voice-turn-slow", transcript: "Explicame algo", language: "es" }));
+      await act(async () => { await Promise.resolve(); });
+      const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_499); });
+      expect(bridge.voice.speech.acknowledge).not.toHaveBeenCalled();
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(bridge.voice.speech.acknowledge).toHaveBeenCalledOnce();
+      expect(bridge.voice.speech.acknowledge).toHaveBeenCalledWith({ requestId: request.requestId });
+      expect(chatListeners.size).toBeGreaterThan(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("does not request a voice acknowledgement after a cancelled chat request", async () => {
+    vi.useFakeTimers();
+    try {
+      await mountApp();
+      act(() => controller.publish({ status: "transcript-ready", canStart: true, sessionId: "session-cancelled", requestId: "voice-cancelled",
+        turnId: "voice-turn-cancelled", transcript: "Consulta cancelada", language: "es" }));
+      await act(async () => { await Promise.resolve(); });
+      const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+      act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+        requestId: request.requestId, status: "cancelled" })));
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
+      expect(bridge.voice.speech.acknowledge).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
   });
 
   it("requests cancellation without marking it complete until a terminal event arrives", async () => {

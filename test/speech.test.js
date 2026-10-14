@@ -83,6 +83,19 @@ test('generates temporary audio with opaque ID, never returns a path, then plays
     assert.equal(f.store.get(generated.audioId), null);
 });
 
+test('stores locally prepared WAV without invoking the synthesis provider', async t => {
+    const f = await fixture(t);
+    const input = makePcmWav({ durationMs: 50, channels: 2 });
+    const result = await f.service.prepareAudio(input);
+    assert.equal(result.success, true);
+    assert.equal(result.temporary, true);
+    assert.equal(f.calls.generated.length, 0);
+    const audioPath = f.store.get(result.audioId).filePath;
+    assert.deepEqual(await readFile(audioPath), input);
+    await f.service.play(result.audioId);
+    await assert.rejects(access(audioPath));
+});
+
 test('persisted audio survives playback and service shutdown cleanup', async t => {
     const f = await fixture(t);
     const generated = await f.service.generate({ text: 'Conservar', persist: true });

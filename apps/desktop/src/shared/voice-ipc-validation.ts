@@ -10,6 +10,8 @@ import type {
   VoicePttStartResponse,
   VoiceSpeechCancelRequest,
   VoiceSpeechCancelResponse,
+  VoiceSpeechAcknowledgementRequest,
+  VoiceSpeechAcknowledgementResponse,
   VoiceSpeechEvent,
 } from "./ipc-contract.js";
 
@@ -103,6 +105,15 @@ export function isVoicePttCancelRequest(value: unknown): value is VoicePttCancel
 
 export function isVoiceSpeechCancelRequest(value: unknown): value is VoiceSpeechCancelRequest {
   return isPlainRecord(value) && hasExactKeys(value, ["requestId"]) && isVoiceId(value.requestId);
+}
+
+export function isVoiceSpeechAcknowledgementRequest(value: unknown): value is VoiceSpeechAcknowledgementRequest {
+  return isPlainRecord(value) && hasExactKeys(value, ["requestId"]) && isVoiceId(value.requestId);
+}
+
+export function isVoiceSpeechAcknowledgementResponse(value: unknown): value is VoiceSpeechAcknowledgementResponse {
+  return isPlainRecord(value) && hasExactKeys(value, ["ok", "requestId", "accepted"])
+    && value.ok === true && isVoiceId(value.requestId) && typeof value.accepted === "boolean";
 }
 
 export function isVoiceSpeechEvent(value: unknown): value is VoiceSpeechEvent {

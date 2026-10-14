@@ -2,6 +2,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   VOICE_EVENT_CHANNEL,
   VOICE_SPEECH_EVENT_CHANNEL,
+  VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL,
+  VOICE_SPEECH_CANCEL_CHANNEL,
   VOICE_PTT_CANCEL_CHANNEL,
   VOICE_PTT_FINISH_CHANNEL,
   VOICE_PTT_START_CHANNEL,
@@ -227,6 +229,109 @@ describe("Electron Main Voice IPC", () => {
     expect(speaker.cancel).toHaveBeenCalledWith("user");
     expect(window.webContents.send).toHaveBeenCalledWith(VOICE_SPEECH_EVENT_CHANNEL, { requestId, state: "preparing" });
     await operation;
+  });
+
+  it("uses the cached acknowledgement asset and gives the final response priority without overlap", async () => {
+    const window = createWindow("acknowledgement");
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    const order: string[] = [];
+    let idFactory = () => "";
+    let playbackState = "idle";
+    let currentTurnId = "";
+    let finishAcknowledgement: (() => void) | undefined;
+    const speaker = {
+      getPlaybackState: () => playbackState,
+      speakPrepared: vi.fn(() => {
+        currentTurnId = idFactory(); playbackState = "playing"; order.push("ack-started");
+        listeners.get("voice.speaking")?.({ turnId: currentTurnId });
+        return new Promise<null>((resolve) => { finishAcknowledgement = () => { playbackState = "idle";
+          listeners.get("voice.speech.cancelled")?.({ turnId: currentTurnId, reason: "superseded" }); resolve(null); }; });
+      }),
+      speak: vi.fn(async () => {
+        currentTurnId = idFactory();
+        expect(playbackState).toBe("idle");
+        order.push("response-started");
+        listeners.get("voice.speech.completed")?.({ turnId: currentTurnId });
+        return { completed: true as const };
+      }),
+      cancel: vi.fn(() => { order.push("ack-stopped"); finishAcknowledgement?.(); return true; }),
+      on: vi.fn((type: string, listener: (event: Record<string, unknown>) => void) => {
+        listeners.set(type, listener); return () => listeners.delete(type);
+      }),
+    };
+    const api = { createVoiceSpeaker: vi.fn(() => speaker) };
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never, undefined, async () => makeAudio());
+    const requestId = "00000000-0000-4000-8000-000000000073";
+    await expect(invoke(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL, trustedEvent(window), { requestId }))
+      .resolves.toEqual({ ok: true, requestId, accepted: true });
+    await vi.waitFor(() => expect(speaker.speakPrepared).toHaveBeenCalledOnce());
+    await speakVoiceResponse(window as never, requestId, "Respuesta principal");
+    expect(order).toEqual(["ack-started", "ack-stopped", "response-started"]);
+    expect(speaker.speak).toHaveBeenCalledOnce();
+  });
+
+  it("Stop during local acknowledgement loading prevents both late acknowledgement and reply audio", async () => {
+    const window = createWindow("ack-stop-loading");
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    let resolveAudio!: (value: Uint8Array) => void;
+    const speaker = {
+      speakPrepared: vi.fn(async () => ({ completed: true as const })),
+      speak: vi.fn(async () => ({ completed: true as const })),
+      cancel: vi.fn(() => true),
+      on: vi.fn((type: string, listener: (event: Record<string, unknown>) => void) => {
+        listeners.set(type, listener); return () => listeners.delete(type);
+      }),
+    };
+    const api = { createVoiceSpeaker: vi.fn(() => speaker) };
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never, undefined,
+      () => new Promise((resolve) => { resolveAudio = resolve; }));
+    const requestId = "00000000-0000-4000-8000-000000000074";
+    const acknowledgement = invoke(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL, trustedEvent(window), { requestId });
+    await vi.waitFor(() => expect(resolveAudio).toBeTypeOf("function"));
+    expect(cancelVoiceSpeech(window as never, "user", requestId)).toBe(true);
+    resolveAudio(makeAudio());
+    await expect(acknowledgement).resolves.toEqual({ ok: true, requestId, accepted: false });
+    await speakVoiceResponse(window as never, requestId, "No debe sonar después de Stop");
+    expect(speaker.speakPrepared).not.toHaveBeenCalled();
+    expect(speaker.speak).not.toHaveBeenCalled();
+  });
+
+  it("Stop interrupts an acknowledgement, suppresses its late reply, and allows a fresh request", async () => {
+    const window = createWindow("ack-stop-playing");
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    let idFactory = () => "";
+    let turnId = "";
+    let finishPlayback: (() => void) | undefined;
+    let playbackState = "idle";
+    const speaker = {
+      getPlaybackState: () => playbackState,
+      speakPrepared: vi.fn(() => {
+        turnId = idFactory(); playbackState = "playing";
+        listeners.get("voice.speaking")?.({ turnId });
+        return new Promise<null>((resolve) => { finishPlayback = () => { playbackState = "idle";
+          listeners.get("voice.speech.cancelled")?.({ turnId, reason: "user" }); resolve(null); }; });
+      }),
+      speak: vi.fn(async () => {
+        turnId = idFactory();
+        listeners.get("voice.speech.completed")?.({ turnId });
+        return { completed: true as const };
+      }),
+      cancel: vi.fn(() => { finishPlayback?.(); return true; }),
+      on: vi.fn((type: string, listener: (event: Record<string, unknown>) => void) => {
+        listeners.set(type, listener); return () => listeners.delete(type);
+      }),
+    };
+    const api = { createVoiceSpeaker: vi.fn((options: { idFactory: () => string }) => { idFactory = options.idFactory; return speaker; }) };
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never, undefined, async () => makeAudio());
+    const requestId = "00000000-0000-4000-8000-000000000075";
+    await invoke(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL, trustedEvent(window), { requestId });
+    await vi.waitFor(() => expect(speaker.speakPrepared).toHaveBeenCalledOnce());
+    expect(invoke(VOICE_SPEECH_CANCEL_CHANNEL, trustedEvent(window), { requestId }))
+      .toEqual({ ok: true, requestId, cancelled: true });
+    await speakVoiceResponse(window as never, requestId, "No debe hablarse tras Stop");
+    expect(speaker.speak).not.toHaveBeenCalled();
+    await speakVoiceResponse(window as never, "00000000-0000-4000-8000-000000000076", "Nueva solicitud");
+    expect(speaker.speak).toHaveBeenCalledOnce();
   });
 
   it("subscribes before start and returns a correlated session with synchronous Voice events", async () => {
