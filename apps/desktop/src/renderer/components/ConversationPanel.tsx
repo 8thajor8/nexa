@@ -36,7 +36,7 @@ interface ConversationPanelProps {
   spotifyNowPlayingCards?: Readonly<Record<string, SpotifyNowPlayingCard>>;
   authorizationAttempts?: Readonly<Record<string, { state: "connecting" | "connected" | "cancelled" | "error"; message?: string }>>;
   chatNotice?: string | null;
-  voiceSpeechStatus?: { requestId: string; state: "preparing" | "speaking" | "error"; message?: string } | null;
+  voiceSpeechStatus?: { requestId: string; state: "preparing" | "speaking" | "cancelling" | "error"; message?: string } | null;
   chatBusy?: boolean;
   onSendMessage?(text: string): void;
   onCancelRequest?(): void;
@@ -73,7 +73,7 @@ const STATUS_ANNOUNCEMENTS: Record<PttVoiceSnapshot["status"], string> = {
   processing: "Transcripción en curso.",
   cancelling: "Cancelando la sesión de voz.",
   recovering: "Recuperando la cancelación pendiente.",
-  "transcript-ready": "Transcripción final recibida.",
+  "transcript-ready": "",
   error: "La operación de voz encontró un error.",
   "recovery-required": "Se requiere recuperar la sesión anterior antes de grabar.",
 };
@@ -279,12 +279,12 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
             </button>
           </div>
           <div className="voice-ptt-controls" role="group" aria-label="Controles de voz">
-            {voiceSpeechStatus?.state === "preparing" && <span className="voice-status-copy" role="status" aria-live="polite">Preparando respuesta hablada…</span>}
-            {voiceSpeechStatus?.state === "speaking" && <>
-              <span className="voice-status-copy" role="status" aria-live="polite">Nexa está hablando.</span>
-              <button className="voice-secondary-button" type="button" onClick={onCancelSpeech}
-                aria-label="Interrumpir respuesta hablada">Interrumpir</button>
-            </>}
+            {voiceSpeechStatus && ["preparing", "speaking", "cancelling"].includes(voiceSpeechStatus.state) && <button
+              className="voice-stop-button" type="button" onClick={onCancelSpeech}
+              disabled={voiceSpeechStatus.state === "cancelling"}
+              aria-label="Detener respuesta hablada" title="Detener respuesta hablada">
+              <svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><rect x="6.5" y="6.5" width="11" height="11" rx="1.5" fill="currentColor"/></svg>
+            </button>}
             {canCancel && <button className="voice-secondary-button" type="button" onClick={onCancel} aria-label="Cancelar sesión de voz">Cancelar</button>}
             {snapshot.status === "recovery-required" && (
               <button className="voice-secondary-button voice-recover-button" type="button" onClick={onRecover} aria-label="Recuperar cancelación pendiente de Main">Recuperar</button>

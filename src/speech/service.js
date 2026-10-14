@@ -35,7 +35,7 @@ export function createSpeechService({
         return { success: true };
     }
 
-    async function generate({ text, style = 'normal', persist = false } = {}) {
+    async function generate({ text, style = 'normal', persist = false, signal } = {}) {
         const audioReadyStartedAt = performance.now();
         if (typeof text !== 'string' || text.trim().length === 0) return failure('invalid_text', 'El texto no puede estar vacío.');
         if (text.length > maxTextLength) return failure('text_too_long', `El texto supera el límite de ${maxTextLength} caracteres.`);
@@ -49,15 +49,18 @@ export function createSpeechService({
             audioSaveMs: null, audioReadyMs: null, outputBytes: null, failureStage: null };
         const initialized = await initialize(metrics);
         if (!initialized.success) return initialized;
+        if (signal?.aborted) return failure('voice_cancelled', 'La generación de voz fue cancelada.');
 
         let audio;
         const providerStartedAt = performance.now();
-        try { audio = await provider.synthesize({ text, instructions: getSpeechInstructions(style), format: speechConfig.format }); }
+        try { audio = await provider.synthesize({ text, instructions: getSpeechInstructions(style), format: speechConfig.format, signal }); }
         catch {
             metrics.synthesisMs = performance.now() - providerStartedAt; metrics.failureStage = 'synthesis'; lastMetrics = { ...metrics };
+            if (signal?.aborted) return failure('voice_cancelled', 'La generación de voz fue cancelada.');
             return failure('speech_generation_failed', 'El proveedor de voz no pudo generar el audio.');
         }
         metrics.synthesisMs = performance.now() - providerStartedAt;
+        if (signal?.aborted) return failure('voice_cancelled', 'La generación de voz fue cancelada.');
         if (!(Buffer.isBuffer(audio) || audio instanceof Uint8Array) || audio.byteLength === 0 || audio.byteLength > maxAudioBytes) {
             metrics.failureStage = 'synthesis'; lastMetrics = { ...metrics };
             return failure('invalid_provider_audio', 'El proveedor devolvió un audio no válido.');
@@ -95,6 +98,7 @@ export function createSpeechService({
                 ? failure('voice_identity_browser_unavailable', 'No está disponible el motor local requerido por la identidad vocal.')
                 : failure('audio_processing_failed', 'No pude preparar el audio para reproducirlo.');
         }
+        if (signal?.aborted) return failure('voice_cancelled', 'La generación de voz fue cancelada.');
         if (!(Buffer.isBuffer(audio) || audio instanceof Uint8Array) || audio.byteLength === 0 || audio.byteLength > maxAudioBytes) {
             metrics.failureStage = 'identity_processing'; lastMetrics = { ...metrics };
             return failure('audio_processing_failed', 'El procesador de audio devolvió un resultado no válido.');

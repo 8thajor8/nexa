@@ -10,10 +10,11 @@ const transcripts: VoiceTranscriptItem[] = [{
   sessionId: "session-1", requestId: "finish-1", turnId: "turn-1", text: "Texto transcrito real.", language: "es",
 }];
 
-function conversation(status: PttVoiceStatus, extras: Partial<PttVoiceSnapshot> = {}, entries: VoiceTranscriptItem[] = []) {
+function conversation(status: PttVoiceStatus, extras: Partial<PttVoiceSnapshot> = {}, entries: VoiceTranscriptItem[] = [],
+  voiceSpeechStatus: { requestId: string; state: "preparing" | "speaking" | "cancelling" | "error"; message?: string } | null = null) {
   return renderToStaticMarkup(createElement(ConversationPanel, {
     snapshot: { status, canStart: status === "idle" || status === "transcript-ready", ...extras }, transcripts: entries, transcriptNotice: null,
-    onStart: noop, onFinish: noop, onCancel: noop, onRecover: noop,
+    voiceSpeechStatus, onCancelSpeech: noop, onStart: noop, onFinish: noop, onCancel: noop, onRecover: noop,
   }));
 }
 
@@ -22,7 +23,7 @@ describe("PTT visual integration", () => {
     const markup = conversation("idle");
     expect(markup).toContain('aria-label="Iniciar grabación de voz"');
     expect(markup).not.toContain("aria-pressed");
-    expect(markup).toContain('id="message-composer" type="text" placeholder="Escribí un mensaje a Nexa…"');
+    expect(markup).toContain('id="message-composer" class="composer-textarea" rows="1" placeholder="Escribí un mensaje a Nexa…"');
     expect(markup).toContain('aria-label="Enviar mensaje a Nexa"');
     expect(markup).toContain('disabled=""'); // Empty text cannot be submitted.
   });
@@ -76,6 +77,23 @@ describe("PTT visual integration", () => {
     expect(markup).toContain("Texto transcrito real.");
     expect(markup).not.toContain("DEMO · MOCK");
     expect(markup).not.toContain("Transcripciones de voz");
+  });
+
+  it("shows an icon-only accessible Stop control while speech is preparing or playing, and omits redundant status copy", () => {
+    for (const state of ["preparing", "speaking"] as const) {
+      const markup = conversation("transcript-ready", {}, transcripts, { requestId: "speech-1", state });
+      expect(markup).toContain('aria-label="Detener respuesta hablada"');
+      expect(markup).toContain('title="Detener respuesta hablada"');
+      expect(markup).toContain('class="voice-stop-button"');
+      expect(markup).not.toContain("Preparando respuesta hablada");
+      expect(markup).not.toContain("Transcripción final recibida");
+      expect(markup).not.toContain("Nexa está hablando");
+      expect(markup).not.toContain(">Interrumpir</button>");
+      expect(markup).toContain("Texto transcrito real.");
+    }
+    const cancelling = conversation("idle", {}, [], { requestId: "speech-1", state: "cancelling" });
+    expect(cancelling).toContain('aria-label="Detener respuesta hablada"');
+    expect(cancelling).toContain("disabled=\"\"");
   });
 
   it("places Send before the microphone at the far right of the composer", () => {

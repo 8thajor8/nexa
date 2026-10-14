@@ -88,8 +88,9 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const terminalChatRequests = useRef(new Set<string>());
   const originalRequestTexts = useRef(new Map<string, string>());
   const [voiceTranscriptNotice, setVoiceTranscriptNotice] = useState<string | null>(null);
-  const [voiceSpeechStatus, setVoiceSpeechStatus] = useState<{ requestId: string; state: "preparing" | "speaking" | "error"; message?: string } | null>(null);
+  const [voiceSpeechStatus, setVoiceSpeechStatus] = useState<{ requestId: string; state: "preparing" | "speaking" | "cancelling" | "error"; message?: string } | null>(null);
   const activeVoiceSpeechRequest = useRef<string | null>(null);
+  const cancellingVoiceSpeechRequests = useRef(new Set<string>());
   const seenTranscriptKeys = useRef(new Set<string>());
   const [weatherStatus, setWeatherStatus] = useState<WeatherCurrentStatus>(() => ({
     available: false, location: preferences.weatherLocation, temperatureC: null, condition: null, updatedAt: 0,
@@ -314,10 +315,15 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       }
       if (activeVoiceSpeechRequest.current !== event.requestId) return;
       if (event.state === "speaking") setVoiceSpeechStatus({ requestId: event.requestId, state: "speaking" });
-      else if (event.state === "error") setVoiceSpeechStatus({ requestId: event.requestId, state: "error",
-        message: VOICE_SPEECH_ERRORS[event.error?.code ?? "voice_speech_playback_failed"] });
+      else if (event.state === "error") {
+        activeVoiceSpeechRequest.current = null;
+        cancellingVoiceSpeechRequests.current.delete(event.requestId);
+        setVoiceSpeechStatus({ requestId: event.requestId, state: "error",
+          message: VOICE_SPEECH_ERRORS[event.error?.code ?? "voice_speech_playback_failed"] });
+      }
       else {
         activeVoiceSpeechRequest.current = null;
+        cancellingVoiceSpeechRequests.current.delete(event.requestId);
         setVoiceSpeechStatus(null);
       }
     });
@@ -326,9 +332,19 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const cancelVoiceSpeech = useCallback(async () => {
     const requestId = activeVoiceSpeechRequest.current;
     if (!requestId) return;
+    if (cancellingVoiceSpeechRequests.current.has(requestId)) return;
+    cancellingVoiceSpeechRequests.current.add(requestId);
+    setVoiceSpeechStatus((current) => current?.requestId === requestId ? { ...current, state: "cancelling" } : current);
     try {
-      await window.nexaDesktop.voice.speech.cancel({ requestId });
+      const result = await window.nexaDesktop.voice.speech.cancel({ requestId });
+      if (!result.ok && activeVoiceSpeechRequest.current === requestId) {
+        activeVoiceSpeechRequest.current = null;
+        cancellingVoiceSpeechRequests.current.delete(requestId);
+        setVoiceSpeechStatus({ requestId, state: "error", message: "No se encontró una respuesta hablada activa para detener." });
+      }
     } catch {
+      if (activeVoiceSpeechRequest.current === requestId) activeVoiceSpeechRequest.current = null;
+      cancellingVoiceSpeechRequests.current.delete(requestId);
       setVoiceSpeechStatus({ requestId, state: "error", message: "No se pudo solicitar la interrupción del audio." });
     }
   }, []);

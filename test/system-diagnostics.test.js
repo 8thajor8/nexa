@@ -85,8 +85,8 @@ test('system status separates registered and available tools and reports unknown
     const diagnostics = createOperationalDiagnostics({ memoryMode: 'memory2-confirmed-write' });
     const snapshot = { ...diagnostics.snapshot(), tools: { registered: ['open_app', 'spotify_play'], available: ['open_app'] } };
     const simple = formatSystemStatus(snapshot);
-    assert.match(simple, /Memory2 en modo de escritura confirmada/u);
-    assert.match(simple, /todavía no inicializado/u);
+    assert.match(simple, /Backend y modo de memoria:\*\* Memory2; escritura confirmada/u);
+    assert.match(simple, /Pendiente de inicialización/u);
     assert.doesNotMatch(simple, /open_app|spotify_play/u);
     const technical = formatSystemStatus(snapshot, { technical: true });
     assert.match(technical, /Herramientas registradas \(2\)/u);
@@ -94,7 +94,36 @@ test('system status separates registered and available tools and reports unknown
     assert.match(technical, /Disponibilidad:\*\* unknown/u);
 });
 
-test('memory status answers only about memory and catalog requests are grouped from registered tools', () => {
+test('human system diagnostic presents runtime, memory, voice and dynamically grouped real capabilities without internal identifiers', () => {
+    const diagnostics = createOperationalDiagnostics({ runtimeId: 'private-runtime-id', memoryMode: 'memory2-readonly' });
+    diagnostics.setMemoryStatus({ backend: 'memory2', mode: 'memory2-readonly', storeType: 'Memory 2 Schema v5',
+        initialized: true, available: true, retrievalEnabled: true, schemaValidation: 'validated' });
+    diagnostics.recordMemoryRetrieval({ readStatus: 'success', matchCount: 1 });
+    diagnostics.recordVoiceOperation({ requestId: 'private-request-id', stage: 'transcription', state: 'success', durationMs: 520,
+        durations: { transcriptionMs: 520 } });
+    diagnostics.recordVoiceOperation({ requestId: 'private-request-id', stage: 'playback', state: 'success', durationMs: 850,
+        model: 'gpt-4o-mini-tts', voice: 'nova', identityProfile: 'nova-portena', identityProcessing: true,
+        durations: { transcriptionMs: 520, synthesisMs: 300, identityProcessingMs: 600 } });
+    const snapshot = { ...diagnostics.snapshot(), tools: { registered: ['open_app', 'list_windows', 'read_file',
+        'whatsapp_prepare_message', 'search_emails', 'list_calendar_events', 'spotify_play', 'remember',
+        'web_search', 'get_weather', 'lifeguard_search_incidents', 'mystery_tool'],
+    available: ['open_app', 'list_windows', 'read_file', 'search_emails', 'spotify_play', 'remember', 'get_weather', 'mystery_tool'] } };
+    const report = formatSystemStatus(snapshot);
+    for (const phrase of ['Diagnóstico de Nexa', 'Sistema central', 'Capacidades de Nexa', 'Sistema de voz', 'Evaluación general',
+        'Registradas: 12; habilitadas: 8', 'Runtime:** Activo', 'Backend y modo de memoria:** Memory2; solo lectura',
+        'Memory2, esquema versión 5', 'Lectura comprobada correctamente',
+        'Control de Windows y aplicaciones', 'Gestión de ventanas e interfaz', 'Archivos y navegación', 'Spotify',
+        'Correo electrónico', 'Calendario', 'Memoria y conocimiento', 'Internet, clima, fecha y hora',
+        'Integración Lifeguard', 'Sin operaciones habilitadas en esta sesión', 'Nova rioplatense', '520 ms']) {
+        assert.ok(report.includes(phrase), `expected report to include ${phrase}`);
+    }
+    assert.doesNotMatch(report, /open_app|mystery_tool|private-runtime-id|private-request-id|spotify_play|remember/u);
+    const technical = formatSystemStatus(snapshot, { technical: true });
+    assert.match(technical, /private-runtime-id/u);
+    assert.match(technical, /spotify_play/u);
+});
+
+test('system status includes full report and catalog requests group only registered tools', () => {
     const snapshot = { runtime: { id: 'runtime-test', state: 'active' },
         memory: { mode: 'memory2-confirmed-write', backend: 'memory2', storeType: 'Memory 2 Schema v5',
             initialized: false, available: null, retrievalEnabled: null, schemaValidation: 'unknown', lastError: null },
@@ -103,7 +132,8 @@ test('memory status answers only about memory and catalog requests are grouped f
         lastMemoryRetrieval: null };
     assert.equal(classifySystemDiagnosticRequest('¿Qué sistema de memoria estás usando?'), 'status');
     const status = formatSystemStatus(snapshot);
-    assert.match(status, /Estado de mi memoria/u);
+    assert.match(status, /Sistema central/u);
+    assert.match(status, /Capacidades de Nexa/u);
     assert.doesNotMatch(status, /spotify_play|mystery_tool|herramientas disponibles/u);
     assert.equal(classifySystemDiagnosticRequest('¿Qué herramientas tenés disponibles?'), 'tool_catalog');
     const all = formatToolCatalog(snapshot);

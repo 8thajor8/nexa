@@ -560,7 +560,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--nexa-cyan);
 .voice-ptt-button::before, .voice-ptt-button::after { position: absolute; inset: -5px; border: 1px solid rgba(49, 143, 244, 0.32); border-radius: 50%; content: ""; pointer-events: none; }
 .voice-ptt-button::after { inset: -8px; border-color: rgba(0, 221, 255, 0.14); transform: rotate(24deg) scaleX(0.92); }
 .voice-ptt-button:hover:not(:disabled) { border-color: #78baff; box-shadow: 0 0 17px rgba(53, 143, 255, 0.32); }
-.voice-ptt-button:focus-visible, .voice-secondary-button:focus-visible { outline: 2px solid var(--nexa-cyan-soft); outline-offset: 2px; }
+.voice-ptt-button:focus-visible, .voice-secondary-button:focus-visible, .voice-stop-button:focus-visible { outline: 2px solid var(--nexa-cyan-soft); outline-offset: 2px; }
 .voice-ptt-button:disabled { cursor: not-allowed; opacity: 0.52; }
 .voice-ptt-button svg { width: 21px; height: 21px; }
 .voice-ptt-button[data-voice-state="listening"] { border-color: #7deaff; background: radial-gradient(circle, rgba(18, 127, 178, 0.88), rgba(5, 39, 72, 0.98)); color: #fff; box-shadow: 0 0 0 3px rgba(0, 204, 255, 0.2), 0 0 21px rgba(0, 207, 255, 0.52), inset 0 0 14px rgba(0, 239, 255, 0.18); animation: voice-ring-breathe 1.6s ease-in-out infinite; }
@@ -569,6 +569,10 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--nexa-cyan);
 @keyframes voice-ring-breathe { 50% { box-shadow: 0 0 0 5px rgba(0, 204, 255, 0.13), 0 0 24px rgba(0, 207, 255, 0.62), inset 0 0 14px rgba(0, 239, 255, 0.2); } }
 .voice-secondary-button { min-height: 38px; padding: 0 10px; border: 1px solid rgba(83, 151, 231, 0.34); border-radius: 8px; background: rgba(8, 27, 54, 0.72); color: #c9ddf4; font-size: 11px; font-weight: 650; cursor: pointer; }
 .voice-secondary-button:hover { border-color: rgba(104, 177, 255, 0.7); background: rgba(18, 52, 96, 0.8); }
+.voice-stop-button { display: grid; width: 38px; height: 38px; flex: 0 0 38px; place-items: center; border: 1px solid rgba(0, 224, 255, 0.64); border-radius: 11px; background: linear-gradient(145deg, rgba(11, 61, 91, 0.88), rgba(7, 25, 48, 0.96)); color: #8cecff; box-shadow: 0 0 12px rgba(0, 204, 255, 0.17), inset 0 0 10px rgba(0, 224, 255, 0.08); cursor: pointer; }
+.voice-stop-button:hover:not(:disabled) { border-color: #9bf3ff; color: #e5fcff; box-shadow: 0 0 16px rgba(0, 220, 255, 0.32); }
+.voice-stop-button:disabled { cursor: default; opacity: 0.55; }
+.voice-stop-button svg { width: 17px; height: 17px; }
 .voice-recover-button { border-color: rgba(115, 174, 255, 0.58); color: #e2efff; }
 .voice-status-copy { color: #abc8e8; font-size: 10px; font-weight: 650; letter-spacing: 0.035em; }
 .voice-error-message { margin: 7px 2px 0; color: #ffc0c4; font-size: 11px; line-height: 1.4; }

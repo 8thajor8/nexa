@@ -87,8 +87,9 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
     function makeOperation(text, options) {
         let resolveCancellation;
         const cancellation = new Promise(resolve => { resolveCancellation = resolve; });
+        const controller = new AbortController();
         return { turnId: idFactory(), text, options, phase: 'synthesizing', startedAt: performance.now(), phaseStartedAt: performance.now(),
-            cancelled: false, cancellation, resolveCancellation };
+            cancelled: false, cancellation, resolveCancellation, controller };
     }
     function discardGenerated(operation) {
         if (operation.options.persist || !operation.generatedAudioId || typeof operation.service?.removeTemporary !== 'function') return Promise.resolve(false);
@@ -110,6 +111,7 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
         const operation = active;
         operation.cancelled = true;
         operation.cancelReason = reason;
+        operation.controller.abort();
         operation.resolveCancellation(null);
         if (operation.phase !== 'speaking') {
             active = null;
@@ -169,7 +171,7 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
             service = await resolveService();
             if (active !== operation) return null;
             synthesisInFlight = true;
-            try { generated = await service.generate({ text: operation.text, ...operation.options }); }
+            try { generated = await service.generate({ text: operation.text, ...operation.options, signal: operation.controller.signal }); }
             finally { synthesisInFlight = false; }
             operation.speechMetrics = typeof service.getLastMetrics === 'function' ? safeSpeechMetrics(service.getLastMetrics()) : null;
             if (active !== operation) {

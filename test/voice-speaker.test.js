@@ -28,10 +28,11 @@ test('speaker delegates synthesis and playback and correlates speaking/completed
     speaker.on('voice.speech.completed', event => events.push(event));
 
     const result = await speaker.speak('Hola Nexa', { style: 'calm' });
-    assert.deepEqual(calls, [
-        ['generate', { text: 'Hola Nexa', style: 'calm', persist: false }],
-        ['play', 'audio_test'],
-    ]);
+    assert.equal(calls[0][0], 'generate');
+    assert.deepEqual({ text: calls[0][1].text, style: calls[0][1].style, persist: calls[0][1].persist },
+        { text: 'Hola Nexa', style: 'calm', persist: false });
+    assert.ok(calls[0][1].signal instanceof AbortSignal);
+    assert.deepEqual(calls.slice(1), [['play', 'audio_test']]);
     assert.deepEqual(result, { sessionId: 'speaker-session', turnId: 'turn-1', completed: true });
     assert.deepEqual(events.map(event => event.type), ['voice.speaking', 'voice.speech.completed']);
     assert.ok(events.every(event => event.sessionId === 'speaker-session' && event.turnId === 'turn-1' && event.timestamp === 42));
@@ -95,9 +96,10 @@ test('speaker preserves the verified SpeechService processing failure and safe s
 test('cancellation during synthesis returns promptly and ignores late output', async () => {
     const pendingGeneration = deferred();
     let playCalls = 0;
+    let generationSignal;
     const removed = [];
     const speaker = createVoiceSpeaker({ speechService: {
-        generate() { return pendingGeneration.promise; },
+        generate({ signal }) { generationSignal = signal; return pendingGeneration.promise; },
         async play() { playCalls++; return { success: true }; },
         async removeTemporary(id) { removed.push(id); return true; },
     }, idFactory: () => 'turn-cancel' });
@@ -108,6 +110,7 @@ test('cancellation during synthesis returns promptly and ignores late output', a
     await Promise.resolve();
     await Promise.resolve();
     assert.equal(speaker.cancel('user'), true);
+    assert.equal(generationSignal.aborted, true);
     assert.equal(await task, null);
     pendingGeneration.resolve({ success: true, audioId: 'audio_late' });
     await new Promise(resolve => setImmediate(resolve));
@@ -116,6 +119,27 @@ test('cancellation during synthesis returns promptly and ignores late output', a
     assert.deepEqual(events.map(event => event.type), ['voice.speech.cancelled']);
     assert.equal(events[0].phase, 'synthesizing');
     assert.equal(events[0].playbackInterrupted, false);
+});
+
+test('repeated cancellation during speech generation remains idempotent and late output is never played', async () => {
+    const pendingGeneration = deferred();
+    const events = [];
+    let playCalls = 0;
+    const speaker = createVoiceSpeaker({ speechService: {
+        generate() { return pendingGeneration.promise; },
+        async play() { playCalls++; return { success: true }; },
+        async removeTemporary() { return true; },
+    } });
+    speaker.on('voice.speech.cancelled', event => events.push(event));
+    const pending = speaker.speak('Mantener el texto, no reproducir audio cancelado');
+    await Promise.resolve();
+    assert.equal(speaker.cancel('user'), true);
+    assert.equal(speaker.cancel('user'), false);
+    assert.equal(await pending, null);
+    pendingGeneration.resolve({ success: true, audioId: 'late-audio' });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(playCalls, 0);
+    assert.equal(events.length, 1);
 });
 
 test('cancellation during playback is logical and reports that playback was not interrupted', async () => {

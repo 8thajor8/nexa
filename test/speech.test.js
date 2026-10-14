@@ -281,16 +281,45 @@ test('shutdown deletes unplayed temporary files but leaves persistent audio', as
 
 test('OpenAI provider uses centralized model, voice, instructions, WAV format and current SDK endpoint', async () => {
     let request;
-    const provider = createOpenAISpeechProvider({ clientFactory: () => ({ audio: { speech: { async create(options) {
+    let requestOptions;
+    const provider = createOpenAISpeechProvider({ clientFactory: () => ({ audio: { speech: { async create(options, optionsForRequest) {
         request = options;
+        requestOptions = optionsForRequest;
         return { async arrayBuffer() { return Uint8Array.from([1, 2, 3]).buffer; } };
     } } } }) });
-    assert.deepEqual(await provider.synthesize({ text: 'Hola', instructions: 'Nexa voice' }), Buffer.from([1, 2, 3]));
+    const controller = new AbortController();
+    assert.deepEqual(await provider.synthesize({ text: 'Hola', instructions: 'Nexa voice', signal: controller.signal }), Buffer.from([1, 2, 3]));
+    assert.equal(requestOptions.signal, controller.signal);
     assert.deepEqual(request, {
         model: 'gpt-4o-mini-tts', voice: 'nova', input: 'Hola', instructions: 'Nexa voice', response_format: 'wav',
     });
     await provider.synthesize({ text: 'Hola', instructions: 'Nexa voice', voice: 'coral' });
     assert.equal(request.voice, 'coral');
+});
+
+test('cancellation during identity processing prevents the late audio from being stored', async () => {
+    let finishIdentity;
+    let announceIdentityStarted;
+    const identityStarted = new Promise(resolve => { announceIdentityStarted = resolve; });
+    let saved = false;
+    const service = createSpeechService({
+        provider: { async synthesize() { return Buffer.from([1, 2, 3]); } },
+        store: { async initialize() {}, async save() { saved = true; return { audioId: 'unexpected' }; } },
+        player: async () => assert.fail('Cancelled audio must never reach playback.'),
+        voiceIdentityProcessor: { process() {
+            announceIdentityStarted();
+            return new Promise(resolve => { finishIdentity = resolve; });
+        } },
+    });
+    const controller = new AbortController();
+    const resultPromise = service.generate({ text: 'Respuesta sintética', signal: controller.signal });
+    await identityStarted;
+    controller.abort();
+    finishIdentity(Buffer.from([4, 5, 6]));
+    const result = await resultPromise;
+    assert.equal(result.success, false);
+    assert.equal(result.error.code, 'voice_cancelled');
+    assert.equal(saved, false);
 });
 
 test('normalizes unknown OpenAI WAV length markers for Windows file playback', () => {

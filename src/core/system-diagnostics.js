@@ -200,9 +200,115 @@ export function formatSystemStatus(snapshot, { technical = false } = {}) {
         : lastRetrieval?.readStatus === 'success' ? 'yes'
             : lastRetrieval?.readStatus === 'error' ? 'no' : 'unknown';
     if (!technical) {
-        const configuredOrActive = memory.initialized === true ? 'está usando' : 'está configurado para usar';
-        return `**Estado de mi memoria**\n\nEl Runtime ${configuredOrActive} ${mode}. El componente de memoria está ${state}`
-            + `${memory.storeType !== 'unknown' ? ` y el almacén es ${memory.storeType}` : ''}.`;
+        const statusLabel = value => value === true ? 'Disponible' : value === false ? 'No disponible' : 'Sin comprobar';
+        const humanBackend = memory.backend === 'memory2' ? 'Memory2'
+            : memory.backend === 'memory1' ? 'Memory1 heredada' : 'Sin identificar';
+        const humanMode = memory.mode === 'memory2-confirmed-write' ? 'escritura confirmada'
+            : memory.mode === 'memory2-readonly' ? 'solo lectura'
+                : memory.mode === 'memory1' ? 'modo heredado' : 'sin identificar';
+        const storeMatch = typeof memory.storeType === 'string' && memory.storeType.match(/schema\s*v(\d+)/iu);
+        const storeLabel = memory.backend === 'memory2' && storeMatch ? `Memory2, esquema versión ${storeMatch[1]}`
+            : memory.storeType && memory.storeType !== 'unknown' ? memory.storeType : 'No identificado';
+        const initialization = memory.initialized === true ? 'Inicializado'
+            : memory.initialized === false ? 'Pendiente de inicialización' : 'Sin comprobar';
+        const retrieval = memory.retrievalEnabled === true ? 'Habilitada' : memory.retrievalEnabled === false ? 'Deshabilitada' : 'Sin comprobar';
+        const validation = memory.schemaValidation === 'validated' ? 'Validado'
+            : memory.schemaValidation === 'invalid' ? 'No válido' : 'Sin comprobar';
+        const verification = operationallyVerified === 'yes' ? 'Lectura comprobada correctamente'
+            : operationallyVerified === 'no' ? 'La última lectura comprobada falló'
+                : 'Todavía no hay una lectura operativa reciente';
+        const runtimeState = runtime?.state === 'active' ? 'Activo'
+            : runtime?.state === 'error' ? 'Con errores' : 'Sin comprobar';
+        const registered = [...new Set(Array.isArray(tools?.registered) ? tools.registered : [])];
+        const enabled = Array.isArray(tools?.available) ? new Set(tools.available) : null;
+        const aliases = {
+            'Computadora y aplicaciones': 'Control de Windows y aplicaciones',
+            'Ventanas y controles': 'Gestión de ventanas e interfaz',
+            'Archivos y carpetas': 'Archivos y navegación',
+            'Voz y audio': 'Audio y multimedia',
+            'Música y Spotify': 'Spotify',
+            'Correo electrónico': 'Correo electrónico',
+            'Calendario': 'Calendario',
+            'Lifeguard': 'Integración Lifeguard',
+            'WhatsApp': 'WhatsApp',
+            'Búsqueda e información': 'Internet, clima, fecha y hora',
+            'Diagnóstico y sistema': 'Internet, clima, fecha y hora',
+            'Memoria': 'Memoria y conocimiento',
+            'Otras herramientas': 'Otras capacidades',
+        };
+        const categories = new Map();
+        for (const id of registered) {
+            const presentation = toolPresentation(id);
+            const presentationCategory = id === 'open_url' ? 'Búsqueda e información'
+                : /^(inspect_ui|find_ui_element|focus_ui_element|invoke_ui_element|set_ui_value|get_ui_value)$/u.test(id)
+                    ? 'Ventanas y controles' : presentation.category;
+            const category = aliases[presentationCategory] ?? 'Otras capacidades';
+            const entry = categories.get(category) ?? { enabled: [], enabledCount: 0, disabled: 0 };
+            if (enabled?.has(id)) {
+                entry.enabledCount++;
+                if (TOOL_PRESENTATION[id]) entry.enabled.push(TOOL_PRESENTATION[id][0]);
+            }
+            else if (enabled) entry.disabled++;
+            categories.set(category, entry);
+        }
+        const capabilityLines = [...categories].map(([category, entry]) => {
+            const operations = [...new Set(entry.enabled)];
+            const detail = operations.length ? operations.join(', ') : enabled === null
+                ? 'Disponibilidad de las operaciones sin comprobar' : entry.enabledCount
+                    ? 'Operaciones disponibles en esta categoría' : 'Sin operaciones habilitadas en esta sesión';
+            const disabledNote = entry.disabled ? `; ${entry.disabled} registrada${entry.disabled === 1 ? '' : 's'} pero deshabilitada${entry.disabled === 1 ? '' : 's'}` : '';
+            return `- **${category}** — ${detail}${disabledNote}.`;
+        });
+        const counts = `Registradas: ${registered.length}; habilitadas: ${enabled ? [...enabled].length : 'sin comprobar'}.`;
+        const voiceStageNames = { ptt: 'micrófono y captura', transcription: 'transcripción', runtime: 'respuesta de Nexa',
+            synthesis: 'síntesis de voz', identity_processing: 'identidad vocal', audio_preparation: 'preparación de audio', playback: 'reproducción' };
+        const voiceStateNames = { started: 'iniciada', processing: 'en curso', success: 'completada', error: 'con error',
+            cancelled: 'cancelada', interrupted: 'interrumpida' };
+        const safeErrorNames = { voice_identity_browser_unavailable: 'No está disponible el motor local de identidad vocal.',
+            voice_tts_generation_failed: 'Falló la generación de voz.', voice_audio_processing_failed: 'Falló el procesamiento del audio.',
+            voice_speech_playback_failed: 'Falló la reproducción de voz.', voice_speech_playback_timeout: 'La reproducción excedió el tiempo esperado.',
+            voice_speech_stop_failed: 'No se pudo confirmar la interrupción de la voz.', voice_speech_stop_timeout: 'La interrupción de voz excedió el tiempo esperado.',
+            voice_audio_storage_unavailable: 'El almacenamiento temporal de audio no está disponible.', voice_speech_busy: 'Ya había una operación de voz en curso.' };
+        const memoryErrorNames = { memory_store_missing: 'No se encontró el almacén de memoria.',
+            memory_store_invalid: 'El almacén de memoria no tiene un formato válido.', memory_schema_unsupported: 'La versión del almacén no es compatible.',
+            memory_store_changed: 'El almacén cambió durante una operación.', memory_reader_closed: 'El lector de memoria está cerrado.',
+            memory_read_failed: 'Falló la última lectura de memoria.', memory_store_unreadable: 'No se pudo leer el almacén de memoria.',
+            memory_store_locked: 'El almacén de Memory2 está bloqueado.', memory_persist_failed: 'No se pudo guardar el cambio de memoria.' };
+        const lastVoice = voice?.last;
+        const lastTranscription = [...(voice?.recent ?? [])].reverse().find(item => item.stage === 'transcription');
+        const voiceReady = voice?.configuration?.model !== 'unknown' && voice?.configuration?.voice !== 'unknown';
+        const voiceLines = [
+            `- **Estado:** ${lastVoice ? `última operación ${voiceStateNames[lastVoice.state] ?? 'registrada'}` : 'Sin ejecuciones recientes registradas'}.`,
+            `- **Última etapa:** ${lastVoice ? voiceStageNames[lastVoice.stage] ?? 'etapa registrada' : 'Sin datos recientes'}`,
+            `- **Última duración:** ${lastVoice?.durationMs === null || !lastVoice ? 'Sin medición reciente' : `${lastVoice.durationMs} ms`}`,
+            `- **Transcripción:** ${lastTranscription ? `${lastTranscription.durations?.transcriptionMs ?? lastTranscription.durationMs ?? 'medición no disponible'}${typeof (lastTranscription.durations?.transcriptionMs ?? lastTranscription.durationMs) === 'number' ? ' ms' : ''}` : 'Sin medición reciente'}`,
+            `- **Síntesis:** ${voiceReady ? 'Configurada; el acceso al proveedor no se comprueba desde este informe' : 'Configuración no comprobada'}`,
+            `- **Identidad vocal:** ${voice?.configuration?.identityProfile === 'nova-portena' ? 'Nova rioplatense' : voice?.configuration?.identityProfile && voice.configuration.identityProfile !== 'unknown' ? 'Perfil de identidad configurado' : 'Sin perfil comprobado'}`,
+            `- **Procesamiento de identidad:** ${voice?.configuration?.identityProcessing === true ? 'Activo' : voice?.configuration?.identityProcessing === false ? 'Desactivado' : 'Sin comprobar'}`,
+        ];
+        if (lastVoice?.errorCode) voiceLines.push(`- **Incidencia reciente:** ${safeErrorNames[lastVoice.errorCode] ?? 'Se registró un error de voz.'}`);
+        const errors = memory.lastError ? (memoryErrorNames[memory.lastError] ?? 'Hay un error de memoria registrado.') : lastVoice?.state === 'error'
+            ? 'Hay un error reciente de Voice.' : 'No hay errores recientes registrados en estos diagnósticos.';
+        return [
+            '**Diagnóstico de Nexa**',
+            '', '**1. Sistema central**',
+            `- **Runtime:** ${runtimeState}.`,
+            `- **Backend y modo de memoria:** ${humanBackend}; ${humanMode}.`,
+            `- **Almacén:** ${storeLabel}.`,
+            `- **Inicialización:** ${initialization}; **disponibilidad:** ${statusLabel(memory.available)}.`,
+            `- **Lectura:** ${retrieval}; **integridad del esquema:** ${validation}.`,
+            `- **Verificación operativa:** ${verification}.`,
+            `- **Errores relevantes:** ${memory.lastError ? memoryErrorNames[memory.lastError] ?? 'Hay un error de memoria registrado.' : 'No hay error de memoria registrado.'}`,
+            '', '**2. Capacidades de Nexa**',
+            counts,
+            ...(capabilityLines.length ? capabilityLines : ['- No hay herramientas registradas en el snapshot actual.']),
+            'El registro de herramientas no confirma por sí solo que un proveedor externo esté conectado.',
+            '', '**3. Sistema de voz**', ...voiceLines,
+            '', '**4. Evaluación general**',
+            `${runtimeState === 'Activo' && memory.available !== false && lastVoice?.state !== 'error'
+                ? 'El núcleo de Nexa está operativo según los datos disponibles.'
+                : 'El estado presenta aspectos pendientes de comprobar o una incidencia registrada.'} ${errors}`,
+        ].join('\n');
     }
     const lines = [
         '**Informe técnico del sistema**',
