@@ -72,6 +72,10 @@ export function createOperationalDiagnostics({ runtimeId = randomUUID(), memoryM
                 identityAudioCaptureWaitMs: duration(event.durations?.identityAudioCaptureWaitMs),
                 identityPostProcessingMs: duration(event.durations?.identityPostProcessingMs),
                 audioReadyMs: duration(event.durations?.audioReadyMs),
+                pttFinalizationMs: duration(event.durations?.pttFinalizationMs), audioConversionMs: duration(event.durations?.audioConversionMs),
+                speechInitializationMs: duration(event.durations?.speechInitializationMs),
+                playbackCommandStartMs: duration(event.durations?.playbackCommandStartMs),
+                responseDispatchToPlaybackMs: duration(event.durations?.responseDispatchToPlaybackMs),
                 audioPreparationMs: duration(event.durations?.audioPreparationMs), playbackMs: duration(event.durations?.playbackMs) }),
             cancellation: ['user', 'superseded', 'session_ended', 'timeout'].includes(event.cancellation) ? event.cancellation : null,
             at: new Date().toISOString() });
@@ -363,7 +367,8 @@ export function createTechnicalDiagnosticReport(snapshot, kind = 'memory') {
         requestId: allowedString(item.requestId), stage: allowedString(item.stage), state: allowedString(item.state),
         errorCode: allowedString(item.errorCode), durationMs: Number.isSafeInteger(item.durationMs) ? item.durationMs : null,
         errorDescription: voiceErrorDescription(item.errorCode),
-        durations: Object.fromEntries(['transcriptionMs', 'runtimeMs', 'synthesisMs', 'identityProcessingMs',
+        durations: Object.fromEntries(['pttFinalizationMs', 'audioConversionMs', 'transcriptionMs', 'runtimeMs', 'speechInitializationMs',
+            'synthesisMs', 'identityProcessingMs', 'playbackCommandStartMs', 'responseDispatchToPlaybackMs',
             'identityServerStartupMs', 'identityBrowserStartupMs', 'identityRendererPreparationMs', 'identityDspProcessingMs',
             'identityDspSetupMs', 'identityAudioCaptureWaitMs', 'identityPostProcessingMs', 'audioReadyMs',
             'audioPreparationMs', 'playbackMs']

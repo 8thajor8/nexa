@@ -72,7 +72,7 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
         return servicePromise;
     }
 
-    const listeners = new Map(['voice.speaking', 'voice.speech.completed', 'voice.speech.cancelled', 'voice.speech.error'].map(type => [type, new Set()]));
+    const listeners = new Map(['voice.speaking', 'voice.playback.started', 'voice.speech.completed', 'voice.speech.cancelled', 'voice.speech.error'].map(type => [type, new Set()]));
     function emit(type, operation, details = {}) {
         const event = Object.freeze({ type, sessionId, turnId: operation?.turnId ?? null,
             playbackId: operation?.playbackId ?? null, timestamp: now(), ...details });
@@ -198,7 +198,11 @@ export function createVoiceSpeaker({ speechService, sessionId = randomUUID(), id
             const observedPlay = Promise.resolve().then(() => {
                 if (operation.cancelled || active !== operation) return { success: false, status: 'stopped', released: true };
                 operation.playStarted = true;
-                return service.play(generated.audioId, { playbackId: operation.playbackId });
+                return service.play(generated.audioId, { playbackId: operation.playbackId, onStarted: () => {
+                    if (active === operation && !operation.cancelled) emit('voice.playback.started', operation, { diagnostics: Object.freeze({
+                        stage: 'playback', state: 'started', durationMs: Math.round(performance.now() - operation.phaseStartedAt),
+                        metrics: operation.speechMetrics }) });
+                } });
             }).then(
                 value => ({ kind: 'result', value }),
                 () => ({ kind: 'error' }),

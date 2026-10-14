@@ -60,6 +60,21 @@ test('speaker emits sanitized generation and playback errors', async () => {
     assert.equal(playbackEvents[0].phase, 'speaking');
 });
 
+test('speaker reports playback start only after the player confirms the start command', async () => {
+    const speaker = createVoiceSpeaker({ idFactory: () => 'turn-started', speechService: {
+        async generate() { return { success: true, audioId: 'audio_test' }; },
+        async play(_audioId, options) { options.onStarted(); return { success: true }; },
+        async removeTemporary() { return true; },
+    } });
+    const events = [];
+    speaker.on('voice.playback.started', event => events.push(event));
+    await speaker.speak('respuesta sintética');
+    assert.equal(events.length, 1);
+    assert.equal(events[0].turnId, 'turn-started');
+    assert.equal(events[0].diagnostics.stage, 'playback');
+    assert.equal(Number.isFinite(events[0].diagnostics.durationMs), true);
+});
+
 test('speaker preserves the verified SpeechService processing failure and safe stage timings', async () => {
     const speaker = createVoiceSpeaker({ idFactory: () => 'turn-diagnostic', speechService: {
         async generate() { return { success: false, error: { code: 'voice_identity_browser_unavailable', message: 'internal path must not escape' } }; },

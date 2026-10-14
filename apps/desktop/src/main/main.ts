@@ -61,6 +61,7 @@ import {
   cleanupVoiceWindow,
   cancelVoiceSpeech,
   speakVoiceResponse,
+  markVoiceResponseDispatched,
   registerVoiceWindowNavigation,
   registerVoiceIpcHandlers,
   registerVoiceMicrophonePermissions,
@@ -70,7 +71,7 @@ import {
 
 interface DesktopSpeechService {
   generate(input: { text: string; style?: string; persist?: boolean }): Promise<unknown>;
-  play(audioId: string, options?: { playbackId?: string }): Promise<unknown>;
+  play(audioId: string, options?: { playbackId?: string; onStarted?: () => void }): Promise<unknown>;
   stopPlayback(playbackId: string): Promise<unknown>;
   getPlaybackStatus(playbackId: string): unknown;
   removeTemporary(audioId: string): Promise<boolean>;
@@ -611,6 +612,10 @@ function installWebContentsGuards(): void {
               identityServerStartupMs, identityBrowserStartupMs, identityRendererPreparationMs, identityDspSetupMs,
               identityDspProcessingMs, identityAudioCaptureWaitMs, identityPostProcessingMs, audioReadyMs,
               audioPreparationMs: audioPreparationMs || null,
+              pttFinalizationMs: duration(metrics.pttFinalizationMs), audioConversionMs: duration(metrics.audioConversionMs),
+              speechInitializationMs: duration(metrics.speechInitializationMs),
+              playbackCommandStartMs: duration(metrics.playbackCommandStartMs),
+              responseDispatchToPlaybackMs: duration(metrics.responseDispatchToPlaybackMs),
               playbackMs: event.stage === "playback" ? event.durationMs : null },
           });
         },
@@ -662,6 +667,7 @@ function installWebContentsGuards(): void {
     }, {
       onNewInteraction: () => { cancelVoiceSpeech(mainWindow as never, "superseded"); },
       onVoiceResponse: (window, requestId, response) => { void speakVoiceResponse(window as never, requestId, response); },
+      onVoiceResponseDispatched: (requestId) => markVoiceResponseDispatched(requestId),
       onVoiceRuntimeCompleted: (_window, requestId, durationMs) => {
         desktopOperationalDiagnostics.recordVoiceOperation({ requestId, stage: "runtime", state: "success", durationMs,
           ...desktopVoiceConfiguration, durations: { runtimeMs: durationMs } });

@@ -41,6 +41,7 @@ export interface ChatVoiceHooks {
   onNewInteraction?(): void;
   onVoiceResponse?(window: ChatWindowContext, requestId: string, response: string): void;
   onVoiceRuntimeCompleted?(window: ChatWindowContext, requestId: string, durationMs: number): void;
+  onVoiceResponseDispatched?(requestId: string): void;
 }
 interface IpcMainLike {
   handle(channel: string, listener: Handler): void;
@@ -282,6 +283,10 @@ export class ChatIpcService {
     if (active.window.isDestroyed?.() || !isChatEventEnvelope(payload)) return;
     try {
       active.window.webContents.send(CHAT_EVENT_CHANNEL, payload);
+      if (active.request.source === "voice" && payload.status === "completed") {
+        try { this.voiceHooks.onVoiceResponseDispatched?.(payload.requestId); }
+        catch { /* Diagnostic timing must not affect response delivery. */ }
+      }
       this.trace("renderer_event_send_called", { conversationId: payload.conversationId,
         requestId: payload.requestId, status: payload.status });
     } catch {

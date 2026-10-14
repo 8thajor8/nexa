@@ -250,6 +250,7 @@ export function createWindowsAudioPlayer({
             }
             record.startedPlayback = true;
             record.status = 'playing';
+            try { record.onStarted?.(); } catch { /* Timing hooks must not affect audio playback. */ }
             if (record.stopRequested) { await stopRecord(record); return; }
 
             const deadline = Date.now() + completionTimeoutMs;
@@ -280,13 +281,14 @@ export function createWindowsAudioPlayer({
         }
     }
 
-    function play(audioPath, { playbackId = idFactory() } = {}) {
+    function play(audioPath, { playbackId = idFactory(), onStarted } = {}) {
         if (disposed) return Promise.resolve(failure('audio_player_disposed'));
         if (typeof playbackId !== 'string' || !playbackId || records.has(playbackId)) return Promise.resolve(failure('audio_playback_id_invalid'));
+        if (onStarted !== undefined && typeof onStarted !== 'function') return Promise.resolve(failure('audio_playback_id_invalid'));
         if (degraded || active) return Promise.resolve(failure(degraded ? 'audio_player_degraded' : 'audio_player_busy', degraded ? 'unknown' : 'failed', false));
         let resolveDone;
         let readyResolve;
-        const record = { playbackId, alias: `NexaAudio${randomBytes(6).toString('hex')}`, status: 'starting', opened: false, openAttempted: false,
+        const record = { playbackId, onStarted, alias: `NexaAudio${randomBytes(6).toString('hex')}`, status: 'starting', opened: false, openAttempted: false,
             startedPlayback: false, stopRequested: false, settled: false, released: false,
             done: new Promise(resolve => { resolveDone = resolve; }), resolveDone,
             ready: new Promise(resolve => { readyResolve = resolve; }), readyResolve };

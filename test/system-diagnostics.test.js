@@ -21,7 +21,9 @@ test('Voice diagnostics retain bounded safe stage metadata and omit conversation
     diagnostics.recordVoiceOperation({ requestId: '00000000-0000-4000-8000-000000000001', stage: 'identity_processing', state: 'error',
         errorCode: 'voice_identity_browser_unavailable', durationMs: 17, model: 'gpt-4o-mini-tts', voice: 'nova',
         identityProfile: 'nova-portena', identityProcessing: true,
-        durations: { synthesisMs: 800, identityProcessingMs: 17, identityBrowserStartupMs: 900,
+        durations: { pttFinalizationMs: 31, audioConversionMs: 8, speechInitializationMs: 22,
+            synthesisMs: 800, identityProcessingMs: 17, playbackCommandStartMs: 14, responseDispatchToPlaybackMs: 1200,
+            identityBrowserStartupMs: 900,
             identityRendererPreparationMs: 120, identityDspSetupMs: 40, identityDspProcessingMs: 7000,
             identityAudioCaptureWaitMs: 6800, identityPostProcessingMs: 15, audioReadyMs: 10300, audioPreparationMs: 2 },
         transcript: 'private utterance', text: 'private response', apiKey: 'secret' });
@@ -31,6 +33,11 @@ test('Voice diagnostics retain bounded safe stage metadata and omit conversation
     assert.equal(report.voice.last.errorCode, 'voice_identity_browser_unavailable');
     assert.equal(report.voice.last.errorDescription, 'Browser local de procesamiento de identidad vocal no disponible');
     assert.equal(report.voice.last.durations.synthesisMs, 800);
+    assert.equal(report.voice.last.durations.pttFinalizationMs, 31);
+    assert.equal(report.voice.last.durations.audioConversionMs, 8);
+    assert.equal(report.voice.last.durations.speechInitializationMs, 22);
+    assert.equal(report.voice.last.durations.playbackCommandStartMs, 14);
+    assert.equal(report.voice.last.durations.responseDispatchToPlaybackMs, 1200);
     assert.equal(report.voice.last.durations.identityBrowserStartupMs, 900);
     assert.equal(report.voice.last.durations.identityAudioCaptureWaitMs, 6800);
     assert.equal(report.voice.last.durations.audioReadyMs, 10300);

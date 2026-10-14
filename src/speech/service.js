@@ -115,7 +115,7 @@ export function createSpeechService({
         }
     }
 
-    async function play(audioId, { playbackId = randomUUID() } = {}) {
+    async function play(audioId, { playbackId = randomUUID(), onStarted } = {}) {
         const initialized = await initialize();
         if (!initialized.success) return initialized;
         const reference = store.get(audioId);
@@ -125,7 +125,7 @@ export function createSpeechService({
         try {
             result = typeof player === 'function'
                 ? await player(reference.filePath)
-                : await player.play(reference.filePath, { playbackId });
+                : await player.play(reference.filePath, { playbackId, ...(onStarted ? { onStarted } : {}) });
             playerSettled = true;
         }
         catch { result = failure('audio_playback_failed', 'Windows no pudo reproducir el audio.'); }

@@ -261,6 +261,8 @@ export interface VoicePttFinishRequest {
   audio: Uint8Array;
   format: "wav";
   language?: string;
+  pttFinalizationMs?: number;
+  audioConversionMs?: number;
 }
 export interface VoicePttFinishAck { ok: true; accepted: true; requestId: string; sessionId: string; }
 export interface VoicePttCancelRequest {

@@ -42,6 +42,20 @@ test('MCI play is nonblocking and natural completion closes its alias before res
     assert.equal(player.getStatus('natural').status, 'completed');
 });
 
+test('playback start hook fires only after Windows accepts the play command', async () => {
+    let mode = 'playing';
+    let started = false;
+    const { player } = fakeMci({ onCommand(command) {
+        if (command.startsWith('play ')) setTimeout(() => { mode = 'stopped'; }, 12);
+        if (command.startsWith('status ')) return { code: 0, output: mode };
+        return { code: 0 };
+    } });
+    const playback = player.play('controlled.wav', { playbackId: 'start-hook', onStarted: () => { started = true; } });
+    assert.equal(started, false);
+    await playback;
+    assert.equal(started, true);
+});
+
 test('stop during playback confirms stop, closes resources, and settles play once', async () => {
     let mode = 'playing';
     const { player, calls } = fakeMci({ onCommand(command) {

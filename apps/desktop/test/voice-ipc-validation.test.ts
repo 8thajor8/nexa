@@ -38,6 +38,10 @@ describe("Voice IPC validation", () => {
     expect(isVoicePttFinishRequest({ requestId: "finish-1", sessionId: "session-1", audio: wrongProfile, format: "wav" })).toBe(false);
     expect(isVoicePttFinishRequest({ requestId: "finish-1", sessionId: "session-1", audio: new Uint8Array([1, 2]), format: "wav" })).toBe(false);
     expect(isVoicePttFinishRequest({ requestId: "finish-1", sessionId: "session-1", audio: makeWav(), format: "WAV" })).toBe(false);
+    expect(isVoicePttFinishRequest({ requestId: "finish-1", sessionId: "session-1", audio: makeWav(), format: "wav",
+      pttFinalizationMs: 12, audioConversionMs: 4 })).toBe(true);
+    expect(isVoicePttFinishRequest({ requestId: "finish-1", sessionId: "session-1", audio: makeWav(), format: "wav",
+      pttFinalizationMs: 60_001, audioConversionMs: 4 })).toBe(false);
   });
 
   it("validates event envelopes and preserves the Voice event object and turn identity", () => {

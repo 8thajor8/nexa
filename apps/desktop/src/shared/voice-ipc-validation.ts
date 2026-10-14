@@ -82,11 +82,15 @@ function isPttWav(audio: unknown): audio is Uint8Array {
 
 export function isVoicePttFinishRequest(value: unknown): value is VoicePttFinishRequest {
   if (!isPlainRecord(value)) return false;
-  const keys = Object.hasOwn(value, "language")
-    ? ["requestId", "sessionId", "audio", "format", "language"]
-    : ["requestId", "sessionId", "audio", "format"];
+  const keys = ["requestId", "sessionId", "audio", "format",
+    ...(Object.hasOwn(value, "language") ? ["language"] : []),
+    ...(Object.hasOwn(value, "pttFinalizationMs") ? ["pttFinalizationMs"] : []),
+    ...(Object.hasOwn(value, "audioConversionMs") ? ["audioConversionMs"] : [])];
+  const validDuration = (key: string) => !Object.hasOwn(value, key)
+    || (Number.isSafeInteger(value[key]) && (value[key] as number) >= 0 && (value[key] as number) <= 60_000);
   return hasExactKeys(value, keys) && isVoiceId(value.requestId) && isVoiceId(value.sessionId)
     && value.format === "wav" && isPttWav(value.audio)
+    && validDuration("pttFinalizationMs") && validDuration("audioConversionMs")
     && (!Object.hasOwn(value, "language") || (typeof value.language === "string"
       && value.language.length > 0 && value.language.length <= MAX_LANGUAGE_LENGTH
       && !/[\u0000-\u001f\u007f]/.test(value.language)));

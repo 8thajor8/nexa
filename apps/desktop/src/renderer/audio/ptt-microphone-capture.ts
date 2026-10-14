@@ -315,6 +315,7 @@ export class PttMicrophoneCapture {
   async finish(language?: string): Promise<Awaited<ReturnType<VoiceDesktopApi["ptt"]["finish"]>>> {
     const state = this.current;
     if (!state || state.phase !== "recording" || state.cancelled) throw new PttCaptureError("voice_session_unavailable");
+    const finalizationStartedAt = performance.now();
     state.phase = "finishing";
     if (state.timer) this.unschedule(state.timer);
     state.timer = null;
@@ -336,12 +337,15 @@ export class PttMicrophoneCapture {
     }
 
     let wav: Uint8Array;
+    const conversionStartedAt = performance.now();
+    let audioConversionMs = 0;
     try {
       const samples = await resamplePttAudio(
         [sourceSamples], state.sampleRate, this.makeOfflineAudioContext, this.maxDurationSeconds,
       );
       wav = encodePcm16MonoWav(samples);
       samples.fill(0);
+      audioConversionMs = Math.round(performance.now() - conversionStartedAt);
     } catch (error) {
       sourceSamples.fill(0);
       await this.abortLocalSession(state);
@@ -359,6 +363,8 @@ export class PttMicrophoneCapture {
     try {
       response = await this.voice.ptt.finish({
         requestId: state.finishRequestId, sessionId: state.sessionId, audio: wav, format: "wav",
+        pttFinalizationMs: Math.max(0, Math.round(performance.now() - finalizationStartedAt) - audioConversionMs),
+        audioConversionMs,
         ...(language === undefined ? {} : { language }),
       });
     } catch (error) {

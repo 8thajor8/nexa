@@ -365,6 +365,7 @@ describe("PTT microphone capture and WAV encoding", () => {
     expect(harness.calls.finish).toHaveLength(1);
     expect(isVoicePttFinishRequest(harness.calls.finish[0])).toBe(true);
     expect(harness.calls.finish[0]).toMatchObject({ format: "wav", language: "es", sessionId: "session-1" });
+    expect(harness.calls.finish[0]).toMatchObject({ pttFinalizationMs: expect.any(Number), audioConversionMs: expect.any(Number) });
     expect(harness.track.stop).toHaveBeenCalledOnce();
     expect(harness.context.close).toHaveBeenCalledOnce();
     await expect(harness.capture.finish()).rejects.toMatchObject({ code: "voice_session_unavailable" });
