@@ -538,6 +538,59 @@ describe("Electron Main Voice IPC", () => {
     expect(speaker.speak).toHaveBeenCalledOnce();
   });
 
+  it("waits for the acknowledgement playback release event before starting the final response", async () => {
+    const window = createWindow("ack-release-barrier");
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    let idFactory = () => "";
+    let playbackState = "idle";
+    let acknowledgementTurnId = "";
+    let releaseAcknowledgement!: (value: null) => void;
+    const speaker = {
+      getPlaybackState: () => playbackState,
+      speakPrepared: vi.fn(() => {
+        const turnId = idFactory();
+        if (!acknowledgementTurnId) {
+          acknowledgementTurnId = turnId;
+          playbackState = "playing";
+          return new Promise<null>((resolve) => { releaseAcknowledgement = resolve; });
+        }
+        if (playbackState !== "idle") {
+          listeners.get("voice.speech.error")?.({ turnId, error: { code: "voice_speech_busy" } });
+          return Promise.reject(new Error("voice_speech_busy"));
+        }
+        listeners.get("voice.speech.completed")?.({ turnId });
+        return Promise.resolve({ completed: true as const });
+      }),
+      speak: vi.fn(),
+      cancel: vi.fn(() => {
+        // The speaker's public operation settles before Windows confirms Stop.
+        releaseAcknowledgement(null);
+        setTimeout(() => {
+          playbackState = "idle";
+          listeners.get("voice.speech.cancelled")?.({ turnId: acknowledgementTurnId, reason: "superseded" });
+        }, 15);
+        return true;
+      }),
+      on: vi.fn((type: string, listener: (event: Record<string, unknown>) => void) => {
+        listeners.set(type, listener); return () => listeners.delete(type);
+      }),
+    };
+    const api = { createVoiceSpeaker: vi.fn((options: { idFactory: () => string }) => { idFactory = options.idFactory; return speaker; }) };
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never,
+      undefined, async () => makeAudio(), async () => ({ audio: makeAudio() }));
+    const requestId = "00000000-0000-4000-8000-000000000083";
+    await expect(invoke(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL, trustedEvent(window), { requestId }))
+      .resolves.toMatchObject({ accepted: true });
+    await vi.waitFor(() => expect(speaker.speakPrepared).toHaveBeenCalledOnce());
+
+    await speakVoiceResponse(window as never, requestId, "Respuesta final del seguimiento");
+
+    expect(speaker.speakPrepared).toHaveBeenCalledTimes(2);
+    expect(window.webContents.send).not.toHaveBeenCalledWith(VOICE_SPEECH_EVENT_CHANNEL,
+      { requestId, state: "error", error: { code: "voice_speech_busy" } });
+    expect(window.webContents.send).toHaveBeenCalledWith(VOICE_SPEECH_EVENT_CHANNEL, { requestId, state: "completed" });
+  });
+
   it.each(["quick time-tool result", "quick Spotify action"])(
     "does not signal follow-up completion when a %s acknowledgement ends before final response preparation",
     async () => {

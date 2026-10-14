@@ -86,8 +86,20 @@ export function DashboardModules({ assistantState, spotifyStatus, spotifyBusyAct
       <section className="dashboard-module dashboard-module--tools surface-panel" aria-labelledby="tools-title">
         <HolographicFrame />
         <ModuleHeading id="tools-title" title="Herramientas disponibles" label="FUTURO" />
-        <ul className="tool-list" aria-label="Capacidades futuras, aún no conectadas">
-          {availableToolsMock.map((tool, index) => (
+        <ul className="tool-list" aria-label="Herramientas y preferencias">
+          {availableToolsMock.map((tool, index) => tool.id === "memory" ? (
+            <li className="tool-item tool-item--voice" key={tool.id}>
+              <button type="button" className="tool-item__voice-button" role="switch" aria-label="Respuestas por voz"
+                aria-checked={voiceRepliesEnabled} aria-describedby="voice-replies-state"
+                onClick={() => onVoiceRepliesChange?.(!voiceRepliesEnabled)}>
+                <svg className="tool-glyph tool-glyph--voice" viewBox="0 0 20 20" aria-hidden="true">
+                  <path d="M3 8v4h3l4 3V5L6 8H3Z" /><path d="M13 7a4 4 0 0 1 0 6m2-8a7 7 0 0 1 0 10" />
+                </svg>
+                <span>Respuestas por voz</span>
+                <small id="voice-replies-state">{voiceRepliesEnabled ? "ACTIVADO" : "DESACTIVADO"}</small>
+              </button>
+            </li>
+          ) : (
             <li className="tool-item" key={tool.id} title={`${tool.label}: integración futura, no operativa`}>
               <span className={`tool-glyph tool-glyph--${index % 4}`} aria-hidden="true">{["▦", "◉", "◎", "◌", "▱", "✉"][index]}</span>
               <span>{tool.label}</span>
@@ -95,13 +107,6 @@ export function DashboardModules({ assistantState, spotifyStatus, spotifyBusyAct
             </li>
           ))}
         </ul>
-        <label className="tool-voice-replies">
-          <span className="tool-voice-replies__copy"><strong>Respuestas por voz</strong>
-            <small>Nexa lee sus respuestas en voz alta, incluso cuando escribís por chat</small></span>
-          <input type="checkbox" role="switch" checked={voiceRepliesEnabled}
-            onChange={(event) => onVoiceRepliesChange?.(event.target.checked)} />
-          <span className="tool-voice-replies__switch" aria-hidden="true" />
-        </label>
       </section>
 
       <section className="dashboard-module dashboard-module--system surface-panel" aria-labelledby="system-title">

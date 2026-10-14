@@ -373,6 +373,7 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
         }),
         owner.speaker.on("voice.speech.completed", (event) => {
           if (typeof event.turnId !== "string") return;
+          const acknowledgementCompleted = owner.acknowledgementEnd?.requestId === event.turnId;
           const matchingRequestActive = owner.activeRequestId === event.turnId;
           const acknowledgementStillActive = matchingRequestActive && owner.activeKind === "acknowledgement";
           const responseStillPreparing = matchingRequestActive && owner.activeKind === "response_preparing"
@@ -383,6 +384,7 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
             owner.acknowledgementEnd.resolve();
             owner.acknowledgementEnd = null;
           }
+          if (acknowledgementCompleted) recordVoice({ requestId: event.turnId, stage: "acknowledgement", state: "completed" });
           if (responseStillActive) owner.activeKind = "response_preparing";
           else if (!acknowledgementStillActive) emitSpeechEvent(window, { requestId: event.turnId, state: "completed" });
           const details = event.diagnostics as Record<string, unknown> | undefined;
@@ -404,6 +406,7 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
         }),
         owner.speaker.on("voice.speech.cancelled", (event) => {
           if (typeof event.turnId !== "string") return;
+          const acknowledgementCancelled = owner.acknowledgementEnd?.requestId === event.turnId;
           const responseStillActive = owner.activeRequestId === event.turnId
             && owner.activeKind === "response_preparing"
             && pendingResponsePreparations.get(window)?.has(event.turnId) === true;
@@ -411,6 +414,8 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
             owner.acknowledgementEnd.resolve();
             owner.acknowledgementEnd = null;
           }
+          if (acknowledgementCancelled) recordVoice({ requestId: event.turnId, stage: "acknowledgement", state: "cancelled",
+            cancellation: typeof event.reason === "string" ? event.reason : "unknown" });
           speechTimingByRequest.delete(event.turnId);
           if (responseStillActive) owner.activeKind = "response_preparing";
           else emitSpeechEvent(window, { requestId: event.turnId, state: "cancelled" });
@@ -420,6 +425,7 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
         }),
         owner.speaker.on("voice.speech.error", (event) => {
           if (typeof event.turnId !== "string") return;
+          const acknowledgementFailed = owner.acknowledgementEnd?.requestId === event.turnId;
           const responseStillActive = owner.activeRequestId === event.turnId
             && owner.activeKind === "response_preparing"
             && pendingResponsePreparations.get(window)?.has(event.turnId) === true;
@@ -427,6 +433,8 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
             owner.acknowledgementEnd.resolve();
             owner.acknowledgementEnd = null;
           }
+          if (acknowledgementFailed) recordVoice({ requestId: event.turnId, stage: "acknowledgement", state: "error",
+            errorCode: safeSpeechErrorCode((event.error as Record<string, unknown> | undefined)?.code) });
           speechTimingByRequest.delete(event.turnId);
           const error = event.error as Record<string, unknown> | undefined;
           if (responseStillActive) owner.activeKind = "response_preparing";
@@ -525,7 +533,8 @@ export function cancelVoiceSpeech(window: VoiceIpcWindow | null, reason: "user" 
   return owner.speaker.cancel(reason);
 }
 
-export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestId: string, text: string): Promise<void> {
+export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestId: string, text: string,
+  origin: "voice" | "typed" = "voice"): Promise<void> {
   if (!window || window.isDestroyed() || !isVoiceId(requestId) || typeof text !== "string") return;
   const spokenText = prepareSpokenText(text);
   if (!spokenText.trim()) {
@@ -545,6 +554,7 @@ export async function speakVoiceResponse(window: VoiceIpcWindow | null, requestI
     releaseVoiceDucking(window, requestId, "error");
     return;
   }
+  recordVoice({ requestId, stage: "playback", state: "requested", metrics: { origin } });
   rememberSpeechTiming(requestId, { startedAt: performance.now() });
   let owner: VoiceSpeechOwner;
   const ownerPreparationStartedAt = performance.now();
@@ -701,12 +711,21 @@ let configuredResponseAudioPreparer: PrepareVoiceResponseAudio | null = null;
 let voiceAcknowledgementIndex = 0;
 
 export async function speakVoiceAcknowledgement(window: VoiceIpcWindow | null, requestId: string): Promise<boolean> {
-  if (!window || window.isDestroyed() || !isVoiceId(requestId) || !configuredVoiceApiLoader || !configuredVoiceAcknowledgementLoader) return false;
+  if (!window || window.isDestroyed() || !isVoiceId(requestId)) return false;
+  recordVoice({ requestId, stage: "acknowledgement", state: "requested" });
+  if (!configuredVoiceApiLoader || !configuredVoiceAcknowledgementLoader) {
+    recordVoice({ requestId, stage: "acknowledgement", state: "discarded", errorCode: "voice_speech_generation_failed" });
+    return false;
+  }
   const owner = await getSpeechOwner(window, configuredVoiceApiLoader).catch(() => null);
   const playbackState = owner?.speaker.getPlaybackState?.();
   const responsePreparingForRequest = owner?.activeKind === "response_preparing" && owner.activeRequestId === requestId;
   if (!owner || window.isDestroyed() || owner.stoppedRequestIds.has(requestId)
-    || (owner.activeRequestId && !responsePreparingForRequest) || (playbackState !== undefined && playbackState !== "idle")) return false;
+    || (owner.activeRequestId && !responsePreparingForRequest) || (playbackState !== undefined && playbackState !== "idle")) {
+    recordVoice({ requestId, stage: "acknowledgement", state: "discarded",
+      ...(playbackState !== undefined && playbackState !== "idle" ? { errorCode: "voice_speech_busy" } : {}) });
+    return false;
+  }
   let resolve!: () => void;
   const promise = new Promise<void>((done) => { resolve = done; });
   owner.acknowledgementEnd = { requestId, promise, resolve };
@@ -714,6 +733,7 @@ export async function speakVoiceAcknowledgement(window: VoiceIpcWindow | null, r
   owner.activeKind = "acknowledgement";
   owner.acknowledgementStarting = true;
   owner.nextTurnId = requestId;
+  recordVoice({ requestId, stage: "acknowledgement", state: "accepted" });
   emitSpeechEvent(window, { requestId, state: "preparing" });
   const ids: VoiceAcknowledgementId[] = ["clear", "review", "moment"];
   const id = ids[voiceAcknowledgementIndex++ % ids.length];
@@ -737,8 +757,12 @@ export async function speakVoiceAcknowledgement(window: VoiceIpcWindow | null, r
     return false;
   }
   owner.acknowledgementStarting = false;
+  recordVoice({ requestId, stage: "acknowledgement", state: "started" });
   try {
+    // The speaker promise may resolve as soon as cancellation is requested. Its
+    // terminal event is emitted only after playback is actually released.
     void owner.speaker.speakPrepared(Buffer.from(audio)).catch(() => undefined).finally(() => {
+      if (owner.speaker.getPlaybackState?.() !== "idle") return;
       if (owner.acknowledgementEnd?.requestId === requestId) {
         owner.acknowledgementEnd.resolve();
         owner.acknowledgementEnd = null;
@@ -982,7 +1006,7 @@ export function registerVoiceIpcHandlers(
     duckingRequestByWindow.set(window, requestId);
     await configuredAudioDucking?.begin(requestId).catch(() => undefined);
     if (activeTypedChatSpeech.get(window) !== requestId) return false;
-    void speakVoiceResponse(window, requestId, pending.text);
+    void speakVoiceResponse(window, requestId, pending.text, "typed");
     return true;
   });
   ipcMain.handle(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL, (event: IpcMainInvokeEvent, payload: unknown) => {
