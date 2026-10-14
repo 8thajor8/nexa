@@ -116,7 +116,8 @@ export function isVoiceFollowupDiagnosticRequest(value: unknown): value is Voice
   if (!isPlainRecord(value)) return false;
   const keys = ["requestId", "outcome", ...(Object.hasOwn(value, "durationMs") ? ["durationMs"] : [])];
   const outcomes = ["window_opened", "vad_speech_detected", "vad_misfire", "window_expired_no_speech",
-    "window_expired_after_speech", "transcription_submitted", "transcript_empty", "prefix_rejected",
+    "window_expired_after_speech", "transcription_submitted", "transcript_empty", "transcript_unusable",
+    "transcript_accepted_without_prefix", "transcript_accepted_prefix_removed", "prefix_rejected",
     "prefix_accepted", "chat_submission_requested", "transcription_error", "cancelled"];
   return hasExactKeys(value, keys) && isVoiceId(value.requestId) && outcomes.includes(String(value.outcome))
     && (!Object.hasOwn(value, "durationMs") || (Number.isFinite(value.durationMs)

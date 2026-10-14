@@ -76,10 +76,10 @@ test('Voice diagnostics retain bounded safe stage metadata and omit conversation
 test('follow-up diagnostics retain only an allowlisted outcome and bounded duration', () => {
     const diagnostics = createOperationalDiagnostics();
     diagnostics.recordVoiceOperation({ requestId: '00000000-0000-4000-8000-000000000002', stage: 'followup', state: 'success',
-        durationMs: 5000, followupOutcome: 'prefix_rejected', transcript: 'private transcript' });
+        durationMs: 5000, followupOutcome: 'transcript_unusable', transcript: 'private transcript' });
     const report = JSON.parse(createTechnicalDiagnosticReport(diagnostics.snapshot(), 'voice'));
     assert.equal(report.voice.last.stage, 'followup');
-    assert.equal(report.voice.last.followupOutcome, 'prefix_rejected');
+    assert.equal(report.voice.last.followupOutcome, 'transcript_unusable');
     assert.doesNotMatch(JSON.stringify(report), /private transcript/u);
     diagnostics.recordVoiceOperation({ requestId: '00000000-0000-4000-8000-000000000003', stage: 'followup', state: 'success',
         followupOutcome: 'private transcript' });
@@ -89,7 +89,7 @@ test('follow-up diagnostics retain only an allowlisted outcome and bounded durat
 test('Voice diagnostic is Spanish, Voice-only, and preserves observed follow-up and playback timing', () => {
     const diagnostics = createOperationalDiagnostics({ memoryMode: 'memory2-readonly' });
     diagnostics.recordVoiceOperation({ requestId: 'safe-request-1', stage: 'followup', state: 'success',
-        followupOutcome: 'prefix_accepted', durationMs: 5000 });
+        followupOutcome: 'transcript_accepted_without_prefix', durationMs: 5000 });
     diagnostics.recordVoiceOperation({ requestId: 'safe-request-1', stage: 'transcription', state: 'success', durationMs: 430,
         durations: { transcriptionMs: 430 } });
     diagnostics.recordVoiceOperation({ requestId: 'safe-request-1', stage: 'playback', state: 'success', durationMs: 900,
@@ -99,7 +99,7 @@ test('Voice diagnostic is Spanish, Voice-only, and preserves observed follow-up 
     const snapshot = { ...diagnostics.snapshot(), tools: { registered: ['spotify_play'], available: ['spotify_play'] } };
     const report = formatVoiceStatus(snapshot);
     assert.match(report, /Diagnóstico de Voice/u);
-    assert.match(report, /palabra de activación válida/u);
+    assert.match(report, /Se aceptó una intervención sin palabra de activación/u);
     assert.match(report, /430 ms/u);
     assert.match(report, /audio listo 700 ms/u);
     assert.match(report, /inicio de reproducción 760 ms/u);

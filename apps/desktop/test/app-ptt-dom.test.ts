@@ -389,6 +389,8 @@ describe("App PTT DOM integration", () => {
     })));
     act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "speaking" })));
     expect(bridge.voice.ptt.start).not.toHaveBeenCalled();
+    act(() => speechListeners.forEach((listener) => listener({ requestId: "intermediate-acknowledgement", state: "completed" })));
+    expect(bridge.voice.ptt.start).not.toHaveBeenCalled();
     vi.mocked(bridge.voice.ptt.start).mockImplementation(async ({ requestId }) => ({
       ok: true as const, requestId, sessionId: "session-followup-vad",
     }));

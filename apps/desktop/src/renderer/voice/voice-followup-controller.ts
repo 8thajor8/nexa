@@ -5,9 +5,9 @@ const FOLLOWUP_WINDOW_MS = 5_000;
 const VAD_ASSET_BASE = "nexa-vad://assets/";
 
 export function extractNexaFollowup(text: string): string | null {
-  const match = /^\s*[¿¡"“‘([{]*\s*(?:nexa|mexa|next)\b[\s,.:;!?¡¿—–"”’)}\]\-]*(.+)$/iu.exec(text);
-  const command = match?.[1]?.trim();
-  return command && /[\p{L}\p{N}]/u.test(command) ? command : null;
+  const prefix = /^\s*[¿¡"“‘([{]*\s*(?:nexa|mexa|next)\b[\s,.:;!?¡¿—–"”’)}\]\-]*(.*)$/iu.exec(text);
+  const command = (prefix ? prefix[1] : text).trim();
+  return /\p{L}{2,}/u.test(command) ? command : null;
 }
 
 interface VadPort {
@@ -270,8 +270,9 @@ export class VoiceFollowupController {
       const generation = this.generation;
       const command = extractNexaFollowup(envelope.event.text);
       if (!envelope.event.text.trim()) this.diagnose(envelope.requestId, "transcript_empty");
-      else if (!command) this.diagnose(envelope.requestId, "prefix_rejected");
-      else this.diagnose(envelope.requestId, "prefix_accepted");
+      else if (!command) this.diagnose(envelope.requestId, "transcript_unusable");
+      else this.diagnose(envelope.requestId,
+        command === envelope.event.text.trim() ? "transcript_accepted_without_prefix" : "transcript_accepted_prefix_removed");
       const transcript = command && envelope.turnId ? {
         text: command, sessionId: envelope.sessionId, requestId: envelope.requestId, turnId: envelope.turnId,
       } : null;

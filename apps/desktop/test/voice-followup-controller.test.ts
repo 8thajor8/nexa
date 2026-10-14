@@ -42,19 +42,23 @@ function harness(transcript = "Nexa, seguí contando") {
 afterEach(() => { vi.useRealTimers(); });
 
 describe("bounded Voice follow-up", () => {
-  it("accepts the approved initial wake-word variants and strips punctuation", () => {
+  it("accepts useful speech without a wake word and strips optional wake words", () => {
+    expect(extractNexaFollowup("¿Y mañana?")).toBe("¿Y mañana?");
     expect(extractNexaFollowup("Nexa, ¿qué hora es?")).toBe("qué hora es?");
     expect(extractNexaFollowup("  nexA: seguí")).toBe("seguí");
     expect(extractNexaFollowup("¡Mexa! Abrí Spotify")).toBe("Abrí Spotify");
     expect(extractNexaFollowup("‘NEXT’ reproducí música")).toBe("reproducí música");
     expect(extractNexaFollowup("¿nExT, cuánto falta?")).toBe("cuánto falta?");
     expect(extractNexaFollowup("Nexa, ...")).toBeNull();
-    expect(extractNexaFollowup("Hola Nexa, seguí")).toBeNull();
-    expect(extractNexaFollowup("Nexabyte, seguí")).toBeNull();
-    expect(extractNexaFollowup("Mexican food, por favor")).toBeNull();
-    expect(extractNexaFollowup("Nextdoor, llamá a casa")).toBeNull();
-    expect(extractNexaFollowup("Nexx, seguí")).toBeNull();
+    expect(extractNexaFollowup("Hola Nexa, seguí")).toBe("Hola Nexa, seguí");
+    expect(extractNexaFollowup("Nexabyte, seguí")).toBe("Nexabyte, seguí");
+    expect(extractNexaFollowup("Mexican food, por favor")).toBe("Mexican food, por favor");
+    expect(extractNexaFollowup("Nextdoor, llamá a casa")).toBe("Nextdoor, llamá a casa");
+    expect(extractNexaFollowup("Nexx, seguí")).toBe("Nexx, seguí");
     expect(extractNexaFollowup("Nexa")).toBeNull();
+    expect(extractNexaFollowup("")).toBeNull();
+    expect(extractNexaFollowup("¿! ...")).toBeNull();
+    expect(extractNexaFollowup("123")).toBeNull();
   });
 
   it("records bounded follow-up outcomes without retaining transcript content", async () => {
@@ -66,7 +70,7 @@ describe("bounded Voice follow-up", () => {
     await vi.waitFor(() => expect(h.accepted).toHaveBeenCalledOnce());
     const outcomes = h.diagnostics.mock.calls.map(([event]) => event.outcome);
     expect(outcomes).toEqual(expect.arrayContaining(["window_opened", "vad_speech_detected", "transcription_submitted",
-      "prefix_accepted", "chat_submission_requested"]));
+      "transcript_accepted_prefix_removed", "chat_submission_requested"]));
     expect(JSON.stringify(h.diagnostics.mock.calls)).not.toContain("información privada de prueba");
     await h.controller.stop();
   });
@@ -79,20 +83,28 @@ describe("bounded Voice follow-up", () => {
       h.emit(`${wakeWord}, ${command}`);
       await vi.waitFor(() => expect(h.accepted).toHaveBeenCalledOnce());
       expect(h.accepted.mock.calls[0][0].text).toBe(command);
-      expect(h.diagnostics.mock.calls.map(([event]) => event.outcome)).toContain("prefix_accepted");
+      expect(h.diagnostics.mock.calls.map(([event]) => event.outcome)).toContain("transcript_accepted_prefix_removed");
       await h.controller.stop();
     }
   });
 
-  it("distinguishes a rejected similar word from an empty transcript", async () => {
+  it("distinguishes empty and unusable transcripts from useful unprefixed speech", async () => {
+    for (const [text, outcome] of [["", "transcript_empty"], ["¿! ...", "transcript_unusable"], ["123", "transcript_unusable"]]) {
+      const h = harness();
+      await h.controller.open();
+      await h.speak();
+      h.emit(text);
+      await vi.waitFor(() => expect(h.controller.getSnapshot()).toBe("idle"));
+      expect(h.diagnostics.mock.calls.map(([event]) => event.outcome)).toContain(outcome);
+      expect(h.accepted).not.toHaveBeenCalled();
+    }
     const h = harness();
     await h.controller.open();
     await h.speak();
-    h.emit("Mexican food, seguí contando");
-    await vi.waitFor(() => expect(h.controller.getSnapshot()).toBe("idle"));
-    expect(h.diagnostics.mock.calls.map(([event]) => event.outcome)).toContain("prefix_rejected");
-    expect(h.diagnostics.mock.calls.map(([event]) => event.outcome)).not.toContain("transcript_empty");
-    expect(h.accepted).not.toHaveBeenCalled();
+    h.emit("¿Y mañana?");
+    await vi.waitFor(() => expect(h.accepted).toHaveBeenCalledOnce());
+    expect(h.accepted.mock.calls[0][0].text).toBe("¿Y mañana?");
+    expect(h.diagnostics.mock.calls.map(([event]) => event.outcome)).toContain("transcript_accepted_without_prefix");
   });
 
   it("records a bounded expiry when VAD detects no speech", async () => {
@@ -114,6 +126,24 @@ describe("bounded Voice follow-up", () => {
     expect(h.vad.destroy).toHaveBeenCalledOnce();
     expect(h.voice.ptt.cancel).toHaveBeenCalledOnce();
     expect(h.voice.ptt.finish).not.toHaveBeenCalled();
+    h.callbacks?.onSpeechRealStart();
+    h.callbacks?.onSpeechEnd(new Float32Array(16_000));
+    expect(h.voice.ptt.finish).not.toHaveBeenCalled();
+  });
+
+  it("allows another intervention only after the next completed voice response opens a new window", async () => {
+    const h = harness();
+    await h.controller.open();
+    await h.speak();
+    h.emit("¿Y mañana?");
+    await vi.waitFor(() => expect(h.accepted).toHaveBeenCalledOnce());
+    h.emit("seguí");
+    expect(h.accepted).toHaveBeenCalledOnce();
+    await h.controller.open();
+    await h.speak();
+    h.emit("Nexa, seguí contando");
+    await vi.waitFor(() => expect(h.accepted).toHaveBeenCalledTimes(2));
+    expect(h.accepted.mock.calls.map(([value]) => value.text)).toEqual(["¿Y mañana?", "seguí contando"]);
   });
 
   it("does not extend the five-second window after a VAD noise misfire", async () => {
@@ -146,14 +176,14 @@ describe("bounded Voice follow-up", () => {
       requestId: expect.any(String), turnId: "turn-1" });
   });
 
-  it("drops ambient speech, duplicate events and late events after Stop", async () => {
+  it("accepts speech without a name once, then drops duplicate and late events", async () => {
     const h = harness();
     await h.controller.open();
     await h.speak();
     h.emit("Estamos hablando de otra cosa");
-    await vi.waitFor(() => expect(h.controller.getSnapshot()).toBe("idle"));
+    await vi.waitFor(() => expect(h.accepted).toHaveBeenCalledOnce());
     h.emit("Nexa, escuchá");
-    expect(h.accepted).not.toHaveBeenCalled();
+    expect(h.accepted).toHaveBeenCalledOnce();
     expect(h.voice.ptt.cancel).toHaveBeenCalledOnce();
   });
 

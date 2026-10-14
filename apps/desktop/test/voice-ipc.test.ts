@@ -160,15 +160,15 @@ describe("Electron Main Voice IPC", () => {
       (event) => diagnostics.push(event as unknown as Record<string, unknown>));
     const requestId = "00000000-0000-4000-8000-000000000058";
     expect(invoke(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL, trustedEvent(window), {
-      requestId, outcome: "prefix_rejected", durationMs: 123,
+      requestId, outcome: "transcript_accepted_without_prefix", durationMs: 123,
     })).toBe(true);
     expect(diagnostics[0]).toMatchObject({ requestId, stage: "followup", state: "success", durationMs: 123,
-      metrics: { followupOutcome: "prefix_rejected" } });
+      metrics: { followupOutcome: "transcript_accepted_without_prefix" } });
     expect(() => invoke(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL, { sender: {}, senderFrame: { url: RENDERER_URL + "/" } }, {
-      requestId, outcome: "prefix_accepted",
+      requestId, outcome: "transcript_accepted_prefix_removed",
     })).toThrow("untrusted_voice_ipc_sender");
     expect(() => invoke(VOICE_FOLLOWUP_DIAGNOSTIC_CHANNEL, trustedEvent(window), {
-      requestId, outcome: "prefix_accepted", transcript: "must not be accepted",
+      requestId, outcome: "transcript_accepted_prefix_removed", transcript: "must not be accepted",
     })).toThrow("invalid_voice_followup_diagnostic_request");
   });
 

@@ -12,7 +12,8 @@ const SAFE_VOICE_ERRORS = new Set(['VOICE_PTT_INVALID_AUDIO', 'VOICE_PTT_UNSUPPO
     'voice_speech_degraded', 'voice_speech_too_long',
 ]);
 const SAFE_FOLLOWUP_OUTCOMES = new Set(['window_opened', 'vad_speech_detected', 'vad_misfire', 'window_expired_no_speech',
-    'window_expired_after_speech', 'transcription_submitted', 'transcript_empty', 'prefix_rejected', 'prefix_accepted',
+    'window_expired_after_speech', 'transcription_submitted', 'transcript_empty', 'transcript_unusable',
+    'transcript_accepted_without_prefix', 'transcript_accepted_prefix_removed', 'prefix_rejected', 'prefix_accepted',
     'chat_submission_requested', 'transcription_error', 'cancelled']);
 const SAFE_MEMORY_ERRORS = new Set([
     'memory_store_missing', 'memory_store_invalid', 'memory_schema_unsupported', 'memory_store_changed',
@@ -367,6 +368,9 @@ export function formatVoiceStatus(snapshot) {
         window_expired_after_speech: 'La ventana terminó después de detectar voz.',
         transcription_submitted: 'El audio se envió a transcripción.',
         transcript_empty: 'La transcripción llegó vacía.',
+        transcript_unusable: 'La transcripción no contenía palabras útiles.',
+        transcript_accepted_without_prefix: 'Se aceptó una intervención sin palabra de activación.',
+        transcript_accepted_prefix_removed: 'Se aceptó una intervención y se quitó la palabra de activación.',
         prefix_rejected: 'La frase no comenzó con una palabra de activación reconocida.',
         prefix_accepted: 'Se reconoció una palabra de activación válida.',
         chat_submission_requested: 'La solicitud reconocida se envió al chat.',
@@ -396,7 +400,7 @@ export function formatVoiceStatus(snapshot) {
         `- **Estado:** ${last ? `última operación ${stateNames[last.state] ?? 'registrada'}` : 'sin operaciones recientes registradas'}.`,
         `- **Última etapa:** ${last ? stageNames[last.stage] ?? 'etapa registrada' : 'sin datos recientes'}.`,
         `- **VAD:** ${latestVad ? outcomeNames[latestVad.followupOutcome] ?? 'actividad registrada' : 'sin resultado reciente registrado'}`,
-        `- **Prefijo y seguimiento:** ${latestFollowup ? outcomeNames[latestFollowup.followupOutcome] ?? 'estado de seguimiento registrado' : 'sin actividad reciente de seguimiento'}`,
+        `- **Seguimiento:** ${latestFollowup ? outcomeNames[latestFollowup.followupOutcome] ?? 'estado de seguimiento registrado' : 'sin actividad reciente de seguimiento'}`,
         `- **Última transcripción:** ${latestTranscription ? duration(latestTranscription.durations?.transcriptionMs ?? latestTranscription.durationMs) : 'sin transcripción reciente'}.`,
         `- **Síntesis:** ${voice.configuration?.model && voice.configuration.model !== 'unknown' ? 'configurada; el proveedor no se comprueba en este informe' : 'configuración sin comprobar'}.`,
         `- **Identidad vocal:** ${profile}; procesamiento ${voice.configuration?.identityProcessing === true ? 'activo' : voice.configuration?.identityProcessing === false ? 'desactivado' : 'sin comprobar'}.`,

@@ -316,7 +316,8 @@ export interface VoiceSpeechApi {
 }
 export type VoiceFollowupDiagnosticOutcome = "window_opened" | "vad_speech_detected" | "vad_misfire"
   | "window_expired_no_speech" | "window_expired_after_speech" | "transcription_submitted"
-  | "transcript_empty" | "prefix_rejected" | "prefix_accepted" | "chat_submission_requested"
+  | "transcript_empty" | "transcript_unusable" | "transcript_accepted_without_prefix"
+  | "transcript_accepted_prefix_removed" | "prefix_rejected" | "prefix_accepted" | "chat_submission_requested"
   | "transcription_error" | "cancelled";
 export interface VoiceFollowupDiagnosticRequest {
   requestId: string;
