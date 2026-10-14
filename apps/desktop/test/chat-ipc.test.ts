@@ -115,6 +115,28 @@ describe("Main chat IPC to Conversation Runtime", () => {
     expect(onVoiceResponse).toHaveBeenCalledWith(h.window, id("52"), "respuesta voice");
   });
 
+  it("does not dispatch speech for intermediate tool or Spotify events before the final voice result", async () => {
+    const result = deferred<RuntimeMessageResult>();
+    const { runtime, listeners } = fakeRuntime(result.promise);
+    const onVoiceResponse = vi.fn();
+    const h = harness(runtime, undefined, { onVoiceResponse });
+    const created = h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL) as { ok: true; conversationId: string };
+    const requestId = id("53");
+    const ack = await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, conversationId: created.conversationId,
+      requestId, source: "voice" }) as { ok: boolean };
+    expect(ack.ok).toBe(true);
+    const [runtimeListener] = [...listeners];
+    runtimeListener?.({ conversationId: created.conversationId, requestId, status: "processing" });
+    runtimeListener?.({ conversationId: created.conversationId, requestId, status: "spotify_now_playing",
+      card: { name: "track", artists: [], imageUrl: null, spotifyUrl: null, playing: true } } as never);
+    expect(onVoiceResponse).not.toHaveBeenCalled();
+    expect(h.contents.send.mock.calls.some((call) => (call[1] as ChatEventEnvelope).status === "spotify_now_playing")).toBe(true);
+
+    result.resolve({ conversationId: created.conversationId, requestId, status: "completed", text: "La canción está sonando." });
+    await vi.waitFor(() => expect(onVoiceResponse).toHaveBeenCalledOnce());
+    expect(onVoiceResponse).toHaveBeenCalledWith(h.window, requestId, "La canción está sonando.");
+  });
+
   it("diagnoses the effective chat Runtime and its preceding Memory2 retrieval without another model call", async () => {
     let modelCalls = 0;
     let readCalls = 0;
