@@ -408,7 +408,6 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
           if (typeof event.turnId !== "string") return;
           const acknowledgementCancelled = owner.acknowledgementEnd?.requestId === event.turnId;
           const responseStillActive = owner.activeRequestId === event.turnId
-            && owner.activeKind === "response_preparing"
             && pendingResponsePreparations.get(window)?.has(event.turnId) === true;
           if (owner.acknowledgementEnd?.requestId === event.turnId) {
             owner.acknowledgementEnd.resolve();
@@ -427,7 +426,6 @@ async function getSpeechOwner(window: VoiceIpcWindow, loadVoiceApi: LoadPublicVo
           if (typeof event.turnId !== "string") return;
           const acknowledgementFailed = owner.acknowledgementEnd?.requestId === event.turnId;
           const responseStillActive = owner.activeRequestId === event.turnId
-            && owner.activeKind === "response_preparing"
             && pendingResponsePreparations.get(window)?.has(event.turnId) === true;
           if (owner.acknowledgementEnd?.requestId === event.turnId) {
             owner.acknowledgementEnd.resolve();
@@ -470,7 +468,9 @@ export function cancelVoiceSpeech(window: VoiceIpcWindow | null, reason: "user" 
   const pendingController = pendingRequestId ? pending?.get(pendingRequestId) : undefined;
   if (reason === "user" && targetRequestId && isVoiceId(targetRequestId)) {
     if (owner && owner.activeRequestId !== targetRequestId && !pendingController) {
-      return owner.stoppedRequestIds.has(targetRequestId);
+      owner.stoppedRequestIds.add(targetRequestId);
+      if (owner.stoppedRequestIds.size > 64) owner.stoppedRequestIds.delete(owner.stoppedRequestIds.values().next().value!);
+      return false;
     }
     if (!owner && !pendingController) {
       let stopped = stoppedVoiceRequests.get(window);
@@ -710,7 +710,8 @@ let configuredVoiceAcknowledgementLoader: LoadVoiceAcknowledgement | null = null
 let configuredResponseAudioPreparer: PrepareVoiceResponseAudio | null = null;
 let voiceAcknowledgementIndex = 0;
 
-export async function speakVoiceAcknowledgement(window: VoiceIpcWindow | null, requestId: string): Promise<boolean> {
+export async function speakVoiceAcknowledgement(window: VoiceIpcWindow | null, requestId: string,
+  beforePlayback?: () => Promise<void>): Promise<boolean> {
   if (!window || window.isDestroyed() || !isVoiceId(requestId)) return false;
   recordVoice({ requestId, stage: "acknowledgement", state: "requested" });
   if (!configuredVoiceApiLoader || !configuredVoiceAcknowledgementLoader) {
@@ -756,6 +757,9 @@ export async function speakVoiceAcknowledgement(window: VoiceIpcWindow | null, r
     if (!window.isDestroyed()) emitSpeechEvent(window, { requestId, state: "cancelled" });
     return false;
   }
+  await beforePlayback?.().catch(() => undefined);
+  if (owner.activeRequestId !== requestId || owner.activeKind !== "acknowledgement" || !owner.acknowledgementStarting
+    || window.isDestroyed() || owner.stoppedRequestIds.has(requestId)) return false;
   owner.acknowledgementStarting = false;
   recordVoice({ requestId, stage: "acknowledgement", state: "started" });
   try {
@@ -990,7 +994,14 @@ export function registerVoiceIpcHandlers(
     if (!isVoiceSpeechAcknowledgementRequest(payload)) throw new Error("invalid_voice_speech_acknowledgement_request");
     const request = payload as VoiceSpeechAcknowledgementRequest;
     return { ok: true as const, requestId: request.requestId,
-      accepted: await speakVoiceAcknowledgement(window, request.requestId) };
+      accepted: await speakVoiceAcknowledgement(window, request.requestId, async () => {
+        if (duckingRequestByWindow.get(window) === request.requestId) return;
+        const previousRequestId = duckingRequestByWindow.get(window);
+        if (previousRequestId && transferVoiceDucking(window, request.requestId)) return;
+        if (previousRequestId) releaseVoiceDucking(window, previousRequestId, "superseded");
+        duckingRequestByWindow.set(window, request.requestId);
+        await configuredAudioDucking?.begin(request.requestId).catch(() => undefined);
+      }) };
   });
   ipcMain.handle(VOICE_SPEECH_CHAT_PLAY_CHANNEL, async (event: IpcMainInvokeEvent, payload: unknown) => {
     const window = getMainWindow();
@@ -1003,8 +1014,10 @@ export function registerVoiceIpcHandlers(
     if (!pending || pending.requestId !== requestId) return false;
     pendingTypedChatResponse.delete(window);
     activeTypedChatSpeech.set(window, requestId);
-    duckingRequestByWindow.set(window, requestId);
-    await configuredAudioDucking?.begin(requestId).catch(() => undefined);
+    if (duckingRequestByWindow.get(window) !== requestId) {
+      duckingRequestByWindow.set(window, requestId);
+      await configuredAudioDucking?.begin(requestId).catch(() => undefined);
+    }
     if (activeTypedChatSpeech.get(window) !== requestId) return false;
     void speakVoiceResponse(window, requestId, pending.text, "typed");
     return true;

@@ -346,7 +346,7 @@ describe("App PTT DOM integration", () => {
   it("speaks a new typed reply only when enabled, keeps visible text, and opens no follow-up", async () => {
     const view = await mountApp();
     fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
-    expect((screen.getByRole("switch", { name: /Respuestas por voz/ }) as HTMLInputElement).checked).toBe(true);
+    expect(screen.getByRole("switch", { name: /Respuestas por voz/ }).getAttribute("aria-checked")).toBe("true");
     fireEvent.change(screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" }), { target: { value: "Hola" } });
     fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
     await waitFor(() => expect(bridge.chat.sendMessage).toHaveBeenCalledOnce());
@@ -362,6 +362,157 @@ describe("App PTT DOM integration", () => {
     expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledOnce();
     view.rerender(createElement(App, { voiceController: controller as unknown as PttVoiceController, microphoneDevices }));
     expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledOnce();
+  });
+
+  it("waits two seconds before one local acknowledgement for a slow typed reply", async () => {
+    vi.useFakeTimers();
+    try {
+      await mountApp();
+      fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
+      fireEvent.change(screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" }), { target: { value: "Consulta lenta" } });
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
+      await act(async () => { await Promise.resolve(); });
+      const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+      await act(async () => { await vi.advanceTimersByTimeAsync(1_999); });
+      expect(bridge.voice.speech.acknowledge).not.toHaveBeenCalled();
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(bridge.voice.speech.acknowledge).toHaveBeenCalledOnce();
+      expect(bridge.voice.speech.acknowledge).toHaveBeenCalledWith({ requestId: request.requestId });
+      expect(bridge.voice.ptt.start).not.toHaveBeenCalled();
+
+      act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "preparing" })));
+      act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "speaking" })));
+      act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+        requestId: request.requestId, status: "completed", response: "Respuesta final" })));
+      expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledWith(request.requestId);
+      expect(bridge.voice.speech.acknowledge).toHaveBeenCalledOnce();
+      expect(bridge.voice.ptt.start).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("skips the typed acknowledgement for a fast reply", async () => {
+    vi.useFakeTimers();
+    try {
+      await mountApp();
+      fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
+      fireEvent.change(screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" }), { target: { value: "Consulta rápida" } });
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
+      await act(async () => { await Promise.resolve(); });
+      const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+      act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+        requestId: request.requestId, status: "completed", response: "Respuesta rápida" })));
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+      expect(bridge.voice.speech.acknowledge).not.toHaveBeenCalled();
+      expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("Stop during a typed acknowledgement prevents both late acknowledgement and final voice", async () => {
+    vi.useFakeTimers();
+    try {
+      await mountApp();
+      fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
+      fireEvent.change(screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" }), { target: { value: "Consulta cancelada" } });
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
+      await act(async () => { await Promise.resolve(); });
+      const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+      expect(bridge.voice.speech.acknowledge).toHaveBeenCalledWith({ requestId: request.requestId });
+      act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "preparing" })));
+      act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "speaking" })));
+      fireEvent.click(screen.getByRole("button", { name: "Detener interacción" }));
+      act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "cancelled" })));
+      expect(bridge.voice.speech.cancel).toHaveBeenCalledWith({ requestId: request.requestId });
+      expect(bridge.voice.speech.acknowledge).toHaveBeenCalledOnce();
+      act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+        requestId: request.requestId, status: "completed", response: "Texto conservado" })));
+      expect(bridge.voice.speech.playChatResponse).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("disabling voice replies cancels a pending typed acknowledgement without affecting chat", async () => {
+    vi.useFakeTimers();
+    try {
+      await mountApp();
+      fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
+      fireEvent.change(screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" }), { target: { value: "Consulta escrita" } });
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
+      await act(async () => { await Promise.resolve(); });
+      const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+      fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+      expect(bridge.voice.speech.acknowledge).not.toHaveBeenCalled();
+      act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+        requestId: request.requestId, status: "completed", response: "Texto intacto" })));
+      expect(bridge.voice.speech.playChatResponse).not.toHaveBeenCalled();
+      expect(bridge.chat.cancelRequest).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("disabling voice replies interrupts a typed acknowledgement without cancelling Runtime", async () => {
+    vi.useFakeTimers();
+    try {
+      await mountApp();
+      fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
+      fireEvent.change(screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" }), { target: { value: "Consulta en curso" } });
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
+      await act(async () => { await Promise.resolve(); });
+      const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+      act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "preparing" })));
+      act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "speaking" })));
+      fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
+      expect(bridge.voice.speech.cancel).toHaveBeenCalledWith({ requestId: request.requestId });
+      expect(bridge.chat.cancelRequest).not.toHaveBeenCalled();
+      act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "cancelled" })));
+      act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+        requestId: request.requestId, status: "completed", response: "Respuesta escrita conservada" })));
+      expect(bridge.voice.speech.playChatResponse).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("keeps a slow typed request eligible for its final reply after acknowledgement audio fails", async () => {
+    vi.useFakeTimers();
+    try {
+      await mountApp();
+      fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
+      fireEvent.change(screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" }), { target: { value: "Consulta larga" } });
+      fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
+      await act(async () => { await Promise.resolve(); });
+      const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+      act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId, state: "preparing" })));
+      act(() => speechListeners.forEach((listener) => listener({ requestId: request.requestId,
+        state: "error", error: { code: "voice_audio_processing_failed" } })));
+      expect(bridge.voice.endDucking).toHaveBeenCalledWith(request.requestId, "error");
+      act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+        requestId: request.requestId, status: "completed", response: "Respuesta principal" })));
+      expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledWith(request.requestId);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("invalidates previous typed audio when a new chat query is sent", async () => {
+    await mountApp();
+    fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
+    const composer = screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" });
+    fireEvent.change(composer, { target: { value: "Primera consulta" } });
+    fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
+    await waitFor(() => expect(bridge.chat.sendMessage).toHaveBeenCalledOnce());
+    const first = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+    act(() => chatListeners.forEach((listener) => listener({ conversationId: first.conversationId,
+      requestId: first.requestId, status: "completed", response: "Primera respuesta" })));
+    expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledWith(first.requestId);
+
+    fireEvent.change(composer, { target: { value: "Segunda consulta" } });
+    fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
+    await waitFor(() => expect(bridge.chat.sendMessage).toHaveBeenCalledTimes(2));
+    expect(bridge.voice.speech.cancel).toHaveBeenCalledWith({ requestId: first.requestId });
+    expect(bridge.voice.endDucking).toHaveBeenCalledWith(first.requestId, "stop");
+    const second = vi.mocked(bridge.chat.sendMessage).mock.calls[1][0];
+    act(() => chatListeners.forEach((listener) => listener({ conversationId: second.conversationId,
+      requestId: second.requestId, status: "completed", response: "Segunda respuesta" })));
+    expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledTimes(2);
+    expect(bridge.voice.speech.playChatResponse).toHaveBeenLastCalledWith(second.requestId);
   });
 
   it("stops an active typed reply when the switch is turned off without cancelling chat", async () => {

@@ -538,6 +538,57 @@ describe("Electron Main Voice IPC", () => {
     expect(speaker.speak).toHaveBeenCalledOnce();
   });
 
+  it("does not expose an intermediate acknowledgement error as a failed final reply", async () => {
+    const window = createWindow("ack-error-during-final-preparation");
+    const listeners = new Map<string, (event: Record<string, unknown>) => void>();
+    let idFactory = () => "";
+    let playbackState = "idle";
+    let acknowledgementTurnId = "";
+    let finishAcknowledgement!: (value: null) => void;
+    let finishPreparation!: (value: { audio: Uint8Array }) => void;
+    let finalPlaybackSawIdle = false;
+    const speaker = {
+      getPlaybackState: () => playbackState,
+      speakPrepared: vi.fn(() => {
+        const turnId = idFactory();
+        if (!acknowledgementTurnId) {
+          acknowledgementTurnId = turnId;
+          playbackState = "playing";
+          return new Promise<null>((resolve) => { finishAcknowledgement = resolve; });
+        }
+        finalPlaybackSawIdle = playbackState === "idle";
+        listeners.get("voice.speech.completed")?.({ turnId });
+        return Promise.resolve({ completed: true as const });
+      }),
+      cancel: vi.fn(() => { playbackState = "idle"; finishAcknowledgement?.(null); return true; }),
+      on: vi.fn((type: string, listener: (event: Record<string, unknown>) => void) => {
+        listeners.set(type, listener); return () => listeners.delete(type);
+      }),
+    };
+    const api = { createVoiceSpeaker: vi.fn((options: { idFactory: () => string }) => { idFactory = options.idFactory; return speaker; }) };
+    registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never,
+      undefined, async () => makeAudio(), () => new Promise((resolve) => { finishPreparation = resolve; }));
+    const requestId = "00000000-0000-4000-8000-000000000084";
+    await expect(invoke(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL, trustedEvent(window), { requestId }))
+      .resolves.toMatchObject({ accepted: true });
+    await vi.waitFor(() => expect(speaker.speakPrepared).toHaveBeenCalledOnce());
+    const finalResponse = speakVoiceResponse(window as never, requestId, "Respuesta final");
+    await vi.waitFor(() => expect(finishPreparation).toBeTypeOf("function"));
+
+    playbackState = "idle";
+    listeners.get("voice.speech.error")?.({ turnId: acknowledgementTurnId,
+      error: { code: "voice_speech_playback_failed" } });
+    finishAcknowledgement(null);
+    finishPreparation({ audio: makeAudio() });
+    await finalResponse;
+
+    expect(finalPlaybackSawIdle).toBe(true);
+    expect(speaker.speakPrepared).toHaveBeenCalledTimes(2);
+    expect(window.webContents.send).not.toHaveBeenCalledWith(VOICE_SPEECH_EVENT_CHANNEL,
+      { requestId, state: "error", error: { code: "voice_speech_playback_failed" } });
+    expect(window.webContents.send).toHaveBeenCalledWith(VOICE_SPEECH_EVENT_CHANNEL, { requestId, state: "completed" });
+  });
+
   it("waits for the acknowledgement playback release event before starting the final response", async () => {
     const window = createWindow("ack-release-barrier");
     const listeners = new Map<string, (event: Record<string, unknown>) => void>();
@@ -576,8 +627,10 @@ describe("Electron Main Voice IPC", () => {
       }),
     };
     const api = { createVoiceSpeaker: vi.fn((options: { idFactory: () => string }) => { idFactory = options.idFactory; return speaker; }) };
+    const audioDucking = { begin: vi.fn(async () => undefined), transfer: vi.fn(), end: vi.fn(async () => undefined),
+      endExcept: vi.fn(async () => undefined), close: vi.fn(async () => undefined) };
     registerVoiceIpcHandlers(() => window as never, RENDERER_URL, async () => api as never,
-      undefined, async () => makeAudio(), async () => ({ audio: makeAudio() }));
+      undefined, async () => makeAudio(), async () => ({ audio: makeAudio() }), audioDucking);
     const requestId = "00000000-0000-4000-8000-000000000083";
     await expect(invoke(VOICE_SPEECH_ACKNOWLEDGEMENT_CHANNEL, trustedEvent(window), { requestId }))
       .resolves.toMatchObject({ accepted: true });
@@ -589,6 +642,8 @@ describe("Electron Main Voice IPC", () => {
     expect(window.webContents.send).not.toHaveBeenCalledWith(VOICE_SPEECH_EVENT_CHANNEL,
       { requestId, state: "error", error: { code: "voice_speech_busy" } });
     expect(window.webContents.send).toHaveBeenCalledWith(VOICE_SPEECH_EVENT_CHANNEL, { requestId, state: "completed" });
+    expect(audioDucking.begin).toHaveBeenCalledOnce();
+    expect(audioDucking.begin).toHaveBeenCalledWith(requestId);
   });
 
   it.each(["quick time-tool result", "quick Spotify action"])(
