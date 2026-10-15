@@ -24,6 +24,14 @@ export function createMemory2ReadOnly({ repository, matchSpecificSelfQueries = f
 
     const facade = Object.create(null);
     Object.defineProperties(facade, {
+        searchContext: {
+            enumerable: true,
+            value: async function searchContext(options = {}) {
+                if (closed) throw safeError('memory_facade_closed');
+                try { return await contextProvider.search(options); }
+                catch { throw safeError('memory_read_failed'); }
+            },
+        },
         readContext: {
             enumerable: true,
             value: async function readContext(options = {}) {

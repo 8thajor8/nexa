@@ -143,6 +143,14 @@ export async function openExistingMemory2Reader({ storePath } = {}) {
         const facade = createMemory2ReadOnly({ repository, matchSpecificSelfQueries: true });
         const result = Object.create(null);
         Object.defineProperties(result, {
+            searchContext: { enumerable: true, value: options => {
+                if (state === 'closed') return Promise.reject(publicError('memory_reader_closed'));
+                if (state === 'changed') return Promise.reject(publicError('memory_store_changed'));
+                return facade.searchContext(options).catch(error => {
+                    if (state === 'changed') throw publicError('memory_store_changed');
+                    throw error;
+                });
+            } },
             readContext: { enumerable: true, value: options => {
                 if (state === 'closed') return Promise.reject(publicError('memory_reader_closed'));
                 if (state === 'changed') return Promise.reject(publicError('memory_store_changed'));

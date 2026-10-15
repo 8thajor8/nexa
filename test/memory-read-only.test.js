@@ -74,11 +74,11 @@ test('empty context preserves metadata and returns an empty items array', async 
     assert.deepEqual(result, { revision: 0, digest: 'a'.repeat(64), generation: 0, items: [] });
 });
 
-test('public facade exposes only readContext and close, without repository or mutation methods', () => {
+test('public facade exposes only bounded reads and close, without repository or mutation methods', () => {
     const { repository } = injectedRepository(fixtureStore());
     const facade = createMemory2ReadOnly({ repository });
-    assert.deepEqual(Object.keys(facade).sort(), ['close', 'readContext']);
-    assert.deepEqual(Object.getOwnPropertyNames(facade).sort(), ['close', 'readContext']);
+    assert.deepEqual(Object.keys(facade).sort(), ['close', 'readContext', 'searchContext']);
+    assert.deepEqual(Object.getOwnPropertyNames(facade).sort(), ['close', 'readContext', 'searchContext']);
     assert.equal(Object.getPrototypeOf(facade), null);
     for (const name of ['repository', 'commit', 'remember', 'forget', 'initialize', 'service', 'invalidate']) {
         assert.equal(name in facade, false);

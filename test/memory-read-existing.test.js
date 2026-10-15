@@ -46,7 +46,7 @@ test('opens an existing v5 store and returns the context-provider structure with
     const bytes = Buffer.from(JSON.stringify(store(), null, 2) + '\n');
     await withFixture(bytes, async ({ directory, storePath }) => {
         const reader = await openExistingMemory2Reader({ storePath });
-        assert.deepEqual(Object.getOwnPropertyNames(reader).sort(), ['close', 'readContext']);
+        assert.deepEqual(Object.getOwnPropertyNames(reader).sort(), ['close', 'readContext', 'searchContext']);
         assert.equal(Object.getPrototypeOf(reader), null);
         const result = await reader.readContext({ message: 'What do I remember?' });
         assert.deepEqual(Object.keys(result), ['revision', 'digest', 'generation', 'items']);
@@ -55,6 +55,8 @@ test('opens an existing v5 store and returns the context-provider structure with
         assert.equal(result.generation, 0);
         assert.equal(result.items[0].type, 'function_call');
         assert.equal(JSON.parse(result.items[1].output).assertions[0].object.value, 'Synthetic reader fixture.');
+        assert.equal((await reader.searchContext({ query: 'Synthetic' })).assertions[0].object.value,
+            'Synthetic reader fixture.');
         assert.deepEqual(await readdir(directory), ['memory-v2.json']);
         assert.deepEqual(await readFile(storePath), bytes);
         await reader.close();

@@ -172,6 +172,49 @@ export function createMemoryContextProvider({ repository, maxRecords = 20, maxAs
     let generation = 0, lastDigest = null;
     return Object.freeze({
         invalidate() { generation++; },
+        async search({ query, includeHistorical = false } = {}) {
+            if (typeof query !== 'string' || !query.isWellFormed() || query.trim().length < 2
+                || query.length > 160 || /[\p{Cc}\p{Cf}]/u.test(query.replace(/\s/gu, ''))
+                || !hasMemoryRelevanceTerms(query) || typeof includeHistorical !== 'boolean') {
+                return { status: 'invalid_query', authority: 'data_only', assertions: [] };
+            }
+            const current = await repository.readSnapshot();
+            const retriever = createMemoryRetriever({ readSnapshot: async () => current, now });
+            const scope = { includeSelf: true, entityIds: [], predicates: null, relationPredicates: [],
+                relevanceText: query, limits: { maxSeedEntities: 1, maxRelationDepth: 0,
+                    maxNeighborsPerEntity: 0, maxRelations: 0, maxAssertions: 20, maxPerEntityPredicate: 3 } };
+            const selected = includeHistorical ? await retriever.history(scope) : await retriever.currentKnowledge(scope);
+            const candidates = [...selected.assertions, ...(selected.indeterminateAssertions ?? [])]
+                .filter(item => !isEntityName(item.record.predicate)
+                    && scoreMemoryRecordRelevance(item.record, query) > 0)
+                .sort((a, b) => scoreMemoryRecordRelevance(b.record, query)
+                    - scoreMemoryRecordRelevance(a.record, query)
+                    || compareText(a.record.id, b.record.id));
+            const payload = { status: candidates.length ? 'found' : 'empty', authority: 'data_only',
+                scope: 'authorized_owner_memory2', temporal: includeHistorical ? 'history' : 'current',
+                assertions: [], conflicts: [], truncated: Boolean(selected.metadata.truncated.assertions) };
+            const activeBySlot = new Map();
+            for (const item of candidates) {
+                if (item.record.status !== 'active') continue;
+                const slot = item.record.predicate;
+                activeBySlot.set(slot, [...(activeBySlot.get(slot) ?? []), item.record.object.value]);
+            }
+            payload.conflicts = [...activeBySlot].filter(([, values]) => new Set(values).size > 1)
+                .map(([predicate]) => predicate);
+            for (const item of candidates) {
+                if (payload.assertions.length >= 6) { payload.truncated = true; break; }
+                const compact = compactAssertion({ ...item,
+                    temporalStatus: item.temporalStatus ?? (item.record.status === 'superseded' ? 'historical' : 'unverified') },
+                'query_term_overlap');
+                const next = { ...payload, assertions: [...payload.assertions, compact] };
+                if (JSON.stringify(next).length > 5900) { payload.truncated = true; continue; }
+                payload.assertions.push(compact);
+            }
+            if (candidates.length && !payload.assertions.length) payload.status = 'insufficient';
+            if (payload.conflicts.some(slot => payload.assertions.filter(item => item.predicate === slot).length
+                < (activeBySlot.get(slot)?.length ?? 0))) payload.status = 'insufficient';
+            return payload;
+        },
         async read({ message = '', recentUserMessages = [] } = {}) {
             const current = await repository.readSnapshot();
             const changedSinceLastRead = lastDigest !== null && lastDigest !== current.digest;
