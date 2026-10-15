@@ -6,6 +6,11 @@ import {
 } from "../src/shared/ipc-contract.js";
 import { registerChatIpcHandlers, type ConversationRuntimeApi, type RuntimeMessageEvent, type RuntimeMessageResult } from "../src/main/chat-ipc.js";
 import { createConversationRuntime } from "../../../src/core/conversation-runtime.js";
+// @ts-expect-error Synthetic regression exercises the existing Memory2 initializer.
+import { initializeEmptyMemoryStore } from "../../../src/memory/backend.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { createAgent } from "../../../src/core/agent.js";
 import { executeTool, getToolsForModel } from "../../../src/tools/index.js";
 
@@ -55,12 +60,24 @@ function harness(runtime: ConversationRuntimeApi | null,
 describe("Main chat IPC to Conversation Runtime", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("creates one Main-owned Runtime conversation idempotently per service", () => {
+  it("keeps a provisional conversation in Runtime only until its first message", () => {
     const { runtime } = fakeRuntime();
-    const h = harness(runtime);
+    const store = { createConversation: vi.fn(async (requestedId?: string) => ({ conversationId: requestedId ?? conversationId })),
+      listConversations: vi.fn(async () => ({ conversations: [], nextCursor: null })),
+      getConversation: vi.fn(async () => null), appendMessage: vi.fn(async () => undefined),
+      listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, incompleteTail: false })) };
+    const h = harness(runtime, undefined, undefined, store);
     expect(h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL)).toEqual({ ok: true, conversationId });
     expect(h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL)).toEqual({ ok: true, conversationId });
+    expect(h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL, { newConversation: true })).toEqual({ ok: true, conversationId });
     expect(runtime.createConversation).toHaveBeenCalledOnce();
+    expect(store.createConversation).not.toHaveBeenCalled();
+    h.service.dispose();
+    const { runtime: restartedRuntime } = fakeRuntime();
+    const restarted = harness(restartedRuntime, undefined, undefined, store);
+    expect(restarted.invoke(CHAT_CREATE_CONVERSATION_CHANNEL)).toEqual({ ok: true, conversationId });
+    expect(store.createConversation).not.toHaveBeenCalled();
+    restarted.service.dispose();
   });
 
   it("creates a distinct conversation only for the explicit new-conversation request", () => {
@@ -105,20 +122,55 @@ describe("Main chat IPC to Conversation Runtime", () => {
   });
 
   it("passes voice source through the same Runtime API and preserves correlation", async () => {
-    const { runtime } = fakeRuntime(Promise.resolve({ conversationId, requestId: id("4"), status: "completed", text: "respuesta voz" }));
-    const h = harness(runtime);
+    const calls: string[] = [];
+    const { runtime, listeners } = fakeRuntime();
+    runtime.sendMessage = vi.fn(async (input) => {
+      calls.push("runtime");
+      const result = { conversationId: input.conversationId, requestId: input.requestId, status: "completed" as const, text: "respuesta voz" };
+      for (const listener of listeners) listener(result);
+      return result;
+    });
+    const store = { createConversation: vi.fn(async (requestedId?: string) => { calls.push("create"); return { conversationId: requestedId ?? conversationId }; }),
+      listConversations: vi.fn(async () => ({ conversations: [], nextCursor: null })),
+      getConversation: vi.fn(async () => null), appendMessage: vi.fn(async (_id: string, message: { role: string }) => { calls.push(message.role); }),
+      listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, incompleteTail: false })) };
+    const h = harness(runtime, undefined, undefined, store);
     h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+    expect(store.createConversation).not.toHaveBeenCalled();
     const voiceRequest = { ...request, requestId: id("4"), source: "voice" as const, text: "transcripción" };
     await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, voiceRequest);
-    expect(runtime.sendMessage).toHaveBeenCalledWith(voiceRequest);
     await vi.waitFor(() => expect(h.contents.send).toHaveBeenLastCalledWith(CHAT_EVENT_CHANNEL,
       { conversationId, requestId: voiceRequest.requestId, status: "completed", response: "respuesta voz" }));
+    expect(runtime.sendMessage).toHaveBeenCalledWith(voiceRequest);
+    expect(store.createConversation).toHaveBeenCalledWith(conversationId);
+    expect(calls).toEqual(["create", "user", "runtime", "assistant"]);
+    h.service.dispose();
+  });
+
+  it("creates and persists one provisional conversation for concurrent first sends", async () => {
+    const creation = deferred<{ conversationId: string }>();
+    const store = { createConversation: vi.fn(() => creation.promise),
+      listConversations: vi.fn(async () => ({ conversations: [], nextCursor: null })),
+      getConversation: vi.fn(async () => null), appendMessage: vi.fn(async () => undefined),
+      listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, incompleteTail: false })) };
+    const { runtime } = fakeRuntime();
+    const h = harness(runtime, undefined, undefined, store);
+    await h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+    const first = await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, requestId: id("81") });
+    const second = await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, requestId: id("82") });
+    expect(first).toMatchObject({ ok: true, accepted: true });
+    expect(second).toMatchObject({ ok: false, error: { code: "busy" } });
+    expect(store.createConversation).toHaveBeenCalledOnce();
+    creation.resolve({ conversationId });
+    await vi.waitFor(() => expect(store.appendMessage).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(runtime.sendMessage).toHaveBeenCalledOnce());
+    h.service.dispose();
   });
 
   it("persists typed and PTT visible turns exactly once before exposing completion", async () => {
     const calls: string[] = [];
     const store = {
-      createConversation: vi.fn(async () => ({ conversationId })),
+      createConversation: vi.fn(async (requestedId?: string) => { calls.push(`create:${requestedId}`); return { conversationId: requestedId ?? conversationId }; }),
       listConversations: vi.fn(async () => ({ conversations: [], nextCursor: null })),
       getConversation: vi.fn(async () => ({ conversationId })),
       appendMessage: vi.fn(async (_id: string, message: { role: string; content: string }) => { calls.push(`${message.role}:${message.content}`); }),
@@ -136,14 +188,17 @@ describe("Main chat IPC to Conversation Runtime", () => {
     const h = harness(runtime, undefined, undefined, store);
     const created = await h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL) as { ok: true; conversationId: string };
     expect(created).toEqual({ ok: true, conversationId });
-    expect(store.createConversation).toHaveBeenCalledOnce();
-    expect(runtime.restoreConversation).toHaveBeenCalledWith(conversationId, []);
+    expect(store.createConversation).not.toHaveBeenCalled();
+    expect(runtime.restoreConversation).not.toHaveBeenCalled();
     for (const [requestId, source] of [[id("61"), "typed"], [id("62"), "voice"]] as const) {
       await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, requestId, source });
       await vi.waitFor(() => expect(h.contents.send.mock.calls.some(call => (call[1] as ChatEventEnvelope).requestId === requestId
         && (call[1] as ChatEventEnvelope).status === "completed")).toBe(true));
     }
+    expect(store.createConversation).toHaveBeenCalledOnce();
+    expect(store.createConversation).toHaveBeenCalledWith(conversationId);
     expect(calls).toEqual([
+      `create:${conversationId}`,
       "user:Hola", "runtime:typed", "assistant:respuesta typed",
       "user:Hola", "runtime:voice", "assistant:respuesta voice",
     ]);
@@ -157,7 +212,7 @@ describe("Main chat IPC to Conversation Runtime", () => {
       getConversation: vi.fn(async () => ({ conversationId })),
       appendMessage: vi.fn(async () => { throw new Error("storage failed"); }),
       listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, incompleteTail: false })) };
-    const { runtime } = fakeRuntime();
+    const { runtime, listeners } = fakeRuntime();
     runtime.restoreConversation = vi.fn(() => true);
     const h = harness(runtime, undefined, undefined, store);
     await h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
@@ -229,7 +284,13 @@ describe("Main chat IPC to Conversation Runtime", () => {
       getConversation: vi.fn(async (requestedId: string) => requestedId === conversationId ? { conversationId } : null),
       appendMessage: vi.fn(async () => undefined),
       listMessages: vi.fn(async () => ({ messages: savedMessages, nextCursor: null, incompleteTail: false })) };
-    const { runtime } = fakeRuntime();
+    const { runtime, listeners } = fakeRuntime();
+    runtime.sendMessage = vi.fn(async (input) => {
+      const result = { conversationId: input.conversationId, requestId: input.requestId,
+        status: "completed" as const, text: "Seguimos la conversación" };
+      for (const listener of listeners) listener(result);
+      return result;
+    });
     runtime.restoreConversation = vi.fn(() => true);
     const h = harness(runtime, undefined, undefined, store);
     expect([...h.handlers.keys()]).toEqual(expect.arrayContaining([CHAT_OPEN_CONVERSATION_CHANNEL, CHAT_LIST_MESSAGES_CHANNEL,
@@ -245,6 +306,11 @@ describe("Main chat IPC to Conversation Runtime", () => {
       { role: "assistant", content: "Te recomiendo conservar una copia." },
     ]);
     expect(store.createConversation).not.toHaveBeenCalled();
+    await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, requestId: id("73") });
+    await vi.waitFor(() => expect(h.contents.send).toHaveBeenLastCalledWith(CHAT_EVENT_CHANNEL,
+      { conversationId, requestId: id("73"), status: "completed", response: "Seguimos la conversación" }));
+    expect(runtime.sendMessage).toHaveBeenCalledWith({ ...request, requestId: id("73") });
+    expect(store.createConversation).not.toHaveBeenCalled();
     h.service.dispose();
   });
 
@@ -252,7 +318,7 @@ describe("Main chat IPC to Conversation Runtime", () => {
     const summary = { conversationId, title: "Nueva conversación", createdAt: "2035-01-01T00:00:00.000Z",
       updatedAt: "2035-01-01T00:00:00.000Z", messageCount: 0 };
     const store = { createConversation: vi.fn(async () => ({ conversationId })),
-      listConversations: vi.fn(async () => ({ conversations: [summary], nextCursor: null })),
+      listConversations: vi.fn(async () => ({ conversations: [{ ...summary, version: 1 }], nextCursor: null })),
       getConversation: vi.fn(async () => ({ conversationId })), appendMessage: vi.fn(async () => undefined),
       listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, incompleteTail: false })) };
     const { runtime } = fakeRuntime();
@@ -260,8 +326,27 @@ describe("Main chat IPC to Conversation Runtime", () => {
     const h = harness(runtime, undefined, undefined, store);
     const result = await h.invoke(CHAT_LIST_CONVERSATIONS_CHANNEL, { limit: 25 }) as { ok: boolean; conversations: unknown[] };
     expect(result).toMatchObject({ ok: true, conversations: [summary], nextCursor: null });
+    expect(result.conversations[0]).not.toHaveProperty("version");
     expect(store.listConversations).toHaveBeenCalledWith({ limit: 25 });
     expect(runtime.restoreConversation).not.toHaveBeenCalled();
+    h.service.dispose();
+  });
+
+  it("logs a safe conversation-list failure code without exposing the error message", async () => {
+    const diagnostics: Array<[string, Readonly<Record<string, string | number | boolean | null>>]> = [];
+    const error = Object.assign(new Error("private path must not be logged"), { name: "ConversationStoreError", code: "conversation_store_corrupt" });
+    const store = { createConversation: vi.fn(async () => ({ conversationId })),
+      listConversations: vi.fn(async () => { throw error; }),
+      getConversation: vi.fn(async () => ({ conversationId })), appendMessage: vi.fn(async () => undefined),
+      listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, incompleteTail: false })) };
+    const { runtime } = fakeRuntime();
+    const h = harness(runtime, (event, details) => diagnostics.push([event, details]), undefined, store);
+    const result = await h.invoke(CHAT_LIST_CONVERSATIONS_CHANNEL, { limit: 25 });
+    expect(result).toMatchObject({ ok: false, error: { code: "operation_failed" } });
+    expect(diagnostics).toContainEqual(["conversation_list_failed", {
+      stage: "persistent_read", errorName: "ConversationStoreError", errorCode: "conversation_store_corrupt",
+    }]);
+    expect(JSON.stringify(diagnostics)).not.toContain("private path");
     h.service.dispose();
   });
 
@@ -423,6 +508,89 @@ describe("Main chat IPC to Conversation Runtime", () => {
     }
     expect(received).toEqual([{ text: "primer mensaje", source: "typed" }, { text: "segundo mensaje", source: "voice" }]);
     await runtime.close();
+  });
+
+  it("answers across lazy conversations in writable Memory2 and restores isolated history", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "nexa-conversation-switch-"));
+    const storePath = path.join(root, "memory-v2.json");
+    await initializeEmptyMemoryStore({ storePath });
+    const messages = new Map<string, Array<{ id: string; conversationId: string; sequence: number; version: number;
+      role: "user" | "assistant"; content: string; createdAt: string; status: "complete" }>>();
+    const store = {
+      createConversation: vi.fn(async (requestedId?: string) => {
+        const id = requestedId ?? conversationId;
+        if (messages.has(id)) throw new Error("conversation_id_collision");
+        messages.set(id, []);
+        return { conversationId: id };
+      }),
+      listConversations: vi.fn(async () => ({ conversations: [], nextCursor: null })),
+      getConversation: vi.fn(async (id: string) => messages.has(id) ? { conversationId: id } : null),
+      appendMessage: vi.fn(async (id: string, message: { role: "user" | "assistant"; content: string }) => {
+        const history = messages.get(id);
+        if (!history) throw new Error("conversation_not_found");
+        history.push({ id: globalThis.crypto.randomUUID(), conversationId: id, sequence: history.length + 1,
+          version: 1, ...message, createdAt: new Date().toISOString(), status: "complete" });
+      }),
+      listMessages: vi.fn(async (id: string) => ({ messages: messages.get(id) ?? [], nextCursor: null, incompleteTail: false })),
+    };
+    const modelUserTurns: string[][] = [];
+    const runtime = createConversationRuntime({
+      memoryMode: "memory2-confirmed-write",
+      storePath,
+      agentOptions: {
+        allowConfirmedMemoryWrites: true,
+        ask: async ({ input }: { input: Array<{ role?: string; content?: string }> }) => {
+          const prior = input.filter((entry) => entry.role === "user").map((entry) => entry.content ?? "");
+          modelUserTurns.push(prior);
+          return { status: "completed", output_text: `ok:${prior.at(-1)}`, output: [] };
+        },
+      },
+    }) as unknown as ConversationRuntimeApi;
+    const h = harness(runtime, undefined, undefined, store);
+
+    const complete = async (id: string, text: string, requestId: string) => {
+      const accepted = await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { conversationId: id, requestId, text, source: "typed" }) as { ok: boolean };
+      expect(accepted.ok).toBe(true);
+      await vi.waitFor(() => { expect(h.contents.send.mock.calls.some((call) => {
+        const event = call[1] as ChatEventEnvelope;
+        return event.conversationId === id && event.requestId === requestId && event.status === "completed";
+      })).toBe(true); });
+    };
+
+    try {
+      const a = h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL) as { ok: true; conversationId: string };
+      expect(messages.has(a.conversationId)).toBe(false);
+      await complete(a.conversationId, "A primero", id("801"));
+
+      const b = await h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL, { newConversation: true }) as { ok: true; conversationId: string };
+      expect(b.conversationId).not.toBe(a.conversationId);
+      expect(messages.has(b.conversationId)).toBe(false);
+      await complete(b.conversationId, "B primero", id("802"));
+      await complete(b.conversationId, "B segundo", id("803"));
+
+      const opened = await h.invoke(CHAT_OPEN_CONVERSATION_CHANNEL, { conversationId: a.conversationId }) as { ok: boolean };
+      expect(opened.ok).toBe(true);
+      await complete(a.conversationId, "A continúa", id("804"));
+
+      expect(store.createConversation).toHaveBeenCalledTimes(2);
+      expect(messages.get(a.conversationId)?.map(({ content }) => content)).toEqual([
+        "A primero", "ok:A primero", "A continúa", "ok:A continúa",
+      ]);
+      expect(messages.get(b.conversationId)?.map(({ content }) => content)).toEqual([
+        "B primero", "ok:B primero", "B segundo", "ok:B segundo",
+      ]);
+      expect(modelUserTurns.map((turns) => turns.at(-1))).toEqual([
+        "A primero", "B primero", "B segundo", "A continúa",
+      ]);
+      expect(modelUserTurns[1]).not.toContain("A primero");
+      expect(modelUserTurns[2]).toContain("B primero");
+      expect(modelUserTurns[3]).toContain("A primero");
+      expect(modelUserTurns[3]).not.toContain("B primero");
+    } finally {
+      h.service.dispose();
+      await runtime.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("forwards a correlated authorization requirement without ending the active chat request", async () => {

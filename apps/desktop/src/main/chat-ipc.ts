@@ -21,7 +21,7 @@ export interface ConversationRuntimeApi {
   close(): Promise<void>;
 }
 export interface ConversationStoreApi {
-  createConversation(): Promise<{ conversationId: string }>;
+  createConversation(conversationId?: string): Promise<{ conversationId: string }>;
   listConversations(options?: ChatConversationListRequest): Promise<{
     conversations: Array<{ conversationId: string; title: string; createdAt: string; updatedAt: string; messageCount: number }>;
     nextCursor: { updatedAt: string; conversationId: string } | null;
@@ -104,7 +104,7 @@ export class ChatIpcService {
   private readonly activeByRequest = new Map<string, ActiveRequest>();
   private readonly seenRequestIds = new WeakMap<object, Set<string>>();
   private conversationId: string | null = null;
-  private conversationCreation: Promise<ChatConversationResponse> | null = null;
+  private conversationPersisted = false;
   private unsubscribeRuntime: (() => void) | null = null;
   private runtimeSwitching = false;
 
@@ -130,7 +130,8 @@ export class ChatIpcService {
       error: { code: "runtime_unavailable", message: "A conversation cannot be created while Runtime is busy." } };
     const runtime = this.getRuntime();
     if (!runtime) return { ok: false, error: { code: "runtime_unavailable", message: "Runtime is not connected." } };
-    if (this.conversationId && !newConversation) return { ok: true, conversationId: this.conversationId };
+    if (this.conversationId && (!newConversation || (this.conversationStore && !this.conversationPersisted)))
+      return { ok: true, conversationId: this.conversationId };
     if (!this.conversationStore) {
       try {
         const conversationId = runtime.createConversation();
@@ -141,21 +142,15 @@ export class ChatIpcService {
         return { ok: false, error: { code: "operation_failed", message: "A conversation could not be created." } };
       }
     }
-    if (this.conversationCreation) return this.conversationCreation;
-    this.conversationCreation = (async () => {
-      try {
-        const conversationId = (await this.conversationStore!.createConversation()).conversationId;
-        if (!isChatConversationResponse({ ok: true, conversationId })) throw new Error("runtime_conversation_id_invalid");
-        if (!runtime.restoreConversation || !runtime.restoreConversation(conversationId, []))
-          throw new Error("runtime_conversation_restore_failed");
-        this.conversationId = conversationId;
-        return { ok: true as const, conversationId };
-      } catch {
-        this.trace("conversation_create_failed", { stage: "persistent_create" });
-        return { ok: false as const, error: { code: "operation_failed" as const, message: "A conversation could not be created." } };
-      } finally { this.conversationCreation = null; }
-    })();
-    return this.conversationCreation;
+    try {
+      const conversationId = runtime.createConversation();
+      if (!isChatConversationResponse({ ok: true, conversationId })) throw new Error("runtime_conversation_id_invalid");
+      this.conversationId = conversationId;
+      this.conversationPersisted = false;
+      return { ok: true, conversationId };
+    } catch {
+      return { ok: false, error: { code: "operation_failed", message: "A conversation could not be prepared." } };
+    }
   }
 
   async openConversation(event: ChatIpcEvent, payload: unknown) {
@@ -178,6 +173,7 @@ export class ChatIpcService {
         runtime.restoreConversation(payload.conversationId, page.messages.filter(message => message.content.trim().length > 0)
           .map(({ role, content }) => ({ role, content })));
       this.conversationId = payload.conversationId;
+      this.conversationPersisted = true;
       return { ok: true as const, conversationId: payload.conversationId,
         messages: exposedMessages(page.messages), nextCursor: page.nextCursor, incompleteTail: page.incompleteTail };
     } catch {
@@ -215,9 +211,15 @@ export class ChatIpcService {
       error: { code: "runtime_unavailable" as const, message: "Conversation storage is not available." } };
     try {
       const page = await this.conversationStore.listConversations(payload);
-      return { ok: true as const, conversations: page.conversations, nextCursor: page.nextCursor };
-    } catch {
-      this.trace("conversation_list_failed", { stage: "persistent_read" });
+      const conversations = page.conversations.map(({ conversationId, title, createdAt, updatedAt, messageCount }) =>
+        ({ conversationId, title, createdAt, updatedAt, messageCount }));
+      return { ok: true as const, conversations, nextCursor: page.nextCursor };
+    } catch (error) {
+      const rawCode = error && typeof error === "object" && "code" in error ? error.code : null;
+      const errorCode = typeof rawCode === "string" && /^[A-Za-z0-9_]{2,40}$/u.test(rawCode) ? rawCode : null;
+      const errorName = error instanceof Error && ["ConversationStoreError", "Error", "TypeError"].includes(error.name)
+        ? error.name : "UnknownError";
+      this.trace("conversation_list_failed", { stage: "persistent_read", errorName, errorCode });
       return { ok: false as const, error: { code: "operation_failed" as const, message: "Conversations could not be listed." } };
     }
   }
@@ -263,8 +265,15 @@ export class ChatIpcService {
     };
     if (this.conversationStore) {
       active.persistencePending = true;
-      operation = this.conversationStore.appendMessage(request.conversationId, { role: "user", content: request.text })
-        .then(() => { active.persistencePending = false; return sendToRuntime(); }).catch((error) => {
+      operation = (async () => {
+        if (!this.conversationPersisted) {
+          await this.conversationStore!.createConversation(request.conversationId);
+          this.conversationPersisted = true;
+        }
+        await this.conversationStore!.appendMessage(request.conversationId, { role: "user", content: request.text });
+        active.persistencePending = false;
+        return sendToRuntime();
+      })().catch((error) => {
           active.persistencePending = false;
           this.trace("conversation_persist_failed", { stage: "user_message" });
           throw error;
@@ -344,6 +353,7 @@ export class ChatIpcService {
     this.unsubscribeRuntime?.();
     this.unsubscribeRuntime = null;
     this.conversationId = null;
+    this.conversationPersisted = false;
     const runtime = this.getRuntime();
     if (runtime) this.unsubscribeRuntime = runtime.onEvent((event) => this.handleRuntimeEvent(event));
   }

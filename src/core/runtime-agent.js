@@ -43,7 +43,7 @@ export async function createRuntimeAgent({
     }
 
     if (memoryMode === 'memory2') {
-        return createAgent({ memoryBackend: 'memory2', ...agentOptions, initialConversationHistory });
+        return createAgent({ memoryBackend: 'memory2', memory2StorePath: storePath, ...agentOptions, initialConversationHistory });
     }
 
     if (memoryMode === 'memory2-confirmed-write') {
@@ -51,7 +51,8 @@ export async function createRuntimeAgent({
             throw new Error('A dedicated absolute synthetic Memory 2 store is required for confirmed writes.');
         }
         const { allowConfirmedMemoryWrites: _hostGate, ...safeAgentOptions } = agentOptions;
-        return createAgent({ ...safeAgentOptions, memoryBackend: 'memory2', memory2StorePath: storePath, initialConversationHistory,
+        return createAgent({ ...safeAgentOptions, memoryBackend: 'memory2', memory2StorePath: storePath,
+            ...(agentOptions.memory2Repository ? { memory2Repository: agentOptions.memory2Repository } : {}), initialConversationHistory,
             enableConfirmedMemoryWrites: true, enableAutomaticMemoryAssessment: false });
     }
 

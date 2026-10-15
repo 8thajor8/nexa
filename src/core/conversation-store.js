@@ -264,10 +264,13 @@ export function createConversationStore({ baseDirectory, fileSystem = {}, now = 
         } finally { await handle?.close().catch(() => {}); }
     }
 
-    async function createConversation() {
+    async function createConversation(requestedConversationId) {
         await initialize();
+        if (requestedConversationId !== undefined
+            && (typeof requestedConversationId !== 'string' || !UUID.test(requestedConversationId)))
+            throw new ConversationStoreError('conversation_id_invalid');
         for (let attempt = 0; attempt < 3; attempt++) {
-            const conversationId = idFactory();
+            const conversationId = requestedConversationId ?? idFactory();
             if (typeof conversationId !== 'string' || !UUID.test(conversationId))
                 throw new ConversationStoreError('conversation_id_invalid');
             const { directory, messages } = pathsFor(conversationId);

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { config, resolveCliMemoryMode } from '../config.js';
 import { createRuntimeAgent } from './runtime-agent.js';
+import { openMemoryBackend } from '../memory/backend.js';
 import { classifySystemDiagnosticRequest, createOperationalDiagnostics, createTechnicalDiagnosticReport,
     formatMemoryDiagnostics, formatSystemStatus, formatToolCatalog, formatVoiceStatus } from './system-diagnostics.js';
 import { getToolsForModel, hostedToolRegistry, localToolRegistry } from '../tools/index.js';
@@ -136,6 +137,25 @@ export function createConversationRuntime({
     const listeners = new Set();
     let closed = false;
     let closing;
+    let sharedWritableMemoryBackendPromise = null;
+    let sharedWritableMemoryBackend = null;
+
+    function getSharedWritableMemoryBackend() {
+        if (!sharedWritableMemoryBackendPromise) {
+            sharedWritableMemoryBackendPromise = openMemoryBackend({
+                backend: 'memory2',
+                storePath,
+                organicMemoryAuthorizationFactory: agentOptions.organicMemoryAuthorizationFactory ?? null,
+            }).then(backend => {
+                sharedWritableMemoryBackend = backend;
+                return backend;
+            }).catch(error => {
+                sharedWritableMemoryBackendPromise = null;
+                throw error;
+            });
+        }
+        return sharedWritableMemoryBackendPromise;
+    }
 
     function trace(event, details = {}) {
         try { diagnostic(Object.freeze({ area: 'conversation_runtime', event, ...details })); }
@@ -187,11 +207,20 @@ export function createConversationRuntime({
     async function getAgent(conversation) {
         if (conversation.agent) return conversation.agent;
         if (!conversation.agentPromise) {
-            conversation.agentPromise = Promise.resolve().then(() => agentFactory({
-                memoryMode, storePath,
-                initialConversationHistory: conversation.initialConversationHistory,
-                agentOptions: { ...agentOptions, operationalDiagnostics, operationalMemoryMode: memoryMode },
-            })).then(agent => {
+            conversation.agentPromise = Promise.resolve().then(async () => {
+                const options = { ...agentOptions, operationalDiagnostics, operationalMemoryMode: memoryMode };
+                // A writable Memory2 repository owns an exclusive process lock. Keep
+                // one repository for this Runtime while retaining a separate agent
+                // and conversational history for every conversation.
+                if (agentFactory === createRuntimeAgent
+                    && (memoryMode === 'memory2' || memoryMode === 'memory2-confirmed-write')) {
+                    const backend = await getSharedWritableMemoryBackend();
+                    options.memory2Repository = backend.repository;
+                }
+                return agentFactory({ memoryMode, storePath,
+                    initialConversationHistory: conversation.initialConversationHistory,
+                    agentOptions: options });
+            }).then(agent => {
                 if (!agent || typeof agent.run !== 'function' || typeof agent.close !== 'function')
                     throw new TypeError('agent_factory_result_invalid');
                 conversation.agent = agent;
@@ -400,6 +429,12 @@ export function createConversationRuntime({
                 try { await conversation.agent.close(); }
                 catch { errors.push(true); }
                 conversation.agent = null;
+            }
+            if (sharedWritableMemoryBackend) {
+                try { await sharedWritableMemoryBackend.close(); }
+                catch { errors.push(true); }
+                sharedWritableMemoryBackend = null;
+                sharedWritableMemoryBackendPromise = null;
             }
             conversations.clear();
             listeners.clear();

@@ -34,6 +34,17 @@ test('creates UUID conversation metadata and recovers it after store reinstantia
     assert.deepEqual(await reopened.getConversation(created.conversationId), created);
 });
 
+test('persists a provisional Runtime conversation under its existing ID only when explicitly requested', async t => {
+    const f = await fixture(t);
+    const conversationId = '00000000-0000-4000-8000-000000000091';
+    const created = await f.store.createConversation(conversationId);
+    assert.equal(created.conversationId, conversationId);
+    assert.equal(created.messageCount, 0);
+    assert.equal((await f.store.listConversations()).conversations.length, 1);
+    await assert.rejects(f.store.createConversation(conversationId), code('conversation_id_collision'));
+    assert.equal((await f.store.listConversations()).conversations.length, 1);
+});
+
 test('appends visible user and assistant messages with stable chronological sequence', async t => {
     const f = await fixture(t);
     const conversation = await f.store.createConversation();
