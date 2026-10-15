@@ -175,7 +175,7 @@ test('CONV-05C: tool call/result pairs stay intact in active context; restart re
     await restoredRuntime.close();
 });
 
-test('CURRENT: Runtime retires an agent after an error; cancellation rolls back only its partial turn', async t => {
+test('CONV-05D: provider error rolls back its partial turn and preserves prior completed context', async t => {
     const errorRecorder = responseRecorder([final('Synthetic pre-error context.'), new Error('synthetic provider failure'), final('Sigo.')]);
     const errorRuntime = runtimeWithResponses(errorRecorder);
     const errorConversation = errorRuntime.createConversation();
@@ -187,7 +187,8 @@ test('CURRENT: Runtime retires an agent after an error; cancellation rolls back 
     const retryInput = JSON.stringify(errorRecorder.requests[2].input);
     assert.ok(retryInput.includes('Synthetic retry after error.'));
     assert.equal(retryInput.includes('Synthetic failed user turn.'), false);
-    assert.equal(retryInput.includes('Synthetic successful context before error.'), false);
+    assert.ok(retryInput.includes('Synthetic successful context before error.'));
+    assert.equal(afterErrorMetrics.conversationalMessages, 3);
     await errorRuntime.close();
 
     let entered;
@@ -212,8 +213,134 @@ test('CURRENT: Runtime retires an agent after an error; cancellation rolls back 
     assert.equal(postCancelInput.includes('Synthetic cancelled user turn.'), false);
     assert.ok(postCancelInput.includes('Synthetic post-cancel turn.'));
     const afterCancelMetrics = measuredInput(cancelRecorder.requests[1].input);
-    t.diagnostic(`synthetic failure/cancellation metrics: afterError=${JSON.stringify(afterErrorMetrics)} afterCancel=${JSON.stringify(afterCancelMetrics)}; Runtime agent retirement resets prior in-memory context after an error, while cancellation removes only the cancelled partial turn`);
+    t.diagnostic(`synthetic failure/cancellation metrics: afterError=${JSON.stringify(afterErrorMetrics)} afterCancel=${JSON.stringify(afterCancelMetrics)}; completed context survives provider errors, while partial failed/cancelled turns are excluded`);
     await cancelRuntime.close();
+});
+
+test('CONV-05D: restoration ignores an incomplete persisted user turn but keeps earlier completed exchanges', async t => {
+    const recorder = responseRecorder();
+    const runtime = runtimeWithResponses(recorder);
+    t.after(() => runtime.close());
+    assert.equal(runtime.restoreConversation(UUID, [
+        { role: 'user', content: 'Synthetic completed antecedent.' },
+        { role: 'assistant', content: 'Synthetic completed answer.' },
+        { role: 'user', content: 'Synthetic persisted turn without final answer.' },
+    ]), true);
+    await send(runtime, UUID, 'restore-after-incomplete', 'Synthetic post-restart follow-up.');
+    const input = JSON.stringify(recorder.requests[0].input);
+    assert.ok(input.includes('Synthetic completed antecedent.'));
+    assert.ok(input.includes('Synthetic completed answer.'));
+    assert.equal(input.includes('Synthetic persisted turn without final answer.'), false);
+    assert.ok(input.includes('Synthetic post-restart follow-up.'));
+});
+
+test('CONV-05D: error after a successful tool preserves the actual call/result and does not re-execute it', async t => {
+    let sideEffects = 0;
+    const recorder = responseRecorder([
+        toolCall('synthetic_action', { action: 'apply' }, 'action-call-1'),
+        new Error('synthetic failure after tool'),
+        final('Continúo con el resultado previo.'),
+    ]);
+    const runtime = runtimeWithResponses(recorder, { agentOptions: {
+        getTools: () => [{ type: 'function', name: 'synthetic_action', parameters: { type: 'object' } }],
+        execute: async () => { sideEffects++; return { success: true, result: 'synthetic-action-completed' }; },
+    } });
+    const id = runtime.createConversation();
+    t.after(() => runtime.close());
+    const failed = await send(runtime, id, 'action-fail-after', 'Ejecuta la acción sintética.');
+    assert.equal(failed.status, 'error');
+    await send(runtime, id, 'action-followup', '¿Qué pasó con la acción?');
+    assert.equal(sideEffects, 1);
+    const input = recorder.requests.at(-1).input;
+    assert.ok(input.some(item => item?.type === 'function_call' && item.call_id === 'action-call-1'));
+    assert.ok(input.some(item => item?.type === 'function_call_output' && item.call_id === 'action-call-1'
+        && item.output.includes('synthetic-action-completed')));
+    assert.ok(JSON.stringify(input).includes('Ejecuta la acción sintética.'));
+    assert.ok(JSON.stringify(input).includes('¿Qué pasó con la acción?'));
+});
+
+test('CONV-05D: failed tool outcome remains explicitly failed and is never promoted to success', async t => {
+    const recorder = responseRecorder([
+        toolCall('synthetic_failure', {}, 'failed-call-1'),
+        final('La operación sintética falló.'),
+        final('El resultado continúa marcado como fallido.'),
+    ]);
+    const runtime = runtimeWithResponses(recorder, { agentOptions: {
+        getTools: () => [{ type: 'function', name: 'synthetic_failure', parameters: { type: 'object' } }],
+        execute: async () => { throw new Error('synthetic tool failure'); },
+    } });
+    const id = runtime.createConversation();
+    t.after(() => runtime.close());
+    assert.equal((await send(runtime, id, 'tool-failure', 'Ejecuta la operación sintética.')).status, 'completed');
+    await send(runtime, id, 'tool-failure-followup', '¿Cuál fue el resultado?');
+    const input = recorder.requests.at(-1).input;
+    const failedOutput = input.find(item => item?.type === 'function_call_output' && item.call_id === 'failed-call-1');
+    assert.ok(failedOutput);
+    assert.equal(JSON.parse(failedOutput.output).success, false);
+    assert.equal(failedOutput.output.includes('"success":true'), false);
+});
+
+test('CONV-05D: streaming cancellation resets the partial draft and the next turn keeps completed context only', async t => {
+    const requests = [];
+    let requestCount = 0;
+    let markStarted;
+    const started = new Promise(resolve => { markStarted = resolve; });
+    const runtime = createConversationRuntime({ memoryMode: 'memory1', streamResponses: true,
+        agentOptions: { load: async () => ({ user: {}, preferences: {}, facts: [] }), save: async () => {},
+            getTools: () => [], logger: () => {}, ask: async request => {
+                requests.push(structuredClone(request.input));
+                requestCount++;
+                if (requestCount === 1) return final('Contexto previo válido.');
+                if (requestCount === 2) {
+                    request.onTextDelta('Synthetic partial draft.');
+                    markStarted();
+                    return new Promise(resolve => request.signal.addEventListener('abort', () => resolve(final('Tarde.')), { once: true }));
+                }
+                return final('Respuesta posterior.');
+            } } });
+    const id = runtime.createConversation();
+    const events = [];
+    runtime.onEvent(event => events.push(event));
+    t.after(() => runtime.close());
+    await send(runtime, id, 'stream-before', 'Antecedente completado antes del stream.');
+    const pending = send(runtime, id, 'stream-cancel', 'Solicitud sintética cancelada.');
+    await started;
+    assert.equal(runtime.cancelRequest('continuity-stream-cancel', 'test'), true);
+    assert.equal((await pending).status, 'cancelled');
+    assert.ok(events.some(event => event.requestId === 'continuity-stream-cancel' && event.status === 'text_reset'));
+    await send(runtime, id, 'stream-after', 'Siguiente solicitud válida.');
+    const recovered = JSON.stringify(requests.at(-1));
+    assert.ok(recovered.includes('Antecedente completado antes del stream.'));
+    assert.equal(recovered.includes('Solicitud sintética cancelada.'), false);
+    assert.equal(recovered.includes('Synthetic partial draft.'), false);
+});
+
+test('CONV-05D: cancellation during a tool retains a confirmed successful effect without replaying it', async t => {
+    let finishTool;
+    let toolStarted;
+    const entered = new Promise(resolve => { toolStarted = resolve; });
+    let sideEffects = 0;
+    const recorder = responseRecorder([toolCall('synthetic_action', {}, 'cancel-action-1'), final('Continuación.')]);
+    const runtime = runtimeWithResponses(recorder, { agentOptions: {
+        getTools: () => [{ type: 'function', name: 'synthetic_action', parameters: { type: 'object' } }],
+        execute: () => new Promise(resolve => {
+            finishTool = () => { sideEffects++; resolve({ success: true, result: 'synthetic-effect-completed' }); };
+            toolStarted();
+        }),
+    } });
+    const id = runtime.createConversation();
+    t.after(() => runtime.close());
+    const pending = send(runtime, id, 'cancel-tool-turn', 'Ejecuta la acción y detente.');
+    await entered;
+    assert.equal(runtime.cancelRequest('continuity-cancel-tool-turn', 'test'), true);
+    finishTool();
+    assert.equal((await pending).status, 'cancelled');
+    await send(runtime, id, 'cancel-tool-next', 'Confirma el estado de la acción anterior.');
+    assert.equal(sideEffects, 1);
+    const input = recorder.requests.at(-1).input;
+    assert.ok(input.some(item => item?.type === 'function_call_output' && item.call_id === 'cancel-action-1'
+        && item.output.includes('synthetic-effect-completed')));
+    assert.deepEqual(input.filter(item => item?.type === 'function_call').map(item => item.call_id), ['cancel-action-1']);
 });
 
 test('CURRENT: a changed Memory2 digest clears prior derived conversation context', async t => {

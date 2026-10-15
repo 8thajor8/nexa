@@ -236,13 +236,6 @@ export function createConversationRuntime({
         return conversation.agentPromise;
     }
 
-    async function retireAgent(conversation, agent) {
-        if (conversation.agent !== agent) return;
-        conversation.agent = null;
-        conversation.agentPromise = null;
-        try { await agent.close(); } catch { /* A request error remains the public result. */ }
-    }
-
     async function processRequest(entry, conversation, text, source) {
         const systemDiagnosticKind = classifySystemDiagnosticRequest(text);
         let agent;
@@ -303,7 +296,7 @@ export function createConversationRuntime({
                         if (entry.terminal || entry.controller.signal.aborted || typeof delta !== 'string' || delta.length === 0) return;
                         emit(entry, 'text_delta', { delta });
                     },
-                    onTextReset: () => { if (!entry.terminal && !entry.controller.signal.aborted) emit(entry, 'text_reset'); },
+                    onTextReset: () => { if (!entry.terminal) emit(entry, 'text_reset'); },
                 } : {}),
                 onAuthorizationRequired: requirement => {
                     if (!entry.terminal && requirement && typeof requirement === 'object') {
@@ -344,7 +337,6 @@ export function createConversationRuntime({
                     initializationMessage: safeInitializationMessage(caughtError),
                 });
             }
-            if (agent) await retireAgent(conversation, agent);
             const error = { code: 'agent_error', message: 'The conversation request failed.' };
             emit(entry, 'error', { error });
             const failure = classifyFailure(caughtError);

@@ -643,7 +643,7 @@ export async function createAgent({
         throw new Error('confirmed_memory_writes_require_writable_memory2');
     }
     let queue = Promise.resolve();
-    let currentMessage = '', currentSource = 'untrusted', contextDigest = null;
+    let currentMessage = '', currentSource = 'untrusted', contextDigest = null, streamedTurnText = false;
     let memoryTopicRecordIds = new Set();
     let activeDiagnosticRequestId = null;
     const selectedInitialConversationHistory = selectConversationContext(initialConversationHistory,
@@ -1072,6 +1072,7 @@ ${memoryToPrompt(memory)}
             ...(typeof onTextDelta === 'function' && !historicalFacts ? { onTextDelta: delta => {
                 if (typeof delta !== 'string' || delta.length === 0) return;
                 streamedText += delta;
+                streamedTurnText = true;
                 if (!firstTextDeltaReported) {
                     firstTextDeltaReported = true;
                     diagnostic('model_first_text_delta', { iteration, durationMs: performance.now() - modelStartedAt });
@@ -1108,9 +1109,9 @@ ${memoryToPrompt(memory)}
         conversation.push(...(finalResponse.output ?? []));
         if (typeof onTextDelta === 'function' && !historicalFacts) {
             if (toolCalls.length > 0) {
-                if (streamedText) onTextReset?.();
+                if (streamedText) { streamedTurnText = false; onTextReset?.(); }
             } else if (typeof finalResponse.output_text === 'string' && finalResponse.output_text !== streamedText) {
-                if (streamedText) onTextReset?.();
+                if (streamedText) { streamedTurnText = false; onTextReset?.(); }
                 if (finalResponse.output_text) onTextDelta(finalResponse.output_text);
             }
         }
@@ -1152,9 +1153,14 @@ ${memoryToPrompt(memory)}
         const onTextReset = typeof options?.onTextReset === 'function' ? options.onTextReset : null;
         if (signal !== undefined && !(signal instanceof AbortSignal)) throw new TypeError('request_signal_invalid');
         activeDiagnosticRequestId = typeof options?.requestId === 'string' ? options.requestId : null;
-        const conversationLength = conversation.length;
+        const conversationSnapshot = selectConversationContext(conversation, normalizedConversationContextPolicy);
+        conversation.splice(0, conversation.length, ...conversationSnapshot);
         const priorRecentUserTurns = recentUserTurns;
         const priorContextDigest = contextDigest;
+        const priorCurrentRecentUserMessages = currentRecentUserMessages;
+        const priorMemoryTopicRecordIds = new Set(memoryTopicRecordIds);
+        const successfulToolProtocolItems = [];
+        streamedTurnText = false;
         const semanticDiagnostics = { semanticInterpreterAvailable: enableConfirmedMemoryWrites && selectedBackend.backend === 'memory2',
             semanticInterpreterInvoked: false, semanticInterpretation: 'not_invoked', runtimeValidation: 'not_run' };
         const recordMemoryChange = event => operationalDiagnostics?.recordMemoryChange?.({
@@ -1610,7 +1616,6 @@ ${memoryToPrompt(memory)}
                         errorCode: typeof error?.code === 'string' ? error.code : null });
                     result = { success: false, error: { code: 'tool_execution_failed', message: error.message } };
                 }
-                throwIfAborted(signal);
                 const succeeded = result?.success === true;
                 if (result?.outcome === 'uncertain') uncertainSpotifyActionCalls.add(callKey);
                 if (succeeded && ['set_ui_value', 'invoke_ui_element'].includes(toolCall.name)) {
@@ -1662,11 +1667,14 @@ ${memoryToPrompt(memory)}
                         });
                     }
                 }
-                conversation.push({
+                const toolOutputItem = {
                     type: 'function_call_output',
                     call_id: toolCall.call_id,
                     output: JSON.stringify(output),
-                });
+                };
+                conversation.push(toolOutputItem);
+                if (succeeded) successfulToolProtocolItems.push(structuredClone(toolCall), structuredClone(toolOutputItem));
+                throwIfAborted(signal);
             }
 
             // Playback controls are reported from the trusted Runtime result. Asking the
@@ -1691,10 +1699,18 @@ ${memoryToPrompt(memory)}
             // The Runtime emits a sanitized failure category. Do not pass arbitrary
             // exception fields into diagnostic sinks from this boundary.
             diagnostic('agent_run_failed', { stage: 'agent_run' });
+            conversation.splice(0, conversation.length, ...conversationSnapshot);
+            recentUserTurns = priorRecentUserTurns;
+            currentRecentUserMessages = priorCurrentRecentUserMessages;
+            contextDigest = priorContextDigest;
+            memoryTopicRecordIds = priorMemoryTopicRecordIds;
+            if (successfulToolProtocolItems.length > 0) {
+                conversation.push({ role: 'user', content: userMessage }, ...successfulToolProtocolItems);
+            }
+            if (streamedTurnText) {
+                try { onTextReset?.(); } catch { /* Clearing a partial draft cannot change request outcome. */ }
+            }
             if (signal?.aborted) {
-                conversation.length = conversationLength;
-                recentUserTurns = priorRecentUserTurns;
-                contextDigest = priorContextDigest;
                 throwIfAborted(signal);
             }
             throw error;

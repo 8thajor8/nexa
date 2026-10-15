@@ -46,6 +46,13 @@ function cost(turns) {
     };
 }
 
+function hasRecoverableOutcome(turn) {
+    if (turn.some(item => item?.role === 'assistant')) return true;
+    const calls = new Set(turn.filter(item => item?.type === 'function_call')
+        .map(item => item.call_id).filter(id => typeof id === 'string'));
+    return turn.some(item => item?.type === 'function_call_output' && calls.has(item.call_id));
+}
+
 /**
  * Select recent complete conversation turns under a shared message/serialized-character
  * budget. The current in-flight turn is retained whole and is outside the historical
@@ -59,7 +66,8 @@ export function selectConversationContext(items, policy = {}, { currentTurnStart
     if (Number.isSafeInteger(currentTurnStartIndex) && currentTurnStartIndex >= 0) {
         currentTurnIndex = turns.findIndex(turn => turn[0] === items[currentTurnStartIndex]);
     }
-    const historicalTurns = currentTurnIndex >= 0 ? turns.slice(0, currentTurnIndex) : turns;
+    const historicalTurns = (currentTurnIndex >= 0 ? turns.slice(0, currentTurnIndex) : turns)
+        .filter(hasRecoverableOutcome);
     const currentTurn = currentTurnIndex >= 0 ? turns.slice(currentTurnIndex) : [];
     const selected = [];
     let messageCount = 0;
