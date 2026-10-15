@@ -1,4 +1,4 @@
-import { speechConfig, getSpeechInstructions, speechStyles } from './config.js';
+import { defaultSpeechInstructionVariant, speechConfig, getSpeechInstructions, speechStyles } from './config.js';
 import { createOpenAISpeechProvider } from './providers/openai.js';
 import { createAudioStore } from './audio-store.js';
 import { createWindowsAudioPlayer } from './windows-player.js';
@@ -22,7 +22,9 @@ export function createSpeechService({
     voiceFxProcessor,
     voiceFxProfile = 'off',
     maxTextLength = speechConfig.maxTextLength,
+    speechInstructionVariant = defaultSpeechInstructionVariant,
 } = {}) {
+    if (!['A', 'B'].includes(speechInstructionVariant)) throw new TypeError('speech_instruction_variant_invalid');
     let lastMetrics = null;
     async function initialize(metrics = null) {
         const startedAt = performance.now();
@@ -55,7 +57,7 @@ export function createSpeechService({
 
         let audio;
         const providerStartedAt = performance.now();
-        try { audio = await provider.synthesize({ text, instructions: getSpeechInstructions(style), format: speechConfig.format, signal,
+        try { audio = await provider.synthesize({ text, instructions: getSpeechInstructions(style, speechInstructionVariant), format: speechConfig.format, signal,
             onTiming: timing => { Object.assign(metrics, timing); } }); }
         catch (error) {
             metrics.synthesisMs = performance.now() - providerStartedAt; metrics.failureStage = 'synthesis'; lastMetrics = { ...metrics };

@@ -27,6 +27,12 @@ export const voiceIdentity = [
     'Keep it relaxed and spontaneous, like chatting with someone you know.',
 ].join(' ');
 
+export const voiceNaturalComparisonInstructions = Object.freeze({
+    B: 'Speak in contemporary urban Rioplatense Spanish from Argentina. Pronounce Spanish with a natural Argentine accent where your voice supports it; use voseo naturally when the text calls for it, without adding slang or changing the words. Let meaning and punctuation shape intonation: use a natural rise for genuine questions, calm clear emphasis for warnings, and casual warmth for everyday remarks. Keep the rhythm fluid and conversational, with brief pauses only at syntactic boundaries. Use subtle humor when the words invite it, without acting. Avoid announcer, audiobook, customer-service delivery, exaggerated accent, extra filler words, or rephrasing the supplied text.',
+});
+
+export const defaultSpeechInstructionVariant = 'B';
+
 export const speechStyles = Object.freeze({
     normal: '',
     professional: 'Use a composed, precise and confident tone while staying natural and approachable.',
@@ -35,8 +41,9 @@ export const speechStyles = Object.freeze({
     calm: 'Speak gently and steadily, with relaxed pacing and a reassuring tone.',
 });
 
-export function getSpeechInstructions(style = 'normal') {
+export function getSpeechInstructions(style = 'normal', variant = defaultSpeechInstructionVariant) {
     const styleInstruction = speechStyles[style];
-    if (!Object.hasOwn(speechStyles, style)) return null;
-    return style === 'normal' ? voiceIdentity : `${voiceIdentity} ${styleInstruction}`;
+    if (!Object.hasOwn(speechStyles, style) || !['A', 'B'].includes(variant)) return null;
+    const base = variant === 'A' ? voiceIdentity : voiceNaturalComparisonInstructions.B;
+    return style === 'normal' ? base : `${base} ${styleInstruction}`;
 }

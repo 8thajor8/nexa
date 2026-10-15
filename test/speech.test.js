@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createAudioStore } from '../src/speech/audio-store.js';
 import { createSpeechService } from '../src/speech/service.js';
-import { speechConfig, speechStyles, voiceIdentity, getSpeechInstructions, getSpeechRequestTimeoutMs } from '../src/speech/config.js';
+import { defaultSpeechInstructionVariant, speechConfig, speechStyles, voiceIdentity, voiceNaturalComparisonInstructions, getSpeechInstructions, getSpeechRequestTimeoutMs } from '../src/speech/config.js';
 import { createOpenAISpeechProvider } from '../src/speech/providers/openai.js';
 import { generateSpeechTool, playAudioTool, speechRegistrations } from '../src/speech/index.js';
 import { checkToolPermission } from '../src/tools/permissions.js';
@@ -15,6 +15,7 @@ import { normalizeWavLengths } from '../src/speech/wav.js';
 import { createVoiceFxProcessor, measureVoiceFxDifference, voiceFxProfiles } from '../src/speech/voice-fx.js';
 import { nexaVoiceIdentity } from '../src/speech/voice-identity.js';
 import { novaPortenaInstructions } from '../src/speech/voice-casting-profiles.js';
+import { voiceNaturalEvaluationPhrases } from '../scripts/voice-natural-comparison.mjs';
 
 const passthroughIdentityProcessor = { async process(audio) { return Buffer.from(audio); } };
 
@@ -193,16 +194,18 @@ test('SpeechService preserves play(audioId) while correlating controlled playbac
     assert.deepEqual(calls.at(-1), ['dispose']);
 });
 
-test('supports every fixed style while keeping a shared voice identity', async t => {
+test('supports every fixed style with the default natural voice instructions', async t => {
     const f = await fixture(t);
     for (const style of Object.keys(speechStyles)) {
         assert.equal((await f.service.generate({ text: 'Hola', style })).success, true);
     }
     assert.equal(Object.keys(speechStyles).join(','), 'normal,professional,alert,sassy,calm');
-    assert(f.calls.generated.every(item => item.instructions.includes(voiceIdentity)));
+    assert(f.calls.generated.every(item => item.instructions.includes(voiceNaturalComparisonInstructions.B)));
     assert.notEqual(getSpeechInstructions('normal'), getSpeechInstructions('calm'));
     assert.equal(voiceIdentity.startsWith(novaPortenaInstructions), true);
-    assert.equal(getSpeechInstructions('normal'), `${novaPortenaInstructions} Keep it relaxed and spontaneous, like chatting with someone you know.`);
+    assert.equal(defaultSpeechInstructionVariant, 'B');
+    assert.equal(getSpeechInstructions('normal'), voiceNaturalComparisonInstructions.B);
+    assert.equal(getSpeechInstructions('normal', 'A'), `${novaPortenaInstructions} Keep it relaxed and spontaneous, like chatting with someone you know.`);
     assert.equal(speechStyles.normal, '');
     assert.doesNotMatch(getSpeechInstructions('normal'), /youthful adult feminine voice|warm, friendly, lively|witty|confident|corporate/iu);
 });
@@ -222,6 +225,54 @@ test('production voice config selects Nova and enables the separate identity pro
     assert.equal(speechConfig.model, 'gpt-4o-mini-tts');
     assert.equal(speechConfig.voice, 'nova');
     assert.equal(speechConfig.voiceIdentityEnabled, true);
+});
+
+test('VOICE-NATURAL-03 defaults to B while retaining reversible A/B comparison', async t => {
+    const f = await fixture(t);
+    const identityCalls = [];
+    const identityProcessor = { async process(audio, options) {
+        identityCalls.push(options);
+        return Buffer.from(audio);
+    } };
+    const productionDefault = createSpeechService({ provider: f.provider, store: f.store, player: f.player,
+        voiceIdentityProcessor: identityProcessor });
+    const reference = createSpeechService({ provider: f.provider, store: f.store, player: f.player,
+        voiceIdentityProcessor: identityProcessor, speechInstructionVariant: 'A' });
+    const experimental = createSpeechService({ provider: f.provider, store: f.store, player: f.player,
+        voiceIdentityProcessor: identityProcessor, speechInstructionVariant: 'B' });
+
+    assert.equal((await productionDefault.generate({ text: '¿Querés que revise las opciones antes de decidir?' })).success, true);
+    assert.equal((await reference.generate({ text: '¿Querés que revise las opciones antes de decidir?' })).success, true);
+    assert.equal((await experimental.generate({ text: '¿Querés que revise las opciones antes de decidir?' })).success, true);
+    assert.equal(f.calls.generated.length, 3, 'each service call uses exactly one synthesis operation');
+    const [defaultVariant, variantA, variantB] = f.calls.generated;
+    assert.equal(defaultVariant.instructions, voiceNaturalComparisonInstructions.B);
+    assert.equal(variantA.instructions, `${novaPortenaInstructions} Keep it relaxed and spontaneous, like chatting with someone you know.`);
+    assert.equal(variantB.instructions, voiceNaturalComparisonInstructions.B);
+    assert.notEqual(variantA.instructions, variantB.instructions);
+    assert.deepEqual({ ...variantA, instructions: undefined, onTiming: undefined },
+        { ...variantB, instructions: undefined, onTiming: undefined },
+        'text, WAV format, cancellation and timing hooks are identical; only instructions differ');
+    assert.deepEqual(identityCalls, [{ enabled: true }, { enabled: true }, { enabled: true }],
+        'default and comparison variants retain the same identity processing');
+    assert.equal(speechConfig.model, 'gpt-4o-mini-tts');
+    assert.equal(speechConfig.voice, 'nova');
+    assert.equal(speechConfig.format, 'wav');
+    assert.throws(() => createSpeechService({ speechInstructionVariant: 'C' }), /speech_instruction_variant_invalid/u);
+    await productionDefault.close();
+    await reference.close();
+    await experimental.close();
+});
+
+test('VOICE-NATURAL-02 comparison phrases match the approved six samples verbatim', () => {
+    assert.deepEqual(voiceNaturalEvaluationPhrases, [
+        'Che, ¿sabías que los pulpos tienen tres corazones?',
+        'No te recomendaría borrar todas las copias de seguridad. Si algo falla, podrías perder tus archivos.',
+        'Dale, perfecto. Lo dejamos así por ahora.',
+        '¿Querés que revise las opciones antes de decidir?',
+        'La reunión es a las 15:30 y el presupuesto es de 1.250 euros.',
+        'Mmm, no estoy tan segura. Yo probaría otra alternativa.',
+    ]);
 });
 
 test('SpeechService processes audio before storing and reports sanitized DSP failures', async t => {
