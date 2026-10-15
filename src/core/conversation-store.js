@@ -628,7 +628,8 @@ export function createConversationStore({ baseDirectory, fileSystem = {}, now = 
         if (!terms || !Number.isSafeInteger(limit) || limit < 1 || limit > SEARCH_MAX_RESULTS)
             throw new ConversationStoreError('conversation_search_invalid');
         return serialize(conversationId, async () => {
-            if (!await readManifest(conversationId)) throw new ConversationStoreError('conversation_not_found');
+            const manifest = await readManifest(conversationId);
+            if (!manifest) throw new ConversationStoreError('conversation_not_found');
             const { directory, messages: messagesPath } = pathsFor(conversationId);
             await assertSafeDirectory(directory);
             let handle;
@@ -643,6 +644,7 @@ export function createConversationStore({ baseDirectory, fileSystem = {}, now = 
                 let firstChunk = true;
                 let bytesScanned = 0;
                 let messagesExamined = 0;
+                let oldestSequenceExamined = Number.MAX_SAFE_INTEGER;
                 const best = [];
                 const compare = (left, right) => right.matchedTermCount - left.matchedTermCount
                     || Number(right.exactPhrase) - Number(left.exactPhrase)
@@ -655,6 +657,7 @@ export function createConversationStore({ baseDirectory, fileSystem = {}, now = 
                     catch (cause) { throw new ConversationStoreError('conversation_store_corrupt', { cause }); }
                     if (!validMessage(message, conversationId)) throw new ConversationStoreError('conversation_store_corrupt');
                     messagesExamined++;
+                    oldestSequenceExamined = Math.min(oldestSequenceExamined, message.sequence);
                     const normalizedContent = normalizeSearch(message.content);
                     const contentTerms = new Set(normalizedContent.match(/[\p{L}\p{N}]{2,}/gu) ?? []);
                     const matchedTermCount = terms.reduce((count, term) => count + Number(contentTerms.has(term)), 0);
@@ -692,7 +695,8 @@ export function createConversationStore({ baseDirectory, fileSystem = {}, now = 
                 }
                 if (scanStart === 0 && cursor === 0 && carry.length > 0
                     && messagesExamined < SEARCH_MAX_MESSAGES) examineLine(carry.toString('utf8'));
-                const truncated = scanStart > 0 || messagesExamined >= SEARCH_MAX_MESSAGES;
+                const truncated = scanStart > 0 || (messagesExamined >= SEARCH_MAX_MESSAGES
+                    && (manifest.messageCount > messagesExamined || oldestSequenceExamined > 1));
                 return Object.freeze({ results: Object.freeze(best.sort((a, b) => a.sequence - b.sequence)
                     .map(result => Object.freeze(result))), messagesExamined, bytesScanned, truncated });
             } catch (cause) {

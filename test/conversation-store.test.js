@@ -241,6 +241,37 @@ test('search scans a 1,000-message synthetic history within explicit byte/messag
     t.diagnostic(`synthetic conversation search: durationMs=${durationMs.toFixed(2)} messagesExamined=${result.messagesExamined} bytesScanned=${result.bytesScanned} results=${result.results.length}`);
 });
 
+test('search distinguishes a complete 20,000-message scan from an omitted older message', async t => {
+    const f = await fixture(t);
+    const conversation = await f.store.createConversation();
+    const directory = path.join(f.options.baseDirectory, 'conversations', conversation.conversationId);
+    const manifestPath = path.join(directory, 'manifest.json');
+    const messagesPath = path.join(directory, 'messages.jsonl');
+    const timestamp = '2035-01-01T00:00:00.000Z';
+    const record = (sequence, content) => ({ version: 1,
+        id: `00000000-0000-4000-8000-${String(sequence).padStart(12, '0')}`,
+        conversationId: conversation.conversationId, sequence, role: sequence % 2 ? 'user' : 'assistant',
+        content, createdAt: timestamp, status: 'complete' });
+    const messages = Array.from({ length: 20_000 }, (_, index) => record(index + 1,
+        index === 0 ? 'Aurora Azul es la decisión histórica.' : `Mensaje sintético número ${index + 1}.`));
+    const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+    await fs.writeFile(messagesPath, `${messages.map(message => JSON.stringify(message)).join('\n')}\n`, 'utf8');
+    await fs.writeFile(manifestPath, JSON.stringify({ ...manifest, messageCount: messages.length, updatedAt: timestamp }), 'utf8');
+
+    const complete = await f.store.searchMessages(conversation.conversationId, { query: 'Aurora Azul' });
+    assert.equal(complete.messagesExamined, 20_000);
+    assert.equal(complete.truncated, false);
+    assert.deepEqual(complete.results.map(result => result.sequence), [1]);
+
+    const beyondLimit = record(20_001, 'Mensaje sintético adicional.');
+    await fs.appendFile(messagesPath, `${JSON.stringify(beyondLimit)}\n`, 'utf8');
+    await fs.writeFile(manifestPath, JSON.stringify({ ...manifest, messageCount: 20_001, updatedAt: timestamp }), 'utf8');
+    const partial = await f.store.searchMessages(conversation.conversationId, { query: 'Aurora Azul' });
+    assert.equal(partial.messagesExamined, 20_000);
+    assert.equal(partial.truncated, true);
+    assert.deepEqual(partial.results, [], 'the omitted oldest match is not presented as found');
+});
+
 test('persists bounded, minimized tool outcomes and restores them without arguments or payloads', async t => {
     const f = await fixture(t);
     const conversation = await f.store.createConversation();

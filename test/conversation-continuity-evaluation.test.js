@@ -1009,6 +1009,30 @@ test('CONV-05F3 FIX1: genuinely unusable queries are rejected without calling th
     assert.equal(searches, 0);
 });
 
+test('CONV-05F4: near-duplicate queries are bounded and Store truncation is preserved for the model', async t => {
+    const recorder = responseRecorder([
+        toolCalls([
+            { name: 'search_conversation_history', args: { query: 'Aurora Azul Centella' }, callId: 'f4-search-1' },
+            { name: 'search_conversation_history', args: { query: 'aurora, azul y centella' }, callId: 'f4-search-2' },
+        ]),
+        final('Encontré evidencia, aunque la búsqueda estaba truncada; no asumiré que sea exhaustiva.'),
+    ]);
+    let searches = 0;
+    const runtime = runtimeWithResponses(recorder, { searchConversationHistory: async () => {
+        searches++;
+        return { results: [{ messageId: 'f4-result', sequence: 3, role: 'user', excerpt: 'Aurora Azul fue la elección.' }],
+            messagesExamined: 20_000, bytesScanned: 2_000_000, truncated: true };
+    } });
+    t.after(() => runtime.close());
+    const id = runtime.createConversation();
+    await send(runtime, id, 'f4-duplicate-search', '¿Qué nombre habíamos elegido?');
+    const outputs = recorder.requests[1].input.filter(item => item?.type === 'function_call_output'
+        && ['f4-search-1', 'f4-search-2'].includes(item.call_id));
+    assert.equal(searches, 1, 'similar query variants must not rescan history in the same turn');
+    assert.equal(JSON.parse(outputs.find(item => item.call_id === 'f4-search-1').output).truncated, true);
+    assert.equal(JSON.parse(outputs.find(item => item.call_id === 'f4-search-2').output).status, 'duplicate_query');
+});
+
 test('CONV-05F3: recent or independent questions do not invoke historical search', async t => {
     const recorder = responseRecorder([final('Puedo responder con lo que acabamos de decir.'),
         final('La respuesta sintética es independiente del historial.')]);
