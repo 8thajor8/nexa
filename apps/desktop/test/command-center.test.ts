@@ -98,6 +98,37 @@ describe("Command Center visual structure", () => {
     expect(markup).toContain("Estado del sistema");
     expect(markup).toContain("Los demás indicadores son demostrativos.");
     expect(markup).toContain("Sin conexión");
+    expect(markup).toContain('class="system-module-content"');
+    expect(markup).toContain('aria-label="Contenido de estado del sistema"');
+  });
+
+  it("renders the master-volume slider with a dynamic Chromium track and accessible focus styling", () => {
+    const styles = readFileSync(new URL("../src/renderer/styles.css", import.meta.url), "utf8");
+    const markup = renderToStaticMarkup(createElement(DashboardModules, {
+      assistantState: "En espera", masterVolume: { available: true, volume: 40, errorCode: null },
+    }));
+
+    expect(markup).toContain('id="master-volume-slider"');
+    expect(markup).toContain('style="--volume-progress:40%"');
+    expect(styles).toMatch(/\.master-volume-control input::-webkit-slider-runnable-track\s*\{[^}]*#397FA8[^}]*#253A59/s);
+    expect(styles).toMatch(/\.master-volume-control input::-webkit-slider-thumb\s*\{[^}]*#4A91B7/s);
+    expect(styles).toMatch(/\.master-volume-control input:focus-visible\s*\{[^}]*outline:\s*2px solid/s);
+    expect(styles).toMatch(/\.master-volume-control input:disabled\s*\{[^}]*cursor:\s*not-allowed[^}]*opacity:\s*\.55/s);
+  });
+
+  it("spans the lower modules across the shell and keeps the system heading outside its scroll area", () => {
+    const styles = readFileSync(new URL("../src/renderer/styles.css", import.meta.url), "utf8");
+    const markup = renderToStaticMarkup(createElement(DashboardModules, { assistantState: "En espera" }));
+    const headingIndex = markup.indexOf('class="dashboard-module-heading"><h2 id="system-title"');
+    const contentIndex = markup.indexOf('class="system-module-content"');
+
+    expect(styles).toMatch(/\.dashboard-modules\s*\{[^}]*grid-column:\s*1 \/ -1[^}]*grid-row:\s*2/s);
+    expect(styles).toMatch(/\.system-module-content\s*\{[^}]*overflow-y:\s*auto[^}]*touch-action:\s*pan-y/s);
+    expect(styles).toMatch(/\.system-module-content::-webkit-scrollbar\s*\{[^}]*display:\s*none/s);
+    expect(markup).toContain('class="dashboard-module dashboard-module--system surface-panel"');
+    expect(headingIndex).toBeGreaterThan(-1);
+    expect(contentIndex).toBeGreaterThan(headingIndex);
+    expect(markup.slice(headingIndex, contentIndex)).not.toContain("system-module-content");
   });
 
   it("cleans panel and navigation labels while preserving their useful titles and the composer", () => {
@@ -133,15 +164,52 @@ describe("Command Center visual structure", () => {
 
     expect(styles).toMatch(/html\s*\{[^}]*overflow:\s*hidden/s);
     expect(styles).toMatch(/body\s*\{[^}]*overflow:\s*hidden/s);
-    expect(styles).toMatch(/\.app-shell\s*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\) 184px/s);
+    expect(styles).toMatch(/\.app-shell\s*\{[^}]*--dashboard-row-size:\s*184px;[^}]*grid-template-rows:\s*minmax\(0, 1fr\) var\(--dashboard-row-size\)/s);
     expect(styles).toMatch(/\.workspace-grid\s*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\)/s);
+    expect(styles).toMatch(/\.sidebar\s*\{[^}]*grid-row:\s*1;[^}]*grid-column:\s*1[^}]*height:\s*calc\(100dvh - var\(--dashboard-row-size\)\)[^}]*transition:\s*height var\(--workspace-height-duration\)/s);
+    expect(styles).toMatch(/\.primary-nav\s*\{[^}]*align-content:\s*start[^}]*gap:\s*9px[^}]*overflow-y:\s*auto/s);
     expect(styles).toMatch(/\.dashboard-modules\s*\{[^}]*grid-column:\s*1 \/ -1[^}]*grid-row:\s*2[^}]*padding:/s);
+    expect(styles).toMatch(/\.app-shell--workspace-expanded \.sidebar\s*\{\s*grid-row:\s*1 \/ -1;\s*height:\s*100dvh;\s*\}/s);
+    expect(styles).toMatch(/\.system-module-content\s*\{[^}]*overflow-y:\s*auto[^}]*scrollbar-width:\s*none[^}]*touch-action:\s*pan-y/s);
+    expect(styles).toMatch(/\.system-module-content::-webkit-scrollbar\s*\{[^}]*display:\s*none/s);
+    expect(styles).toMatch(/\.dashboard-module--system \.system-list\s*\{[^}]*overflow:\s*visible/s);
+    expect(styles).toMatch(/@media \(max-width:\s*760px\)[\s\S]*?\.app-shell--workspace-expanded \.sidebar\s*\{\s*grid-row:\s*1;\s*height:\s*auto;/s);
     expect(styles).toMatch(/@media \(max-width:\s*760px\)[\s\S]*?\.dashboard-modules\s*\{[^}]*overflow-x:\s*auto/);
     expect(styles).toMatch(/\.tool-list\s*\{[^}]*grid-template-columns:\s*repeat\(4, minmax\(0, 1fr\)\)/s);
     expect(styles).toMatch(/@container \(max-width:\s*300px\)[\s\S]*?\.tool-list\s*\{[^}]*repeat\(3, minmax\(0, 1fr\)\)/);
     expect(markup).toContain('id="message-composer"');
     expect(markup).toContain('aria-current="page"');
     expect(markup).toContain('aria-label="Mostrar controles de ventana"');
+  });
+
+  it("keeps the sidebar at the upper-panel height in Command Center and expands it only for Conversations", () => {
+    const styles = readFileSync(new URL("../src/renderer/styles.css", import.meta.url), "utf8");
+    const sidebarRule = styles.match(/\.sidebar\s*\{([^}]*)\}/s)?.[1] ?? "";
+    const navRule = styles.match(/\.primary-nav\s*\{([^}]*)\}/s)?.[1] ?? "";
+    const expandedRule = styles.match(/\.app-shell--workspace-expanded \.sidebar\s*\{([^}]*)\}/s)?.[1] ?? "";
+
+    expect(sidebarRule).toMatch(/grid-row:\s*1;/);
+    expect(sidebarRule).toMatch(/height:\s*calc\(100dvh - var\(--dashboard-row-size\)\)/);
+    expect(sidebarRule).toMatch(/transition:\s*height var\(--workspace-height-duration\)/);
+    expect(navRule).toMatch(/align-content:\s*start/);
+    expect(navRule).toMatch(/gap:\s*9px/);
+    expect(navRule).not.toContain("space-between");
+    expect(expandedRule).toMatch(/grid-row:\s*1 \/ -1/);
+    expect(expandedRule).toMatch(/height:\s*100dvh/);
+    expect(styles).toMatch(/@media \(max-width:\s*760px\)[\s\S]*?\.app-shell--workspace-expanded \.sidebar\s*\{\s*grid-row:\s*1;\s*height:\s*auto;/s);
+    expect(styles).toMatch(/@media \(prefers-reduced-motion:\s*reduce\)[\s\S]*?transition-duration:\s*0\.01ms/s);
+  });
+
+  it("makes the complete system module scroll internally without changing its grid sizing", () => {
+    const styles = readFileSync(new URL("../src/renderer/styles.css", import.meta.url), "utf8");
+    const systemRule = styles.match(/\.dashboard-module--system\s*\{([^}]*)\}/s)?.[1] ?? "";
+
+    expect(systemRule).not.toMatch(/overflow-y:\s*auto/);
+    expect(systemRule).not.toMatch(/height\s*:/);
+    expect(styles).toMatch(/\.system-module-content\s*\{[^}]*min-height:\s*0[^}]*flex:\s*1 1 0[^}]*overflow-y:\s*auto[^}]*touch-action:\s*pan-y/s);
+    expect(styles).toMatch(/\.dashboard-module\s*\{[^}]*overflow:\s*hidden/s);
+    expect(styles).toMatch(/\.dashboard-module--system \.system-list\s*\{[^}]*overflow:\s*visible/s);
+    expect(styles).toMatch(/\.system-module-content::-webkit-scrollbar\s*\{[^}]*display:\s*none/s);
   });
 
   it("adapts the international header and Settings modal to compact windows", () => {
@@ -161,7 +229,7 @@ describe("Command Center visual structure", () => {
 
     expect(styles).toMatch(/--nexa-layout-column-gap:\s*18px/);
     expect(styles).toMatch(/\.app-shell\s*\{[^}]*column-gap:\s*var\(--nexa-layout-column-gap\)/s);
-    expect(styles).toMatch(/\.workspace-grid\s*\{[^}]*column-gap:\s*var\(--nexa-layout-column-gap\)/s);
+    expect(styles).toMatch(/\.workspace-grid\s*\{[^}]*column-gap:\s*0[^}]*transition:\s*grid-template-columns var\(--workspace-height-duration\)/s);
     expect(styles).toMatch(/\.dashboard-modules\s*\{[^}]*column-gap:\s*var\(--nexa-layout-column-gap\)/s);
     expect(styles).toMatch(/\.message-list\s*\{[^}]*overflow:\s*auto[^}]*scrollbar-width:\s*none/s);
     expect(styles).toMatch(/\.message-list::-webkit-scrollbar\s*\{[^}]*display:\s*none/s);
@@ -180,9 +248,31 @@ describe("Command Center visual structure", () => {
     const styles = readFileSync(new URL("../src/renderer/styles.css", import.meta.url), "utf8");
     expect(markup).toContain('role="switch" aria-label="Respuestas por voz" aria-checked="true"');
     expect(markup).toContain('id="conversation-voice-replies-state">ACTIVADO</small>');
-    expect(styles).toMatch(/\.workspace-grid\s*\{[^}]*grid-template-columns 820ms/s);
+    expect(styles).toMatch(/\.workspace-grid\s*\{[^}]*transition:\s*grid-template-columns var\(--workspace-height-duration\)/s);
+    expect(styles).not.toMatch(/\.app-shell\s*\{[^}]*transition:[^}]*grid-template-rows/s);
+    expect(styles).toMatch(/\.workspace-shell\s*\{[^}]*grid-row:\s*1\s*\/\s*-1;[^}]*height:\s*calc\(100% - var\(--dashboard-row-size\)\);[^}]*transition:\s*height var\(--workspace-height-duration\)/s);
     expect(styles).toMatch(/\.conversations-history\s*\{[^}]*transform 820ms/s);
+    expect(styles).toMatch(/\.workspace-grid--conversations\s*\{[^}]*grid-template-columns:\s*minmax\(205px, \.42fr\) minmax\(0, 1fr\) minmax\(0, 0fr\)/s);
+    expect(styles).toMatch(/@media \(max-width:\s*760px\)[\s\S]*?\.workspace-grid\s*\{[^}]*grid-template-columns:\s*minmax\(0, 0fr\) minmax\(0, 1fr\)[^}]*grid-template-rows:\s*minmax\(220px, 1\.25fr\) minmax\(160px, 0\.9fr\)/);
+    expect(styles).toMatch(/\.workspace-grid--conversations\s*\{[^}]*grid-template-columns:\s*minmax\(155px, \.62fr\) minmax\(0, 1\.38fr\)[^}]*grid-template-rows:\s*minmax\(0, 1fr\) minmax\(0, 0fr\)/s);
+    expect(styles).toMatch(/\.master-volume-control\s*\{[^}]*display:\s*grid/s);
+    expect(styles).toMatch(/\.master-volume-control input\s*\{[^}]*width:\s*100%[^}]*height:\s*14px[^}]*accent-color:\s*#397FA8[^}]*cursor:\s*pointer/s);
+    expect(styles).toMatch(/\.master-volume-control input:disabled\s*\{[^}]*cursor:\s*not-allowed[^}]*opacity:\s*\.55/s);
     expect(styles).toMatch(/@media \(prefers-reduced-motion:\s*reduce\)[\s\S]*?transition-duration:\s*0\.01ms/s);
+  });
+
+  it("moves Presence and lower modules fully offscreen before hiding or collapsing their layout", () => {
+    const styles = readFileSync(new URL("../src/renderer/styles.css", import.meta.url), "utf8");
+    expect(styles).toMatch(/\.app-shell--side-motion \.presence-panel, \.app-shell--side-motion \.dashboard-modules\s*\{\s*will-change:\s*transform/s);
+    expect(styles).not.toMatch(/\.presence-panel\s*\{[^}]*will-change:\s*transform/s);
+    expect(styles).toMatch(/\.presence-panel\s*\{[^}]*transition:\s*transform var\(--workspace-slide-duration\)/s);
+    expect(styles).toMatch(/\.presence-panel--offscreen\s*\{[^}]*transform:\s*translateX\(110%\)[^}]*transition-delay:\s*0s,\s*var\(--workspace-slide-duration\)/s);
+    expect(styles).toMatch(/\.dashboard-modules\s*\{[^}]*transition:\s*transform var\(--workspace-slide-duration\)/s);
+    expect(styles).toMatch(/\.dashboard-modules--hidden\s*\{[^}]*transform:\s*translateX\(-110%\)[^}]*transition-delay:\s*var\(--workspace-module-stagger\)/s);
+    expect(styles).toMatch(/\.app-shell--workspace-expanded \.workspace-shell\s*\{\s*height:\s*100%/s);
+    expect(styles).not.toMatch(/\.presence-panel--offscreen\s*\{[^}]*scale\(/s);
+    expect(styles).toMatch(/@media \(max-width:\s*760px\)[\s\S]*?\.workspace-shell\s*\{[^}]*grid-row:\s*2\s*\/\s*-1[^}]*height:\s*calc\(100% - var\(--dashboard-row-size\)\)/s);
+    expect(styles).toMatch(/@media \(prefers-reduced-motion:\s*reduce\)[\s\S]*?\.app-shell--workspace-expanded \.workspace-shell,[\s\S]*?transition-delay:\s*0s !important/s);
   });
 
   it("renders accessible controls for frameless window operations", () => {

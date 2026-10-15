@@ -99,7 +99,7 @@ export async function buildElectron({ outputRoot = resolve(desktopRoot, "dist-el
       },
       // Runtime's lazily-used browser/system adapters include native and optional
       // packages. Keep those Node-resolved in the monorepo; Runtime remains bundled.
-      external: ["electron", "keytar", "playwright-core", "chromium-bidi/*"],
+      external: ["electron", "keytar", "playwright-core", "chromium-bidi/*", "loudness"],
       sourcemap: false,
       write: false,
       logLevel,

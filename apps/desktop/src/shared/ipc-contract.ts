@@ -37,6 +37,9 @@ export const SPOTIFY_LIVE_STATUS_EVENT_CHANNEL = "spotify:live-status-event" as 
 export const SPOTIFY_LIVE_VISIBILITY_CHANNEL = "spotify:live-visibility" as const;
 export const SPOTIFY_CONTROL_CHANNEL = "spotify:control" as const;
 export const WEATHER_CURRENT_CHANNEL = "weather:current" as const;
+export const MASTER_VOLUME_GET_CHANNEL = "audio:master-volume:get" as const;
+export const MASTER_VOLUME_SET_CHANNEL = "audio:master-volume:set" as const;
+export const MASTER_VOLUME_EVENT_CHANNEL = "audio:master-volume:event" as const;
 export const DESKTOP_RENDERER_ISOLATION_ARGUMENT = "--nexa-renderer-isolated" as const;
 export const DESKTOP_RENDERER_ORGANIC_PILOT_ARGUMENT = "--nexa-renderer-organic-pilot-verified" as const;
 
@@ -240,6 +243,17 @@ export interface WeatherDesktopApi {
   getCurrent(location: string): Promise<WeatherCurrentStatus>;
 }
 
+export interface MasterVolumeStatus {
+  available: boolean;
+  volume: number | null;
+  errorCode: "device_unavailable" | "access_denied" | "operation_failed" | null;
+}
+export interface MasterVolumeDesktopApi {
+  get(): Promise<MasterVolumeStatus>;
+  set(value: number): Promise<MasterVolumeStatus>;
+  onChanged(listener: (status: MasterVolumeStatus) => void): () => void;
+}
+
 export type VoicePttEventType =
   | "voice.session.started"
   | "voice.transcribing"
@@ -407,6 +421,7 @@ export interface NexaDesktopApi {
   memory: DesktopMemoryApi;
   authorization: AuthorizationDesktopApi;
   spotify: SpotifyDesktopApi;
+  masterVolume: MasterVolumeDesktopApi;
   weather: WeatherDesktopApi;
 }
 

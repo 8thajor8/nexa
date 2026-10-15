@@ -55,6 +55,28 @@ async function mountApp() {
   return view;
 }
 
+function controlAnimationFrames() {
+  let nextId = 0;
+  const pending = new Map<number, FrameRequestCallback>();
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    const id = ++nextId;
+    pending.set(id, callback);
+    return id;
+  });
+  vi.stubGlobal("cancelAnimationFrame", (id: number) => { pending.delete(id); });
+  return () => {
+    const callbacks = [...pending.values()];
+    pending.clear();
+    act(() => { callbacks.forEach((callback) => callback(0)); });
+  };
+}
+
+function finishTransition(element: Element, propertyName: string) {
+  const event = new Event("transitionend", { bubbles: true });
+  Object.defineProperty(event, "propertyName", { value: propertyName });
+  fireEvent(element, event);
+}
+
 function setScrollMetrics(element: HTMLElement, values: { scrollHeight: number; clientHeight: number; scrollTop: number }) {
   let scrollTop = values.scrollTop;
   Object.defineProperties(element, {
@@ -89,6 +111,11 @@ beforeEach(async () => {
         controlsEnabled: false, track: null, message: null, updatedAt: Date.now() })),
       onLiveStatus: vi.fn(() => () => undefined),
     } as unknown as NexaDesktopApi["spotify"],
+    masterVolume: {
+      get: vi.fn(async () => ({ available: true, volume: 42, errorCode: null })),
+      set: vi.fn(async (volume: number) => ({ available: true, volume, errorCode: null })),
+      onChanged: vi.fn(() => () => undefined),
+    },
     minimizeWindow: vi.fn(),
     toggleMaximizeWindow: vi.fn(async () => false),
     closeWindow: vi.fn(),
@@ -127,6 +154,8 @@ beforeEach(async () => {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
   if (previousBridge) Object.defineProperty(window, "nexaDesktop", previousBridge);
   else Reflect.deleteProperty(window, "nexaDesktop");
 });
@@ -139,6 +168,7 @@ describe("App PTT DOM integration", () => {
     expect(bridge.chat.createConversation).not.toHaveBeenCalled();
     expect(bridge.weather.getCurrent).not.toHaveBeenCalled();
     expect(bridge.spotify.getLiveStatus).not.toHaveBeenCalled();
+    expect(bridge.masterVolume.get).not.toHaveBeenCalled();
   });
 
   it("retains automatic Chat, Weather and Spotify initialization in normal mode", async () => {
@@ -147,6 +177,157 @@ describe("App PTT DOM integration", () => {
     expect(bridge.chat.createConversation).toHaveBeenCalled();
     expect(bridge.weather.getCurrent).toHaveBeenCalled();
     expect(bridge.spotify.getLiveStatus).toHaveBeenCalled();
+    expect(bridge.masterVolume.get).toHaveBeenCalled();
+  });
+
+  it("moves side panels before expansion and contracts before their return", async () => {
+    const advanceFrame = controlAnimationFrames();
+    await mountApp();
+    const shell = document.querySelector(".app-shell")!;
+    const workspace = document.querySelector(".workspace-grid")!;
+    const workspaceShell = document.querySelector(".workspace-shell")!;
+    const chat = document.querySelector(".conversation-panel")!;
+    const presence = document.querySelector(".presence-panel")!;
+    const modules = document.querySelector(".dashboard-modules")!;
+    const history = document.querySelector(".conversations-history")!;
+
+    fireEvent.click(screen.getByRole("button", { name: "Conversations" }));
+    expect(shell.getAttribute("data-workspace-phase")).toBe("preparing-exit");
+    expect(workspace.classList.contains("workspace-grid--conversations")).toBe(false);
+    advanceFrame();
+    advanceFrame();
+    expect(shell.getAttribute("data-workspace-phase")).toBe("exiting");
+    expect(presence.classList.contains("presence-panel--offscreen")).toBe(true);
+    expect(modules.classList.contains("dashboard-modules--hidden")).toBe(true);
+    expect(shell.classList.contains("app-shell--workspace-expanded")).toBe(false);
+    finishTransition(presence, "transform");
+    expect(shell.getAttribute("data-workspace-phase")).toBe("exiting");
+    finishTransition(modules, "transform");
+    expect(shell.getAttribute("data-workspace-phase")).toBe("expanding");
+    expect(workspace.classList.contains("workspace-grid--conversations")).toBe(true);
+    expect(shell.classList.contains("app-shell--workspace-expanded")).toBe(true);
+    expect(presence.getAttribute("aria-hidden")).toBe("true");
+    expect(presence.hasAttribute("inert")).toBe(true);
+    expect(modules.getAttribute("aria-hidden")).toBe("true");
+    expect(modules.hasAttribute("inert")).toBe(true);
+    expect(history.getAttribute("aria-hidden")).toBe("false");
+    expect(history.hasAttribute("inert")).toBe(false);
+    finishTransition(workspaceShell, "height");
+    expect(shell.getAttribute("data-workspace-phase")).toBe("expanding");
+    finishTransition(workspace, "grid-template-columns");
+    expect(shell.getAttribute("data-workspace-phase")).toBe("conversations");
+
+    fireEvent.click(screen.getByRole("button", { name: "Command Center" }));
+    expect(shell.getAttribute("data-workspace-phase")).toBe("contracting");
+    expect(shell.classList.contains("app-shell--workspace-expanded")).toBe(false);
+    expect(workspace.classList.contains("workspace-grid--conversations")).toBe(true);
+    expect(presence.classList.contains("presence-panel--offscreen")).toBe(true);
+    finishTransition(workspaceShell, "height");
+    expect(shell.getAttribute("data-workspace-phase")).toBe("preparing-entry");
+    expect(workspace.classList.contains("workspace-grid--conversations")).toBe(true);
+    expect(history.getAttribute("aria-hidden")).toBe("false");
+    expect(presence.classList.contains("presence-panel--offscreen")).toBe(true);
+    advanceFrame();
+    advanceFrame();
+    expect(shell.getAttribute("data-workspace-phase")).toBe("entering");
+    expect(workspace.classList.contains("workspace-grid--conversations")).toBe(false);
+    expect(presence.classList.contains("presence-panel--offscreen")).toBe(false);
+    finishTransition(modules, "transform");
+    expect(shell.getAttribute("data-workspace-phase")).toBe("command");
+    expect(document.querySelector(".conversation-panel")).toBe(chat);
+    expect(document.querySelector(".presence-panel")).toBe(presence);
+    expect(document.querySelector(".dashboard-modules")).toBe(modules);
+    expect(document.querySelector(".conversations-history")).toBe(history);
+    expect(presence.getAttribute("aria-hidden")).toBe("false");
+    expect(presence.hasAttribute("inert")).toBe(false);
+    expect(modules.getAttribute("aria-hidden")).toBe("false");
+    expect(modules.hasAttribute("inert")).toBe(false);
+    expect(history.getAttribute("aria-hidden")).toBe("true");
+    expect(history.hasAttribute("inert")).toBe(true);
+  });
+
+  it("renders and debounces the system master-volume slider", async () => {
+    await mountApp();
+    const slider = screen.getByRole("slider", { name: "Volumen general de Windows" });
+    await waitFor(() => expect((slider as HTMLInputElement).value).toBe("42"));
+    expect((slider as HTMLInputElement).value).toBe("42");
+    expect(screen.getByText("42%")).toBeTruthy();
+    fireEvent.change(slider, { target: { value: "56" } });
+    fireEvent.change(slider, { target: { value: "63" } });
+    await act(async () => { await new Promise((resolve) => window.setTimeout(resolve, 220)); });
+    expect(bridge.masterVolume.set).toHaveBeenCalledTimes(1);
+    expect(bridge.masterVolume.set).toHaveBeenCalledWith(63);
+  });
+
+  it("reverses interrupted workspace transitions without leaving panels hidden", async () => {
+    const advanceFrame = controlAnimationFrames();
+    await mountApp();
+    const shell = document.querySelector(".app-shell")!;
+    const workspaceShell = document.querySelector(".workspace-shell")!;
+    const modules = document.querySelector(".dashboard-modules")!;
+    const presence = document.querySelector(".presence-panel")!;
+
+    fireEvent.click(screen.getByRole("button", { name: "Conversations" }));
+    advanceFrame();
+    advanceFrame();
+    expect(shell.getAttribute("data-workspace-phase")).toBe("exiting");
+    fireEvent.click(screen.getByRole("button", { name: "Command Center" }));
+    expect(shell.getAttribute("data-workspace-phase")).toBe("entering");
+    fireEvent.click(screen.getByRole("button", { name: "Conversations" }));
+    expect(shell.getAttribute("data-workspace-phase")).toBe("exiting");
+    finishTransition(modules, "transform");
+    expect(shell.getAttribute("data-workspace-phase")).toBe("expanding");
+    fireEvent.click(screen.getByRole("button", { name: "Command Center" }));
+    expect(shell.getAttribute("data-workspace-phase")).toBe("contracting");
+    finishTransition(workspaceShell, "height");
+    advanceFrame();
+    advanceFrame();
+    finishTransition(modules, "transform");
+    expect(shell.getAttribute("data-workspace-phase")).toBe("command");
+    expect(presence.getAttribute("aria-hidden")).toBe("false");
+    expect(modules.getAttribute("aria-hidden")).toBe("false");
+  });
+
+  it("switches views directly when reduced motion is requested", async () => {
+    vi.stubGlobal("matchMedia", () => ({ matches: true }));
+    await mountApp();
+    const shell = document.querySelector(".app-shell")!;
+    fireEvent.click(screen.getByRole("button", { name: "Conversations" }));
+    expect(shell.getAttribute("data-workspace-phase")).toBe("conversations");
+    fireEvent.click(screen.getByRole("button", { name: "Command Center" }));
+    expect(shell.getAttribute("data-workspace-phase")).toBe("command");
+  });
+
+  it("settles an active transition when reduced motion is enabled", async () => {
+    let onChange: (() => void) | undefined;
+    const preference = { matches: false, addEventListener: vi.fn((_event: string, listener: () => void) => { onChange = listener; }),
+      removeEventListener: vi.fn() };
+    vi.stubGlobal("matchMedia", () => preference);
+    const advanceFrame = controlAnimationFrames();
+    await mountApp();
+    const shell = document.querySelector(".app-shell")!;
+    fireEvent.click(screen.getByRole("button", { name: "Conversations" }));
+    advanceFrame();
+    advanceFrame();
+    expect(shell.getAttribute("data-workspace-phase")).toBe("exiting");
+    preference.matches = true;
+    act(() => { onChange?.(); });
+    expect(shell.getAttribute("data-workspace-phase")).toBe("conversations");
+  });
+
+  it("finishes a workspace transition if the browser omits transitionend", async () => {
+    const advanceFrame = controlAnimationFrames();
+    await mountApp();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const shell = document.querySelector(".app-shell")!;
+    fireEvent.click(screen.getByRole("button", { name: "Conversations" }));
+    advanceFrame();
+    advanceFrame();
+    expect(shell.getAttribute("data-workspace-phase")).toBe("exiting");
+    act(() => { vi.advanceTimersByTime(2_000); });
+    expect(shell.getAttribute("data-workspace-phase")).toBe("expanding");
+    act(() => { vi.advanceTimersByTime(2_000); });
+    expect(shell.getAttribute("data-workspace-phase")).toBe("conversations");
   });
 
   it("keeps the chat event listener stable while Main initializes the conversation", async () => {

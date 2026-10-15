@@ -1,6 +1,7 @@
 import { availableToolsMock, recentActivityMock, systemStatusMock } from "../data/dashboard-mock";
 import { HolographicFrame } from "./HolographicFrame";
-import type { SpotifyLiveStatus, SpotifyPlaybackControl } from "../../shared/ipc-contract";
+import type { CSSProperties } from "react";
+import type { MasterVolumeStatus, SpotifyLiveStatus, SpotifyPlaybackControl } from "../../shared/ipc-contract";
 
 function ActivityGlyph({ icon }: { icon: (typeof recentActivityMock)[number]["icon"] }) {
   if (icon === "window") return <svg viewBox="0 0 20 20"><rect x="3" y="4" width="14" height="12" rx="1.5" /><path d="M3 7h14" /></svg>;
@@ -22,6 +23,8 @@ interface DashboardModulesProps {
   spotifyStatus?: SpotifyLiveStatus;
   spotifyBusyAction?: SpotifyPlaybackControl | null;
   spotifyError?: string | null;
+  masterVolume?: MasterVolumeStatus;
+  onMasterVolumeChange?: (value: number) => void;
   onSpotifyControl?: (action: SpotifyPlaybackControl) => void;
   onOpenSpotifyTrack?: (url: string) => void;
   voiceRepliesEnabled?: boolean;
@@ -68,6 +71,7 @@ function SpotifyMiniPlayer({ status, busyAction, error, onControl, onOpenTrack }
 }
 
 export function DashboardModules({ assistantState, spotifyStatus, spotifyBusyAction = null, spotifyError = null,
+  masterVolume = { available: false, volume: null, errorCode: "device_unavailable" }, onMasterVolumeChange,
   onSpotifyControl, onOpenSpotifyTrack, voiceRepliesEnabled = false, onVoiceRepliesChange, className = "", isHidden = false }: DashboardModulesProps) {
   return (
     <section className={`dashboard-modules${className ? ` ${className}` : ""}`} aria-label="Módulos del Command Center"
@@ -115,23 +119,39 @@ export function DashboardModules({ assistantState, spotifyStatus, spotifyBusyAct
       <section className="dashboard-module dashboard-module--system surface-panel" aria-labelledby="system-title">
         <HolographicFrame />
         <ModuleHeading id="system-title" title="Estado del sistema" label="SPOTIFY" />
-        {spotifyStatus && <SpotifyMiniPlayer status={spotifyStatus} busyAction={spotifyBusyAction} error={spotifyError}
-          onControl={onSpotifyControl} onOpenTrack={onOpenSpotifyTrack} />}
-        <ul className="system-list" aria-label="Otros indicadores del sistema">
-          {systemStatusMock.map((item) => {
-            const isAssistant = item.valueKind === "assistant";
-            const value = isAssistant ? assistantState : item.value;
-            const state = isAssistant ? "simulated" : item.state;
-            return (
-              <li className="system-item" key={item.id}>
-                <span className={`system-indicator system-indicator--${state}`} aria-hidden="true" />
-                <span>{item.label}</span>
-                <strong>{value}</strong>
-              </li>
-            );
-          })}
-        </ul>
-        <p className="system-disclaimer">Los demás indicadores son demostrativos.</p>
+        <div className="system-module-content" aria-label="Contenido de estado del sistema" tabIndex={0}>
+          {spotifyStatus && <SpotifyMiniPlayer status={spotifyStatus} busyAction={spotifyBusyAction} error={spotifyError}
+            onControl={onSpotifyControl} onOpenTrack={onOpenSpotifyTrack} />}
+          <div className="master-volume-control">
+            <label htmlFor="master-volume-slider"><span>Volumen de Windows</span>
+              <strong>{masterVolume.available ? `${masterVolume.volume}%` : "No disponible"}</strong></label>
+            <input id="master-volume-slider" type="range" min={0} max={100} step={1}
+              value={masterVolume.volume ?? 0} disabled={!masterVolume.available}
+              style={{ "--volume-progress": `${masterVolume.volume ?? 0}%` } as CSSProperties}
+              aria-label="Volumen general de Windows" aria-valuetext={masterVolume.available ? `${masterVolume.volume}%` : "No disponible"}
+              onChange={(event) => onMasterVolumeChange?.(Number(event.currentTarget.value))} />
+            {!masterVolume.available && <small className="master-volume-control__error">
+              {masterVolume.errorCode === "access_denied" ? "No se pudo acceder al control de audio."
+                : masterVolume.errorCode === "operation_failed" ? "No se pudo consultar o ajustar el audio."
+                  : "Dispositivo de salida no disponible."}
+            </small>}
+          </div>
+          <ul className="system-list" aria-label="Otros indicadores del sistema">
+            {systemStatusMock.map((item) => {
+              const isAssistant = item.valueKind === "assistant";
+              const value = isAssistant ? assistantState : item.value;
+              const state = isAssistant ? "simulated" : item.state;
+              return (
+                <li className="system-item" key={item.id}>
+                  <span className={`system-indicator system-indicator--${state}`} aria-hidden="true" />
+                  <span>{item.label}</span>
+                  <strong>{value}</strong>
+                </li>
+              );
+            })}
+          </ul>
+          <p className="system-disclaimer">Los demás indicadores son demostrativos.</p>
+        </div>
       </section>
     </section>
   );

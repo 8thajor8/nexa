@@ -61,6 +61,20 @@ describe("chat preload allowlist", () => {
     expect(mocks.invoke).not.toHaveBeenCalled();
   });
 
+  it("exposes validated master-volume requests through the dedicated IPC channels", async () => {
+    const api = await loadPreload();
+    const volume = api.masterVolume as { get(): Promise<unknown>; set(value: number): Promise<unknown> };
+    const status = { available: true, volume: 40, errorCode: null };
+    mocks.invoke.mockResolvedValueOnce(status);
+    await expect(volume.get()).resolves.toEqual(status);
+    expect(mocks.invoke).toHaveBeenLastCalledWith("audio:master-volume:get");
+    mocks.invoke.mockResolvedValueOnce(status);
+    await expect(volume.set(40)).resolves.toEqual(status);
+    expect(mocks.invoke).toHaveBeenLastCalledWith("audio:master-volume:set", 40);
+    mocks.invoke.mockResolvedValueOnce({ available: true, volume: 140, errorCode: null });
+    await expect(volume.get()).rejects.toThrow("invalid_master_volume_status");
+  });
+
   it("exposes only narrow chat operations and uses fixed correlated channels", async () => {
     const api = await loadPreload();
     expect(api.isIsolated).toBe(false);

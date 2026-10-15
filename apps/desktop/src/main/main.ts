@@ -57,6 +57,7 @@ import type { WindowPreferences } from "../shared/ipc-contract.js";
 import { registerWeatherIpcHandler, removeWeatherIpcHandler } from "./weather-ipc.js";
 import { registerAuthorizationIpcHandlers, removeAuthorizationIpcHandlers } from "./authorization-ipc.js";
 import { registerSpotifyLiveStatusHandlers, removeSpotifyLiveStatusHandlers, SpotifyLiveStatusService } from "./spotify-live-status.js";
+import { registerMasterVolumeIpcHandlers, removeMasterVolumeIpcHandlers } from "./master-volume-ipc.js";
 import { beginChatRuntimeSwitch, cleanupChatWindow, endChatRuntimeSwitch, refreshChatRuntimeAfterSwitch,
   registerChatIpcHandlers, removeChatIpcHandlers, type ConversationRuntimeApi } from "./chat-ipc.js";
 import { isApprovedSyntheticStore, isReadableMemory2Store, registerMemoryModeIpcHandlers } from "./memory-mode-ipc.js";
@@ -488,7 +489,7 @@ async function updateWindowPreferences(preferences: WindowPreferences) {
 }
 
 function writeSafeTrace(area: string, event: string, details: Record<string, unknown>): void {
-  const safeFields = ["conversationId", "requestId", "source", "status", "origin", "durationMs", "errorName", "errorCode", "moduleVersion",
+  const safeFields = ["conversationId", "requestId", "source", "status", "origin", "durationMs", "errorName", "errorCode", "errorKind", "moduleVersion",
     "iteration", "finalOnly", "type", "toolCallCount", "tool", "success", "code", "permission", "allowed",
     "reason", "target", "initiator", "appQuery", "resolution", "isInPlace", "mainFrame", "prevented",
     "httpStatus", "outcome", "stage", "reconciliation", "bodyKind", "bodyLength", "contentType",
@@ -498,7 +499,7 @@ function writeSafeTrace(area: string, event: string, details: Record<string, unk
     "targetDisplayId", "actualDisplayId", "beforeX", "beforeY", "beforeWidth", "beforeHeight", "requestedX",
     "requestedY", "requestedWidth", "requestedHeight", "finalX", "finalY", "finalWidth", "finalHeight",
     "requestedFullscreen", "actualFullscreen", "initialFullscreen", "actualMaximized", "initialMaximized", "maximized",
-    "persistedFullscreen", "transitioning", "success", "targetScaleFactor", "sourceScaleFactor", "boundsMatch", "dpiAdjusted", "placementSuccess",
+    "persistedFullscreen", "transitioning", "success", "targetScaleFactor", "sourceScaleFactor", "boundsMatch", "dpiAdjusted", "placementSuccess", "registered", "available",
     "operationId", "phase", "eventName", "command", "initialDisplayId", "requestedDisplayId", "persistedDisplayId",
     "transitionTargetDisplayId", "transitionTargetFullscreen", "currentX", "currentY", "currentWidth", "currentHeight",
     "initialX", "initialY", "initialWidth", "initialHeight", "targetX", "targetY", "targetWidth", "targetHeight",
@@ -668,6 +669,8 @@ function installWebContentsGuards(): void {
     session.defaultSession.setPermissionCheckHandler(() => false);
   }
   writeSafeTrace("desktop", "module_loaded", { moduleVersion: desktopModuleVersion });
+  writeSafeTrace("audio", "master_volume_startup", { stage: desktopIsolation ? "isolated" : "normal",
+    registered: startupPolicy.registerExternalServices });
   Menu.setApplicationMenu(null);
   installWebContentsGuards();
   registerIpcHandlers(
@@ -678,6 +681,10 @@ function installWebContentsGuards(): void {
     () => desktopRestart.request(),
   );
   if (startupPolicy.registerExternalServices) {
+    registerMasterVolumeIpcHandlers(() => mainWindow, {
+      onDiagnostic: (details) => writeSafeTrace("audio", "master_volume_operation_error", details),
+      onTrace: (details) => writeSafeTrace("audio", details.outcome === "failed" ? "master_volume_ipc_error" : "master_volume_diagnostic", details),
+    });
     registerWeatherIpcHandler(() => mainWindow);
     ipcMain.handle(SPOTIFY_OPEN_TRACK_CHANNEL, async (event, value: unknown) => {
       if (!mainWindow || !isTrustedIpcSender(event as never, mainWindow as never)) throw new Error("untrusted_ipc_sender");
@@ -907,6 +914,7 @@ app.on("before-quit", (event) => {
   ipcMain.removeHandler(MEMORY_MODE_SET_CHANNEL);
   removeAuthorizationIpcHandlers();
   removeSpotifyLiveStatusHandlers();
+  removeMasterVolumeIpcHandlers();
   removeVoiceIpcHandlers();
   if (!desktopSpeechServiceClosed) {
     event.preventDefault();

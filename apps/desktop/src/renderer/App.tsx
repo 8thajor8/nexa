@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import type { TransitionEvent } from "react";
 import type { AuthorizationProvider, ChatAuthorizationRequirement, ChatConversationListCursor, ChatConversationSummary,
   ChatEventEnvelope, ChatIpcErrorCode, ChatMessageCursor, DesktopMemoryMode,
-  DesktopMemoryModeResult, SpotifyLiveStatus, SpotifyPlaybackControl, SpotifyNowPlayingCard, VoiceSpeechErrorCode,
+  DesktopMemoryModeResult, MasterVolumeStatus, SpotifyLiveStatus, SpotifyPlaybackControl, SpotifyNowPlayingCard, VoiceSpeechErrorCode,
   VoiceSpeechEvent, VoiceChatTimingOrigin, VoiceChatTimingPhase, WeatherCurrentStatus } from "../shared/ipc-contract";
 import { ASSISTANT_STATE_LABELS, createMockAssistantStateProvider } from "../shared/assistant-state";
 import { loadDesktopPreferences, saveDesktopPreferences, type DesktopPreferences } from "./desktop-preferences";
@@ -19,6 +20,19 @@ import { welcomeGreeting } from "./conversation-welcome";
 import type { MicrophoneDeviceStore } from "./audio/microphone-device-store";
 
 interface AppProps { voiceController: PttVoiceControllerPort; microphoneDevices: MicrophoneDeviceStore; }
+
+type WorkspacePhase = "command" | "preparing-exit" | "exiting" | "expanding" | "conversations"
+  | "contracting" | "preparing-entry" | "entering";
+
+function nextWorkspacePhase(phase: WorkspacePhase): WorkspacePhase {
+  switch (phase) {
+    case "exiting": return "expanding";
+    case "expanding": return "conversations";
+    case "contracting": return "preparing-entry";
+    case "entering": return "command";
+    default: return phase;
+  }
+}
 
 const MAX_CHAT_HISTORY = 100;
 const VOICE_ACKNOWLEDGEMENT_DELAY_MS = 1_500;
@@ -78,6 +92,83 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const [preferences, setPreferences] = useState<DesktopPreferences>(() => loadDesktopPreferences());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [activeView, setActiveView] = useState<"command" | "conversations">("command");
+  const [workspacePhase, setWorkspacePhase] = useState<WorkspacePhase>("command");
+  const conversationLayout = ["expanding", "conversations", "contracting", "preparing-entry"].includes(workspacePhase);
+  const workspaceExpanded = ["expanding", "conversations"].includes(workspacePhase);
+  const sidePanelsOffscreen = ["exiting", "expanding", "conversations", "contracting", "preparing-entry"].includes(workspacePhase);
+  const sidePanelsMoving = ["preparing-exit", "exiting", "preparing-entry", "entering"].includes(workspacePhase);
+
+  const navigateWorkspace = useCallback((view: "command" | "conversations") => {
+    setActiveView(view);
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      setWorkspacePhase(view);
+      return;
+    }
+    setWorkspacePhase((phase) => {
+      if (view === "conversations") {
+        if (phase === "command") return "preparing-exit";
+        if (phase === "entering") return "exiting";
+        if (phase === "preparing-entry") return "expanding";
+        if (phase === "contracting") return "expanding";
+      } else {
+        if (phase === "conversations" || phase === "expanding") return "contracting";
+        if (phase === "exiting" || phase === "entering" || phase === "preparing-entry") return "entering";
+        if (phase === "preparing-exit") return "command";
+      }
+      return phase;
+    });
+  }, []);
+
+  useEffect(() => {
+    const preference = window.matchMedia?.("(prefers-reduced-motion: reduce)");
+    if (!preference?.addEventListener) return;
+    const settle = () => { if (preference.matches) setWorkspacePhase(activeView); };
+    preference.addEventListener("change", settle);
+    return () => preference.removeEventListener("change", settle);
+  }, [activeView]);
+
+  useEffect(() => {
+    if (workspacePhase !== "preparing-exit" && workspacePhase !== "preparing-entry") return;
+    // Give the compositor a painted frame with stable geometry before moving either side panel.
+    let secondFrame = 0;
+    const firstFrame = window.requestAnimationFrame(() => {
+      secondFrame = window.requestAnimationFrame(() => {
+        setWorkspacePhase((phase) => phase === "preparing-exit" ? "exiting"
+          : phase === "preparing-entry" ? "entering" : phase);
+      });
+    });
+    return () => { window.cancelAnimationFrame(firstFrame); window.cancelAnimationFrame(secondFrame); };
+  }, [workspacePhase]);
+
+  useEffect(() => {
+    if (!["exiting", "expanding", "contracting", "entering"].includes(workspacePhase)) return;
+    // Transitionend can be skipped by resize, hidden windows, or interrupted CSS transitions.
+    const watchdog = window.setTimeout(() => setWorkspacePhase(nextWorkspacePhase), 2_000);
+    return () => window.clearTimeout(watchdog);
+  }, [workspacePhase]);
+
+  const workspaceTransitionProperties = useRef(new Set<string>());
+  useEffect(() => { workspaceTransitionProperties.current.clear(); }, [workspacePhase]);
+  const onWorkspaceTransitionEnd = useCallback((event: TransitionEvent<HTMLDivElement>) => {
+    if (workspacePhase === "exiting" || workspacePhase === "entering") {
+      if (event.propertyName !== "transform" || !(event.target instanceof Element)
+        || !event.target.classList.contains("dashboard-modules")) return;
+    } else if (workspacePhase === "expanding" || workspacePhase === "contracting") {
+      if (!(event.target instanceof Element)) return;
+      const isHeight = event.propertyName === "height" && event.target.classList.contains("workspace-shell");
+      const isGridTrack = workspacePhase === "expanding"
+        && (event.propertyName === "grid-template-columns" || event.propertyName === "grid-template-rows")
+        && event.target.classList.contains("workspace-grid");
+      if (!isHeight && !isGridTrack) return;
+      workspaceTransitionProperties.current.add(isHeight ? "height" : event.propertyName);
+      const requiredTracks = workspacePhase === "contracting" ? []
+        : window.matchMedia?.("(max-width: 760px)").matches
+          ? ["grid-template-columns", "grid-template-rows"] : ["grid-template-columns"];
+      if (!workspaceTransitionProperties.current.has("height")
+        || !requiredTracks.every((property) => workspaceTransitionProperties.current.has(property))) return;
+    } else return;
+    setWorkspacePhase(nextWorkspacePhase);
+  }, [workspacePhase]);
   const stateProvider = useMemo(() => createMockAssistantStateProvider(), []);
   const assistantState = useSyncExternalStore(
     stateProvider.subscribe, stateProvider.getSnapshot, stateProvider.getSnapshot,
@@ -107,6 +198,9 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   });
   const [spotifyControlBusy, setSpotifyControlBusy] = useState<SpotifyPlaybackControl | null>(null);
   const [spotifyControlError, setSpotifyControlError] = useState<string | null>(null);
+  const [masterVolume, setMasterVolume] = useState<MasterVolumeStatus>({ available: false, volume: null, errorCode: "device_unavailable" });
+  const masterVolumeTimer = useRef<number | null>(null);
+  const pendingMasterVolume = useRef<number | null>(null);
   const [chatConversationId, setChatConversationId] = useState<string | null>(null);
   const [activeConversationEmpty, setActiveConversationEmpty] = useState(false);
   const [welcomeMessage] = useState(() => welcomeGreeting(new Date()));
@@ -865,6 +959,39 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     return () => { mounted = false; unsubscribe(); };
   }, [isIsolated]);
 
+  useEffect(() => {
+    if (isIsolated) return;
+    const api = window.nexaDesktop?.masterVolume;
+    if (!api) return;
+    let mounted = true;
+    const unsubscribe = api.onChanged((status) => {
+      if (mounted && pendingMasterVolume.current === null) setMasterVolume(status);
+    });
+    void api.get().then((status) => { if (mounted) setMasterVolume(status); }).catch(() => {
+      if (mounted) setMasterVolume({ available: false, volume: null, errorCode: "operation_failed" });
+    });
+    return () => { mounted = false; unsubscribe(); };
+  }, [isIsolated]);
+
+  const updateMasterVolume = useCallback((value: number) => {
+    pendingMasterVolume.current = value;
+    setMasterVolume((current) => current.available ? { ...current, volume: value } : current);
+    if (masterVolumeTimer.current !== null) window.clearTimeout(masterVolumeTimer.current);
+    masterVolumeTimer.current = window.setTimeout(() => {
+      masterVolumeTimer.current = null;
+      const target = pendingMasterVolume.current;
+      pendingMasterVolume.current = null;
+      if (target === null) return;
+      void window.nexaDesktop.masterVolume.set(target).then(setMasterVolume).catch(() => {
+        setMasterVolume({ available: false, volume: null, errorCode: "operation_failed" });
+      });
+    }, 180);
+  }, []);
+
+  useEffect(() => () => {
+    if (masterVolumeTimer.current !== null) window.clearTimeout(masterVolumeTimer.current);
+  }, []);
+
   async function controlSpotify(action: SpotifyPlaybackControl) {
     if (spotifyControlBusy) return;
     setSpotifyControlBusy(action);
@@ -1001,21 +1128,22 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   }, []);
 
   return (
-    <div className={`app-shell${wallpaperEnabled && wallpaperDataUrl ? " app-shell--wallpaper" : ""}${activeView === "conversations" ? " app-shell--conversations" : ""}`}>
+    <div onTransitionEnd={onWorkspaceTransitionEnd} data-workspace-phase={workspacePhase}
+      className={`app-shell${wallpaperEnabled && wallpaperDataUrl ? " app-shell--wallpaper" : ""}${workspaceExpanded ? " app-shell--workspace-expanded" : ""}${sidePanelsMoving ? " app-shell--side-motion" : ""}${workspacePhase === "entering" ? " app-shell--entering" : ""}`}>
       {wallpaperEnabled && wallpaperDataUrl && (
         <img className="wallpaper-background" src={wallpaperDataUrl} alt="" aria-hidden="true" />
       )}
       <WindowChrome />
-      <Sidebar activeView={activeView} onOpenCommandCenter={() => setActiveView("command")}
-        onOpenConversations={() => setActiveView("conversations")}
+      <Sidebar activeView={activeView} onOpenCommandCenter={() => navigateWorkspace("command")}
+        onOpenConversations={() => navigateWorkspace("conversations")}
         onOpenSettings={() => setSettingsOpen(true)} showSettings={!isSyntheticOrganicPilot} showConversations={!isIsolated} />
       <main className="workspace-shell">
         {isSyntheticOrganicPilot && <div className="synthetic-pilot-banner" role="status">PILOTO SINTÉTICO — SIN DATOS PERSONALES</div>}
         <CommandHeader preferences={preferences} weather={weatherStatus} weatherLoading={weatherLoading} />
 
-        <div className={`workspace-grid${activeView === "conversations" ? " workspace-grid--conversations" : ""}`}>
+        <div className={`workspace-grid${conversationLayout ? " workspace-grid--conversations" : ""}`}>
           <ConversationsPanel conversations={conversationItems} activeConversationId={chatConversationId}
-            isVisible={activeView === "conversations"}
+            isVisible={conversationLayout}
             busy={conversationOpening || conversationListLoading || activeChatRequest.current !== null} loading={conversationListLoading}
             hasMore={conversationListCursor !== null} error={conversationListError}
             onNew={() => { void createNewConversation(); }}
@@ -1032,7 +1160,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
             chatNotice={chatNotice}
             chatBusy={chatConversationId === null || activeChatRequest.current !== null || conversationOpening}
             welcomeMessage={activeConversationEmpty ? welcomeMessage : null}
-            showVoiceRepliesToggle={activeView === "conversations"} voiceRepliesEnabled={preferences.voiceRepliesEnabled}
+            showVoiceRepliesToggle={conversationLayout} voiceRepliesEnabled={preferences.voiceRepliesEnabled}
             onVoiceRepliesChange={changeVoiceReplies}
             hasOlderMessages={olderMessagesCursor !== null}
             olderMessagesLoading={olderMessagesLoading}
@@ -1056,15 +1184,16 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
               || (voiceSnapshot.status === "error" && !voiceSnapshot.canStart && Boolean(voiceSnapshot.sessionId))}
             cancellationPending={cancellationPending}
           />
-          <PresencePanel className={activeView === "conversations" ? "presence-panel--offscreen" : ""}
-            isHidden={activeView === "conversations"}
+          <PresencePanel className={sidePanelsOffscreen ? "presence-panel--offscreen" : ""}
+            isHidden={workspacePhase !== "command"}
             status={voiceSnapshot.status} statusLabel={VOICE_STATUS_LABELS[voiceSnapshot.status]} />
         </div>
 
       </main>
-      <DashboardModules className={activeView === "conversations" ? "dashboard-modules--hidden" : ""} isHidden={activeView === "conversations"}
+      <DashboardModules className={sidePanelsOffscreen ? "dashboard-modules--hidden" : ""} isHidden={workspacePhase !== "command"}
         assistantState={ASSISTANT_STATE_LABELS[assistantState]} spotifyStatus={spotifyLiveStatus}
         spotifyBusyAction={spotifyControlBusy} spotifyError={spotifyControlError}
+        masterVolume={masterVolume} onMasterVolumeChange={updateMasterVolume}
         voiceRepliesEnabled={preferences.voiceRepliesEnabled} onVoiceRepliesChange={changeVoiceReplies}
         onSpotifyControl={(action) => { void controlSpotify(action); }} onOpenSpotifyTrack={(url) => { void openSpotifyTrack(url); }} />
       {settingsOpen && <SettingsModal preferences={preferences} onPreferencesChange={updatePreferences}

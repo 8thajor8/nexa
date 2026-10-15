@@ -44,6 +44,9 @@ import {
   VOICE_PTT_FINISH_CHANNEL,
   VOICE_PTT_START_CHANNEL,
   WEATHER_CURRENT_CHANNEL,
+  MASTER_VOLUME_GET_CHANNEL,
+  MASTER_VOLUME_SET_CHANNEL,
+  MASTER_VOLUME_EVENT_CHANNEL,
   DESKTOP_RENDERER_ISOLATION_ARGUMENT,
   DESKTOP_RENDERER_ORGANIC_PILOT_ARGUMENT,
   type NexaDesktopApi,
@@ -54,6 +57,7 @@ import {
 } from "./shared/authorization-ipc-validation";
 import { canonicalSpotifyTrackUrl } from "./shared/spotify-link-validation";
 import { isWeatherCurrentStatus, isWeatherLocation } from "./shared/weather-ipc-validation";
+import { isMasterVolumePercent, isMasterVolumeStatus } from "./shared/master-volume-ipc-validation";
 import { isWindowPreferences, isWindowSettingsSnapshot } from "./shared/window-settings-validation";
 import {
   isVoiceEventEnvelope,
@@ -374,6 +378,32 @@ const api: NexaDesktopApi = {
       const response: unknown = await ipcRenderer.invoke(WEATHER_CURRENT_CHANNEL, location.trim());
       if (!isWeatherCurrentStatus(response)) throw new Error("invalid_weather_status_response");
       return response;
+    },
+  },
+  masterVolume: {
+    async get() {
+      const response: unknown = await ipcRenderer.invoke(MASTER_VOLUME_GET_CHANNEL);
+      if (!isMasterVolumeStatus(response)) throw new Error("invalid_master_volume_status");
+      return response;
+    },
+    async set(value) {
+      if (!isMasterVolumePercent(value)) throw new Error("invalid_master_volume_value");
+      const response: unknown = await ipcRenderer.invoke(MASTER_VOLUME_SET_CHANNEL, value);
+      if (!isMasterVolumeStatus(response)) throw new Error("invalid_master_volume_response");
+      return response;
+    },
+    onChanged(listener) {
+      if (typeof listener !== "function") throw new TypeError("master_volume_listener_required");
+      const wrappedListener = (_event: Electron.IpcRendererEvent, payload: unknown) => {
+        if (isMasterVolumeStatus(payload)) listener(payload);
+      };
+      ipcRenderer.on(MASTER_VOLUME_EVENT_CHANNEL, wrappedListener);
+      let subscribed = true;
+      return () => {
+        if (!subscribed) return;
+        subscribed = false;
+        ipcRenderer.removeListener(MASTER_VOLUME_EVENT_CHANNEL, wrappedListener);
+      };
     },
   },
 };
