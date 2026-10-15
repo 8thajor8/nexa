@@ -645,3 +645,222 @@ test('CONV-05C: text/voice modality, conversation isolation, and Memory2 digest 
     assert.ok(JSON.stringify(sources[0][1]).includes('Synthetic voice follow-up.'));
     assert.equal(JSON.stringify(sources[0][2]).includes('Synthetic typed antecedent.'), false);
 });
+
+test('CONV-05E2 STRUCTURAL: every model request receives the same contextual evidence rules', async t => {
+    const recorder = responseRecorder();
+    const runtime = runtimeWithResponses(recorder);
+    t.after(() => runtime.close());
+    await send(runtime, runtime.createConversation(), 'policy-memory1', 'Continuá con la referencia anterior.');
+    const policy = recorder.requests[0].instructions;
+    for (const marker of ['REFERENCIAS Y CONTINUIDAD CONVERSACIONAL', 'intercambios recientes',
+        'resultados de herramientas', 'herramientas de lectura en vivo', 'Memory2',
+        'varios antecedentes plausibles', 'no contiene argumentos', 'No ejecutes acciones externas ambiguas']) {
+        assert.ok(policy.includes(marker), `missing contextual rule: ${marker}`);
+    }
+    assert.equal(recorder.requests.length, 1, 'the policy must not add a model request');
+
+    const reader = { async readContext() { return { revision: 1, digest: 'synthetic-stable-digest', items: [] }; },
+        async close() {} };
+    const memoryRecorder = responseRecorder();
+    const memoryRuntime = createConversationRuntime({ memoryMode: 'memory2-readonly',
+        agentFactory: ({ agentOptions, initialConversationHistory }) => createAgent({ ...agentOptions,
+            initialConversationHistory, memory2ReadOnlyReader: reader, memoryRetrievalEnabled: true,
+            getTools: () => [], logger: () => {},
+            ask: request => askOpenAI({ ...request, client: memoryRecorder.client }) }) });
+    t.after(() => memoryRuntime.close());
+    await send(memoryRuntime, memoryRuntime.createConversation(), 'policy-memory2', '¿A cuál me refería?');
+    assert.ok(memoryRecorder.requests[0].instructions.includes('REFERENCIAS Y CONTINUIDAD CONVERSACIONAL'));
+    assert.ok(memoryRecorder.requests[0].instructions.includes('SELECCIÓN DE FUENTES DE INFORMACIÓN'));
+});
+
+test('CONV-05E2 STRUCTURAL: implicit references retain recent antecedents, corrections, and topic returns', async t => {
+    const scenarios = [
+        { name: 'artist', turns: ['Poné Purple Disco Machine.', 'Ahora otra de ese artista.'] },
+        { name: 'application', turns: ['Abrí la calculadora.', 'Cerrala.'] },
+        { name: 'prior action', turns: ['Subí el volumen de la aplicación.', 'Hacé lo mismo con la anterior.'] },
+        { name: 'correction', turns: ['Elegí la opción azul.', 'No, me refería a la otra.'] },
+        { name: 'two candidates', turns: ['Elegí entre el artista Alfa y el artista Beta.', 'Poné otra de ese artista.'] },
+        { name: 'topic return', turns: ['Hablemos del proyecto Orión.', 'Ahora hablemos de música.', 'Volvamos al tema anterior.'] },
+        { name: 'chosen item', turns: ['Elegimos la canción sintética Faro.', '¿Cuál era la que habíamos elegido?'] },
+    ];
+    for (const scenario of scenarios) await t.test(scenario.name, async child => {
+        const recorder = responseRecorder();
+        const runtime = runtimeWithResponses(recorder);
+        child.after(() => runtime.close());
+        const id = runtime.createConversation();
+        for (let index = 0; index < scenario.turns.length; index++)
+            assert.equal((await send(runtime, id, `${scenario.name}-${index}`, scenario.turns[index],
+                index % 2 ? 'voice' : 'typed')).status, 'completed');
+        const input = recorder.requests.at(-1).input;
+        const visible = input.filter(item => ['user', 'assistant'].includes(item?.role));
+        assert.deepEqual(visible.filter(item => item.role === 'user').map(item => item.content), scenario.turns);
+        assert.equal(recorder.requests.length, scenario.turns.length);
+    });
+});
+
+test('CONV-05E2 SCRIPTED: ambiguous or missing antecedents can be clarified without external actions', async t => {
+    for (const scenario of [
+        { name: 'two artists', antecedents: ['Mencioné al artista Alfa.', 'También mencioné al artista Beta.'],
+            followup: 'Poné otra de ese artista.', clarification: '¿Alfa o Beta?' },
+        { name: 'missing target', antecedents: ['Hablamos de música en general.'],
+            followup: 'Cerrá la aplicación anterior.', clarification: '¿Qué aplicación querés cerrar?' },
+    ]) await t.test(scenario.name, async child => {
+        let actions = 0;
+        const recorder = responseRecorder([
+            ...scenario.antecedents.map(() => final('Respuesta sintética.')),
+            final(scenario.clarification),
+        ]);
+        const runtime = runtimeWithResponses(recorder, { agentOptions: {
+            getTools: () => [{ type: 'function', name: 'close_window', parameters: { type: 'object' } }],
+            execute: async () => { actions++; return { success: true }; },
+        } });
+        child.after(() => runtime.close());
+        const id = runtime.createConversation();
+        for (let index = 0; index < scenario.antecedents.length; index++)
+            await send(runtime, id, `${scenario.name}-antecedent-${index}`, scenario.antecedents[index]);
+        const result = await send(runtime, id, `${scenario.name}-clarify`, scenario.followup);
+        assert.equal(result.text, scenario.clarification);
+        assert.equal(actions, 0);
+        assert.ok(recorder.requests.at(-1).instructions.includes('pide una aclaración breve'));
+    });
+});
+
+test('CONV-05E2 STRUCTURAL: live playback state is checked without replay or exposing Spotify content', async t => {
+    let playbackCalls = 0;
+    let readCalls = 0;
+    const recorder = responseRecorder([
+        toolCall('spotify_play', { query: 'artista sintético Alfa' }, 'play-alpha'),
+        toolCall('spotify_get_current_track', {}, 'read-current'),
+        final('La reproducción actual es distinta.'),
+    ]);
+    const runtime = runtimeWithResponses(recorder, { agentOptions: {
+        getTools: () => [
+            { type: 'function', name: 'spotify_play', parameters: { type: 'object' } },
+            { type: 'function', name: 'spotify_get_current_track', parameters: { type: 'object' } },
+        ],
+        execute: async name => name === 'spotify_play'
+            ? (playbackCalls++, { success: true, selected: { name: 'Pista Alfa' } })
+            : (readCalls++, { success: true, playing: true, track: { name: 'Pista Beta' } }),
+    } });
+    t.after(() => runtime.close());
+    const id = runtime.createConversation();
+    assert.equal((await send(runtime, id, 'play-first', 'Poné al artista sintético Alfa.')).status, 'completed');
+    assert.equal((await send(runtime, id, 'play-followup', '¿Qué está sonando ahora?')).status, 'completed');
+    assert.equal(playbackCalls, 1);
+    assert.equal(readCalls, 1);
+    const beforeRead = JSON.stringify(recorder.requests[1].input);
+    const afterRead = JSON.stringify(recorder.requests[2].input);
+    assert.ok(beforeRead.includes('artista sintético Alfa'));
+    assert.ok(recorder.requests[2].input.some(item => item?.type === 'function_call_output'
+        && item.call_id === 'read-current' && JSON.parse(item.output).trackAvailable === true));
+    assert.equal(afterRead.includes('Pista Beta'), false, 'Spotify content is presented locally, not sent to the model');
+    assert.ok(recorder.requests[2].instructions.includes('una reproducción, ventana o volumen anterior no prueba el estado presente'));
+});
+
+test('CONV-05E2 STRUCTURAL: failed actions remain failed and absent antecedents stay outside the budget', async t => {
+    const recorder = responseRecorder([
+        toolCall('open_app', { app: 'aplicación sintética Delta' }, 'failed-open'),
+        final('No se pudo abrir.'),
+        final('Aclaración sintética.'),
+    ]);
+    let attempts = 0;
+    const runtime = runtimeWithResponses(recorder, { agentOptions: {
+        getTools: () => [{ type: 'function', name: 'open_app', parameters: { type: 'object' } }],
+        execute: async () => { attempts++; return { success: false, error: { code: 'synthetic_failure' } }; },
+    } });
+    t.after(() => runtime.close());
+    const id = runtime.createConversation();
+    await send(runtime, id, 'failed-action', 'Abrí la aplicación sintética Delta.');
+    await send(runtime, id, 'failed-followup', '¿Y qué ocurrió?');
+    assert.equal(attempts, 1);
+    assert.ok(recorder.requests.at(-1).input.some(item => item?.type === 'function_call_output'
+        && item.output.includes('"success":false')));
+
+    const budgetRecorder = responseRecorder();
+    const budgetRuntime = runtimeWithResponses(budgetRecorder,
+        { conversationContextPolicy: { maxMessages: 2, maxCharacters: 1_000 } });
+    t.after(() => budgetRuntime.close());
+    const budgetId = budgetRuntime.createConversation();
+    await send(budgetRuntime, budgetId, 'old-antecedent', 'Elegimos la canción sintética Faro.');
+    await send(budgetRuntime, budgetId, 'new-topic', 'Cambiamos al tema de calendarios.');
+    await send(budgetRuntime, budgetId, 'out-of-budget', 'Volvamos a la que habíamos elegido.');
+    const input = JSON.stringify(budgetRecorder.requests.at(-1).input);
+    assert.equal(input.includes('canción sintética Faro'), false);
+    assert.ok(input.includes('Volvamos a la que habíamos elegido.'));
+    assert.ok(budgetRecorder.requests.at(-1).instructions.includes('el relevante ya no está en el contexto disponible'));
+});
+
+test('CONV-05E2 STRUCTURAL: restart distinguishes visible antecedents from minimal historical tool records', async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'nexa-reference-restart-'));
+    t.after(async () => {
+        const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(directory));
+        assert.ok(relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+        await rm(directory, { recursive: true, force: true });
+    });
+    const store = createConversationStore({ baseDirectory: path.join(directory, 'synthetic-conversations') });
+    await store.createConversation(UUID);
+    await store.appendMessage(UUID, { role: 'user', content: 'Poné al artista sintético Gamma.' });
+    await store.appendToolRecord(UUID, { turnId: 'synthetic-turn', userSequence: 1,
+        toolName: 'spotify_play', callIdHash: 'a'.repeat(64), status: 'succeeded' });
+    await store.appendMessage(UUID, { role: 'assistant', content: 'Spotify aceptó la orden de reproducción.' });
+    const messages = (await store.listMessages(UUID)).messages;
+    const records = await store.listToolRecords(UUID);
+    const recorder = responseRecorder();
+    let actions = 0;
+    const runtime = runtimeWithResponses(recorder, { agentOptions: {
+        getTools: () => [{ type: 'function', name: 'spotify_play', parameters: { type: 'object' } }],
+        execute: async () => { actions++; return { success: true }; },
+    } });
+    t.after(() => runtime.close());
+    assert.equal(runtime.restoreConversation(UUID, messages, records), true);
+    await send(runtime, UUID, 'restored-artist', 'Ahora otra de ese artista.');
+    const input = recorder.requests[0].input;
+    assert.ok(input.some(item => item?.role === 'user' && item.content.includes('artista sintético Gamma')));
+    const record = input.find(item => item?.role === 'developer' && item.content.includes('Historical tool outcome'));
+    assert.ok(record);
+    assert.ok(record.content.includes('"status":"succeeded"'));
+    assert.equal(record.content.includes('Gamma'), false);
+    assert.equal(actions, 0, 'restoration and a synthetic text reply cannot replay a prior action');
+
+    const missingRecorder = responseRecorder();
+    const missing = runtimeWithResponses(missingRecorder);
+    t.after(() => missing.close());
+    assert.equal(missing.restoreConversation(UUID, [
+        { role: 'user', content: 'Reproducí algo.' },
+        { role: 'assistant', content: 'Spotify aceptó la orden.' },
+    ], records), true);
+    await send(missing, UUID, 'missing-artist', 'Otra de ese artista.');
+    assert.equal(JSON.stringify(missingRecorder.requests[0].input).includes('Gamma'), false);
+    assert.ok(missingRecorder.requests[0].instructions.includes('no contiene argumentos, artista, aplicación, pista'));
+});
+
+test('CONV-05E2 STRUCTURAL: Memory2 evidence is separate from recent conversation and unrelated memories', async t => {
+    const recorder = responseRecorder();
+    const reader = { async readContext({ message }) {
+        const relevant = message.includes('jazz');
+        const callId = 'synthetic-memory-read';
+        return { revision: 1, digest: 'stable-synthetic-memory', items: [
+            { type: 'function_call', name: 'memory_context_snapshot', arguments: '{}', call_id: callId },
+            { type: 'function_call_output', call_id: callId, output: JSON.stringify({
+                assertions: [{ value: relevant ? 'Preferencia sintética por jazz.' : 'Interés sintético por jardinería.' }],
+                relations: [],
+            }) },
+        ] };
+    }, async close() {} };
+    const runtime = createConversationRuntime({ memoryMode: 'memory2-readonly',
+        agentFactory: ({ agentOptions, initialConversationHistory }) => createAgent({ ...agentOptions,
+            initialConversationHistory, memory2ReadOnlyReader: reader, memoryRetrievalEnabled: true,
+            getTools: () => [], logger: () => {},
+            ask: request => askOpenAI({ ...request, client: recorder.client }) }) });
+    t.after(() => runtime.close());
+    const id = runtime.createConversation();
+    await send(runtime, id, 'memory-relevant', 'Me gusta el jazz.');
+    await send(runtime, id, 'memory-unrelated', 'Ahora hablemos de calculadoras.');
+    const relevant = JSON.stringify(recorder.requests[0].input);
+    const unrelated = JSON.stringify(recorder.requests[1].input);
+    assert.ok(relevant.includes('Preferencia sintética por jazz.'));
+    assert.ok(unrelated.includes('Interés sintético por jardinería.'));
+    assert.ok(unrelated.includes('Me gusta el jazz.'), 'recent conversation is delivered separately');
+    assert.ok(recorder.requests[1].instructions.includes('Memory2 aporta preferencias y hechos persistentes relevantes'));
+    assert.equal(recorder.requests.length, 2);
+});

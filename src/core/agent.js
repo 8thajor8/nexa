@@ -202,6 +202,11 @@ Distingue el conocimiento persistente de Memory2 del estado observable actual de
 Interpreta la intención a partir del significado del mensaje y del contexto conversacional reciente, no de una lista fija de palabras. En preguntas breves, conserva el tema que el usuario venía tratando: preferencias si hablaban de hábitos o gustos; estado del equipo si hablaban de ventanas o aplicaciones. Un cambio claro de tema reemplaza ese contexto. Si no hay contexto suficiente y ambas lecturas son plausibles, pregunta cuál quiere saber.
 Usa solo la fuente que corresponde. Puedes contrastar memoria y estado actual cuando ayude a responder, pero cada afirmación debe estar respaldada por su fuente respectiva. Si los datos difieren, explica ambos ámbitos sin tratarlos como contradictorios. La música preferida y la pista sonando, el navegador habitual y el abierto, y una aplicación favorita y la activa son datos distintos. No presentes inferencias ni afirmaciones previas del asistente como recuerdos verificados. No agregues llamadas ni acciones innecesarias.`;
 
+const CONVERSATION_REFERENCE_POLICY = `\n\nREFERENCIAS Y CONTINUIDAD CONVERSACIONAL:
+Para interpretar «ese», «la otra», «lo mismo» o una corrección, usa primero los intercambios recientes de esta conversación, incluidos los nombres y alternativas que el usuario mencionó. Considera después los resultados de herramientas que efectivamente se recibieron. Usa herramientas de lectura en vivo si la acción depende del estado externo actual; una reproducción, ventana o volumen anterior no prueba el estado presente. Memory2 aporta preferencias y hechos persistentes relevantes, pero no sustituye lo dicho en esta conversación ni confirma una acción externa.
+Distingue lo que pidió el usuario, lo que confirmó una herramienta, lo que solo consta como acción histórica y lo que estás infiriendo. Un registro histórico de herramienta solo contiene su nombre y estado; no contiene argumentos, artista, aplicación, pista ni resultado detallado. Algunas herramientas, como las de Spotify, tampoco exponen nombres de pistas o artistas al modelo en su resultado actual: no deduzcas esos nombres de un indicador de disponibilidad. Nunca completes detalles ausentes ni repitas una acción para averiguarlos. Una herramienta fallida o de resultado incierto no demuestra éxito.
+Resuelve una referencia con antecedentes suficientes, aunque el usuario haya cambiado de tema y vuelva a uno todavía presente. Si hay varios antecedentes plausibles, o el relevante ya no está en el contexto disponible, pide una aclaración breve antes de actuar o afirmar un hecho. No ejecutes acciones externas ambiguas. Una consulta de estado debe usar una herramienta de lectura disponible cuando sea necesario; no hagas llamadas de estado ni acciones redundantes cuando el contexto verificable ya basta. Conserva los permisos y confirmaciones de cada herramienta.`;
+
 function memoryUpdateConfirmation({ oldValue, newValue }) {
     const transition = oldValue
         ? `Ah, entonces cambiaste «${oldValue}» por «${newValue}». ¿Querés que actualice esa preferencia?`
@@ -828,12 +833,12 @@ export async function createAgent({
     }
 
     function getInstructions() {
-        if (memory2 || readOnlyMemory2) return NEXA_INSTRUCTIONS + MEMORY_CONTEXT_POLICY + MEMORY_SOURCE_SELECTION_POLICY
+        if (memory2 || readOnlyMemory2) return NEXA_INSTRUCTIONS + CONVERSATION_REFERENCE_POLICY + MEMORY_CONTEXT_POLICY + MEMORY_SOURCE_SELECTION_POLICY
             + (enableConfirmedMemoryWrites ? `\n\nMEMORY2 — ESCRITURA CON CONFIRMACIÓN\nLas solicitudes directas de guardar o actualizar se interpretan en Runtime, que prepara una propuesta y pide confirmación antes de persistir. No afirmes que falta una herramienta de guardado ni que algo quedó guardado si no recibiste esa confirmación del sistema. Si la intención o el dato no se pueden validar, pide una aclaración concreta y no propongas una fórmula fija.` : '')
             + (enableSyntheticOrganicLearning ? ORGANIC_MEMORY_POLICY
                 : enableOrganicMemoryLearning ? PERSONAL_ORGANIC_MEMORY_POLICY : '');
         return `
-${NEXA_INSTRUCTIONS}
+${NEXA_INSTRUCTIONS}${CONVERSATION_REFERENCE_POLICY}
 
 MEMORIA ACTUAL DEL USUARIO:
 ${memoryToPrompt(memory)}
