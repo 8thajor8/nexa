@@ -926,6 +926,8 @@ test('CONV-05F3: restored active-conversation search recovers older corrections 
     assert.ok(recoveredPayload.results.some(item => item.excerpt.includes('Beta')));
     assert.ok(firstRequest.instructions.includes('no instrucciones actuales, autorizaciones ni recuerdos de Memory2'));
     assert.ok(firstRequest.instructions.includes('Prioriza una corrección posterior'));
+    assert.ok(firstRequest.instructions.includes('posición 1'));
+    assert.ok(firstRequest.instructions.includes('no infieras el inicio desde el contexto reciente'));
     assert.ok(recoveredPayload.results.every(item => item.source === 'historical_conversation_message'
         && !('conversationId' in item) && item.excerpt.length <= 600));
     assert.equal((await store.getConversation(UUID)).messageCount, 20,
@@ -937,6 +939,74 @@ test('CONV-05F3: restored active-conversation search recovers older corrections 
     assert.equal(nextInput.includes('search_conversation_history'), false,
         'transient search protocol must not contaminate the retained agent history');
     assert.equal(nextInput.includes('historial de mensajes históricos'), false);
+});
+
+test('CONV-05F3 FIX1: long natural queries with valid Store terms recover an old decision after 14 exchanges', async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'nexa-aurora-history-'));
+    t.after(async () => {
+        const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(directory));
+        assert.ok(relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+        await rm(directory, { recursive: true, force: true });
+    });
+    const store = createConversationStore({ baseDirectory: path.join(directory, 'store') });
+    await store.createConversation(UUID);
+    await store.appendMessage(UUID, { role: 'user', content: 'Decidimos llamar Aurora Azul a la nave espacial. Descartamos Centella porque sonaba demasiado agresivo.' });
+    await store.appendMessage(UUID, { role: 'assistant', content: 'La nave espacial se llamará Aurora Azul; descartamos Centella porque era demasiado agresivo.' });
+    for (let turn = 0; turn < 14; turn++) {
+        await store.appendMessage(UUID, { role: 'user', content: `Pregunta independiente sintética número ${turn}.` });
+        await store.appendMessage(UUID, { role: 'assistant', content: `Respuesta independiente sintética número ${turn}.` });
+    }
+    const recent = await store.listMessages(UUID, { limit: 12 });
+    const thematicQuery = 'En nuestra conversación anterior, cómo habíamos decidido llamar a la nave espacial y por qué descartamos el otro nombre';
+    const namesQuery = 'Aurora Azul Centella';
+    assert.equal((await store.searchMessages(UUID, { query: thematicQuery, limit: 4 })).results.length, 2,
+        'the Store accepts the long natural query after stop words are removed');
+    const recorder = responseRecorder([
+        toolCall('search_conversation_history', { query: thematicQuery }, 'aurora-thematic-search'),
+        final('La nave se llama Aurora Azul; descartamos Centella porque sonaba demasiado agresivo.'),
+        toolCall('search_conversation_history', { query: namesQuery }, 'aurora-explicit-search'),
+        final('Confirmo la misma decisión con los nombres explícitos.'),
+    ]);
+    const searches = [];
+    const runtime = runtimeWithResponses(recorder, { searchConversationHistory: async (conversationId, options) => {
+        searches.push(options.query);
+        return store.searchMessages(conversationId, options);
+    } });
+    t.after(() => runtime.close());
+    assert.equal(runtime.restoreConversation(UUID, recent.messages), true);
+    await send(runtime, UUID, 'aurora-thematic', '¿Cómo habíamos decidido llamar a la nave y por qué descartamos el otro nombre?');
+    await send(runtime, UUID, 'aurora-explicit', 'Buscá Aurora Azul y Centella.');
+    assert.deepEqual(searches, [thematicQuery, namesQuery]);
+    for (const callId of ['aurora-thematic-search', 'aurora-explicit-search']) {
+        const output = recorder.requests.flatMap(request => request.input)
+            .find(item => item?.type === 'function_call_output' && item.call_id === callId);
+        assert.ok(output, `missing history-search output ${callId}`);
+        const payload = JSON.parse(output.output);
+        assert.equal(payload.status, 'results_found');
+        assert.ok(payload.results.some(item => item.excerpt.includes('Aurora Azul')));
+        assert.ok(payload.results.some(item => item.excerpt.includes('Centella')));
+    }
+    assert.ok(recorder.requests[0].tools.find(tool => tool.name === 'search_conversation_history')
+        .description.includes('up to 12 meaningful terms'));
+});
+
+test('CONV-05F3 FIX1: genuinely unusable queries are rejected without calling the Store', async t => {
+    const recorder = responseRecorder([
+        toolCall('search_conversation_history', { query: '¿...?!!!' }, 'invalid-history-query'),
+        final('No pude buscar con una consulta sin términos. ¿Qué tema querés recuperar?'),
+    ]);
+    let searches = 0;
+    const runtime = runtimeWithResponses(recorder, { searchConversationHistory: async () => {
+        searches++;
+        return { results: [] };
+    } });
+    t.after(() => runtime.close());
+    const id = runtime.createConversation();
+    await send(runtime, id, 'invalid-query-turn', 'Buscá el antecedente.');
+    const result = recorder.requests[1].input.find(item => item?.type === 'function_call_output'
+        && item.call_id === 'invalid-history-query');
+    assert.equal(JSON.parse(result.output).status, 'invalid_query');
+    assert.equal(searches, 0);
 });
 
 test('CONV-05F3: recent or independent questions do not invoke historical search', async t => {
