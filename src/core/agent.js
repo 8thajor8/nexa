@@ -1190,7 +1190,10 @@ ${memoryToPrompt(memory)}
         // Current-state questions need the normal contextual turn so the model can
         // choose between Memory2 and live tools such as Windows/Spotify. The verified
         // history path remains for previous, date, reason, status, and sequence queries.
-        const isMemoryFollowup = followupDimension !== 'unknown' && followupDimension !== 'current';
+        // A bare conversational "why?" refers to the preceding answer, not necessarily
+        // to a reason recorded in Memory2. Historical reasons require explicit history wording.
+        const isMemoryFollowup = followupDimension !== 'unknown' && followupDimension !== 'current'
+            && followupDimension !== 'reason';
         const preserveCurrentTopicContext = followupDimension === 'current';
         if (!explicitHistoryQuestion && !isMemoryFollowup && !preserveCurrentTopicContext) memoryTopicRecordIds.clear();
         if (memory2 && isTrustedDirectInput && source !== 'untrusted'

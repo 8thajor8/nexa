@@ -170,36 +170,127 @@ test('contextual current and previous followups use the selected Memory2 history
     });
 });
 
-test('contextual date and reason followups stay unknown when Memory2 contains no such evidence', async () => {
+test('bare reason followup keeps chat context while explicit registered-motive questions stay in Memory2 history', async () => {
     await withStore(async ({ storePath }) => {
-        let composeCount = 0;
+        const store = JSON.parse(await readFile(storePath, 'utf8'));
+        addSyntheticTextHistory(store, { key: 'synthetic-editor-topic', idStart: 591,
+            values: ['Mi editor de prueba favorito es Cursor.'] });
+        validateMemoryStore(store);
+        await writeFile(storePath, JSON.stringify(store), 'utf8');
+        const requests = [];
         const instance = createRuntime(storePath, async request => {
-            if (request.tools.some(tool => tool.name === 'interpret_memory_intent')) {
-                const current = request.input.filter(item => item?.role === 'user').at(-1)?.content;
-                const newValue = current.includes('VS Code') ? 'VS Code' : 'Cursor';
-                const oldValue = newValue === 'VS Code' ? 'Sublime Text' : 'VS Code';
-                return interpreted({ intent: 'update_editor_preference', sourceQuote: current, newValue, oldValue });
-            }
-            if (request.tools.some(tool => tool.name === 'compose_memory_history_answer')) {
-                composeCount++;
-                return composed([{ text: 'Antes de VS Code usabas Sublime Text.', role: 'previous', factIndexes: [0] }]);
-            }
-            return final();
+            requests.push(structuredClone(request));
+            const userText = request.input.filter(item => item?.role === 'user').at(-1)?.content;
+            return final(userText === '¿Cuál es mi editor de prueba favorito?'
+                ? 'Tu editor de prueba favorito registrado es Cursor.' : 'Te recomendé conservarlo para tener una copia recuperable.');
         });
         const conversationId = instance.createConversation();
-        await seed(instance, conversationId, 'Sublime Text', 'followup-no-date');
-        await send(instance, conversationId, 'Nexa, cambié de editor. Ahora prefiero VS Code', 'followup-date-vscode');
-        await send(instance, conversationId, 'sí', 'followup-date-vscode-confirm');
-        await send(instance, conversationId, 'Nexa, ¿qué editor usaba antes de VS Code?', 'followup-date-prime');
+        assert.equal(await send(instance, conversationId, '¿Cuál es mi editor de prueba favorito?', 'followup-prime'),
+            'Tu editor de prueba favorito registrado es Cursor.');
+        assert.ok(requests[0].input.some(item => item?.call_id?.startsWith('memory_context_')),
+            'the first turn must retrieve Memory2 context and populate the topic IDs');
         const before = JSON.parse(await readFile(storePath, 'utf8'));
 
-        assert.equal(await send(instance, conversationId, '¿Cuándo cambié?', 'followup-date-missing'),
+        assert.equal(await send(instance, conversationId, '¿Cuándo cambié mi editor habitual?', 'followup-date-no-evidence'),
             'No tengo registrada una fecha verificable para ese cambio.');
-        assert.equal(await send(instance, conversationId, '¿Y por qué?', 'followup-reason-missing'),
+        assert.equal(requests.length, 1,
+            'a historical date question without a verified date must use the safe fallback without asking the model to infer one');
+
+        assert.equal(await send(instance, conversationId, '¿Y por qué?', 'followup-reason-contextual'),
+            'Te recomendé conservarlo para tener una copia recuperable.');
+        const conversational = requests.at(-1);
+        assert.equal(conversational.tools.some(tool => tool.name === 'compose_memory_history_answer'), false);
+        assert.ok(conversational.input.some(item => item?.role === 'assistant'
+            && item.content?.some?.(part => part.type === 'output_text'
+                && part.text === 'Tu editor de prueba favorito registrado es Cursor.')));
+
+        assert.equal(await send(instance, conversationId, '¿Qué motivo tenía registrado para ese cambio?', 'followup-reason-explicit'),
             'No tengo registrado el motivo de ese cambio.');
-        assert.equal(composeCount, 1, 'missing date and motive are answered without asking the model to infer');
+        assert.equal(requests.length, 2, 'explicit missing-history fallback does not ask the model to invent a motive');
         assert.equal(JSON.parse(await readFile(storePath, 'utf8')).revision, before.revision,
             'informational followups do not mutate Memory2');
+        await instance.close();
+    });
+});
+
+test('ordinary why and correction followups keep the prior answer when Memory2 topic IDs are present', async () => {
+    await withStore(async ({ storePath }) => {
+        const store = JSON.parse(await readFile(storePath, 'utf8'));
+        addSyntheticTextHistory(store, { key: 'synthetic-backup-topic', idStart: 601,
+            values: ['El usuario conserva una copia de seguridad independiente para proteger sus archivos.'] });
+        validateMemoryStore(store);
+        await writeFile(storePath, JSON.stringify(store), 'utf8');
+
+        const scenarios = [
+            { followup: '¿Y por qué sería mala idea?', initial: 'Estoy pensando en borrar todas las copias de seguridad de mi computadora para liberar espacio. ¿Qué opinás?',
+                answer: 'Borrar todas te dejaría sin una copia para recuperar tus archivos si falla el equipo.' },
+            { followup: '¿Por qué me recomendaste eso?', initial: 'Estoy pensando en borrar todas las copias de seguridad de mi computadora para liberar espacio. ¿Qué opinás?',
+                answer: 'Borrar todas te dejaría sin una copia para recuperar tus archivos si falla el equipo.' },
+            { followup: '¿Y por qué?', initial: 'Estoy pensando en borrar todas las copias de seguridad de mi computadora para liberar espacio. ¿Qué opinás?',
+                answer: 'Borrar todas te dejaría sin una copia para recuperar tus archivos si falla el equipo.' },
+            { followup: 'No, me refería al segundo', initial: 'Tengo dos opciones para mis copias: borrar todas o mover una a un disco externo. ¿Qué opinás?',
+                answer: 'Mover una copia a un disco externo es más seguro; borrar todas te deja sin recuperación.' },
+        ];
+
+        for (const [index, scenario] of scenarios.entries()) {
+            const requests = [];
+            const instance = createRuntime(storePath, async request => {
+                requests.push(structuredClone(request));
+                const userText = request.input.filter(item => item?.role === 'user').at(-1)?.content;
+                if (userText === scenario.initial) return final(scenario.answer);
+                return final('Respuesta contextual sintética.');
+            });
+            const conversationId = instance.createConversation();
+            await send(instance, conversationId, scenario.initial, `contextual-reference-${index}-initial`);
+            const memoryContext = requests[0].input.find(item => item?.type === 'function_call_output'
+                && item.call_id?.startsWith('memory_context_'));
+            assert.ok(memoryContext, 'the fixture must produce retrieved Memory2 topic IDs');
+            assert.match(memoryContext.output, /copia de seguridad independiente/u);
+            assert.equal(await send(instance, conversationId, scenario.followup, `contextual-reference-${index}-followup`),
+                'Respuesta contextual sintética.');
+            const followupRequest = requests.at(-1);
+            assert.equal(followupRequest.input.filter(item => item?.role === 'user').at(-1)?.content, scenario.followup);
+            assert.equal(followupRequest.tools.some(tool => tool.name === 'compose_memory_history_answer'), false,
+                'ordinary references must not be routed to the Memory2 history composer');
+            assert.ok(followupRequest.input.some(item => item?.role === 'user' && item.content === scenario.initial));
+            assert.ok(followupRequest.input.some(item => item?.role === 'assistant'
+                && item.content?.some?.(part => part.type === 'output_text' && part.text === scenario.answer)),
+            'the immediately preceding assistant response must reach the model');
+            await instance.close();
+        }
+    });
+});
+
+test('explicit historical reason questions still retrieve documented Memory2 reasons', async () => {
+    await withStore(async ({ storePath }) => {
+        const store = JSON.parse(await readFile(storePath, 'utf8'));
+        addSyntheticTextHistory(store, { key: 'synthetic-editor-reason', idStart: 621, values: [
+            'Mi editor habitual era Zed.',
+            'Mi editor habitual ahora es Cursor porque necesitaba compatibilidad con mis proyectos actuales.',
+        ] });
+        validateMemoryStore(store);
+        await writeFile(storePath, JSON.stringify(store), 'utf8');
+
+        const requests = [];
+        const instance = createRuntime(storePath, async request => {
+            requests.push(structuredClone(request));
+            const facts = historyPayload(request);
+            assert.ok(facts, 'explicit historical questions must use the verified history path');
+            assert.equal(facts.requestedDimension, 'reason');
+            const index = facts.facts.findIndex(fact => fact.state === 'current' && fact.value.includes('porque'));
+            assert.notEqual(index, -1, 'the documented reason must be supplied as evidence');
+            return composed([{ text: 'Cambiaste a Cursor porque necesitabas compatibilidad con proyectos actuales.',
+                role: 'current', factIndexes: [index] }]);
+        });
+        const conversationId = instance.createConversation();
+        for (const [index, question] of [
+            '¿Por qué cambié mi editor habitual?',
+            '¿Qué motivo tenía registrado para ese cambio?',
+        ].entries()) {
+            const answer = await send(instance, conversationId, question, `explicit-reason-${index}`);
+            assert.match(answer, /compatibilidad/u);
+        }
+        assert.equal(requests.length, 2);
         await instance.close();
     });
 });
@@ -452,6 +543,10 @@ test('historical questions without verified facts use a safe fallback without ca
         const before = JSON.parse(await readFile(storePath, 'utf8'));
         const answer = await send(instance, conversationId, '¿Qué editor usaba antes?', 'history-empty');
         assert.match(answer, /No encontré un historial verificable/u);
+        assert.equal(await send(instance, conversationId, '¿Qué motivo tenía registrado para ese cambio?', 'history-empty-reason'),
+            'No tengo registrado el motivo de ese cambio.');
+        assert.equal(await send(instance, conversationId, '¿Por qué cambié mi editor habitual?', 'history-empty-editor-reason'),
+            'No tengo registrado el motivo de ese cambio.');
         assert.equal(modelCalls, 0);
         assert.equal(JSON.parse(await readFile(storePath, 'utf8')).revision, before.revision);
         await instance.close();
