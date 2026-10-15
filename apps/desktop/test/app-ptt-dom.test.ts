@@ -558,6 +558,8 @@ describe("App PTT DOM integration", () => {
     expect(await screen.findByText("Hola Nexa, ¿en qué te ayudo?")).toBeTruthy();
     expect(document.querySelector(".message--runtime-response")).toBe(streamedBubble);
     expect(document.querySelectorAll(".message--runtime-response")).toHaveLength(1);
+    expect(document.querySelector(".message--runtime-response .message-marker--nexa .nexa-core-mark__core")).toBeTruthy();
+    expect(document.querySelector(".message--runtime-response .message-marker--nexa")?.textContent).toBe("");
     await waitFor(() => expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledOnce());
     expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledWith(request.requestId);
     await waitFor(() => expect(bridge.voice.recordChatTiming).toHaveBeenCalledWith(expect.objectContaining({

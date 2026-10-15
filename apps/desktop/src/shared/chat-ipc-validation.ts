@@ -11,7 +11,7 @@ const MAX_TEXT_LENGTH = 16_000;
 const ERROR_CODES: readonly ChatIpcErrorCode[] = ["invalid_request", "busy", "conversation_not_found",
   "request_not_found", "runtime_unavailable", "cancel_not_accepted", "operation_failed"];
 const EVENT_STATUSES = ["processing", "text_delta", "text_reset", "completed", "cancelled", "error", "authorization_required"] as const;
-const EXTERNAL_EVENT_STATUSES = [...EVENT_STATUSES, "spotify_now_playing"] as const;
+const EXTERNAL_EVENT_STATUSES = [...EVENT_STATUSES, "spotify_now_playing", "conversation_title_updated"] as const;
 type RecordValue = Record<string, unknown>;
 
 function isRecord(value: unknown): value is RecordValue {
@@ -140,6 +140,9 @@ export function isChatEventEnvelope(value: unknown): value is ChatEventEnvelope 
       && (card.spotifyUrl === null || isSpotifyTrackUrl(card.spotifyUrl))
       && typeof card.playing === "boolean";
   }
+  if (value.status === "conversation_title_updated") return exactKeys(value, ["conversationId", "requestId", "status", "title"])
+    && typeof value.title === "string" && value.title.trim().length > 0 && value.title.length <= 60
+    && !/[\u0000-\u001f\u007f-\u009f]/u.test(value.title);
   if (value.status === "authorization_required") {
     if (!exactKeys(value, ["conversationId", "requestId", "status", "requirement"]) || !isRecord(value.requirement)) return false;
     const requirement = value.requirement;

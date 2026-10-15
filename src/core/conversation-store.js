@@ -21,6 +21,7 @@ const ERROR_MESSAGES = Object.freeze({
     conversation_persist_failed: 'Conversation data could not be saved.',
     conversation_commit_uncertain: 'The conversation write could not be confirmed.',
     conversation_id_collision: 'A unique conversation could not be created.',
+    conversation_title_invalid: 'Conversation title is invalid.',
 });
 const MESSAGE_VALIDATION_REASONS = new Set(['invalid_shape', 'invalid_role', 'content_not_string',
     'content_too_large', 'disallowed_control_character', 'empty_content', 'invalid_status']);
@@ -64,8 +65,12 @@ function safeTitle(value) {
         && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
 }
 
+function validTitleSource(value) { return value === 'provisional' || value === 'automatic' || value === 'manual'; }
+
 function validManifest(value, conversationId) {
-    return exactRecord(value, ['version', 'conversationId', 'createdAt', 'updatedAt', 'title', 'messageCount'])
+    const legacy = exactRecord(value, ['version', 'conversationId', 'createdAt', 'updatedAt', 'title', 'messageCount']);
+    const current = exactRecord(value, ['version', 'conversationId', 'createdAt', 'updatedAt', 'title', 'messageCount', 'titleSource']);
+    return (legacy || (current && validTitleSource(value.titleSource)))
         && value.version === 1 && value.conversationId === conversationId
         && validDate(value.createdAt) && validDate(value.updatedAt)
         && safeTitle(value.title) && Number.isSafeInteger(value.messageCount) && value.messageCount >= 0;
@@ -202,7 +207,10 @@ export function createConversationStore({ baseDirectory, fileSystem = {}, now = 
                 throw new ConversationStoreError('conversation_store_corrupt');
             const value = JSON.parse(await fs.readFile(manifest, 'utf8'));
             if (!validManifest(value, conversationId)) throw new ConversationStoreError('conversation_store_corrupt');
-            return value;
+            // Older manifests predate title ownership. Preserve their titles by
+            // treating any non-placeholder title as user-owned.
+            return value.titleSource ? value : { ...value,
+                titleSource: value.title === 'Nueva conversación' ? 'provisional' : 'manual' };
         } catch (cause) {
             if (cause instanceof ConversationStoreError) throw cause;
             if (cause?.code === 'ENOENT') return null;
@@ -299,7 +307,7 @@ export function createConversationStore({ baseDirectory, fileSystem = {}, now = 
                 const timestamp = now();
                 if (!validDate(timestamp)) throw new ConversationStoreError('conversation_store_invalid');
                 const manifest = { version: 1, conversationId, createdAt: timestamp, updatedAt: timestamp,
-                    title: 'Nueva conversación', messageCount: 0 };
+                    title: 'Nueva conversación', messageCount: 0, titleSource: 'provisional' };
                 const handle = await fs.open(messages, 'wx', 0o600);
                 await handle.sync();
                 await handle.close();
@@ -352,6 +360,23 @@ export function createConversationStore({ baseDirectory, fileSystem = {}, now = 
         return serialize(conversationId, async () => {
             const manifest = await readManifest(conversationId);
             return manifest ? Object.freeze({ ...manifest }) : null;
+        });
+    }
+
+    async function updateTitle(conversationId, title, source = 'manual') {
+        await initialize();
+        if (typeof conversationId !== 'string' || !UUID.test(conversationId))
+            throw new ConversationStoreError('conversation_id_invalid');
+        const maxLength = source === 'automatic' ? 60 : 120;
+        if (!validTitleSource(source) || source === 'provisional' || typeof title !== 'string'
+            || title.trim() !== title || title.length < 1 || title.length > maxLength || !safeTitle(title))
+            throw new ConversationStoreError('conversation_title_invalid');
+        return serialize(conversationId, async () => {
+            const manifest = await readManifest(conversationId);
+            if (!manifest) throw new ConversationStoreError('conversation_not_found');
+            if (source === 'automatic' && manifest.titleSource !== 'provisional') return false;
+            await writeManifest({ ...manifest, title, titleSource: source });
+            return true;
         });
     }
 
@@ -440,5 +465,5 @@ export function createConversationStore({ baseDirectory, fileSystem = {}, now = 
     }
 
     return Object.freeze({ initialize, createConversation, listConversations, getConversation,
-        appendMessage, listMessages, deleteConversation });
+        appendMessage, listMessages, updateTitle, deleteConversation });
 }

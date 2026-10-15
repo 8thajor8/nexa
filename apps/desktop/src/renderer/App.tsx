@@ -205,9 +205,12 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const [activeConversationEmpty, setActiveConversationEmpty] = useState(false);
   const [welcomeMessage] = useState(() => welcomeGreeting(new Date()));
   const [conversationItems, setConversationItems] = useState<ChatConversationSummary[]>([]);
+  const conversationItemsRef = useRef(conversationItems);
+  conversationItemsRef.current = conversationItems;
   const [conversationListCursor, setConversationListCursor] = useState<ChatConversationListCursor | null>(null);
   const conversationListCursorRef = useRef(conversationListCursor);
   conversationListCursorRef.current = conversationListCursor;
+  const conversationListRequestSequence = useRef(0);
   const [conversationListLoading, setConversationListLoading] = useState(false);
   const [conversationListError, setConversationListError] = useState<string | null>(null);
   const [conversationOpening, setConversationOpening] = useState(false);
@@ -309,11 +312,13 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
 
   const refreshConversationList = useCallback(async (append = false) => {
     if (isIsolated) return;
+    const sequence = ++conversationListRequestSequence.current;
     setConversationListLoading(true);
     setConversationListError(null);
     try {
       const result = await window.nexaDesktop.chat.listConversations(append && conversationListCursorRef.current
         ? { limit: 50, cursor: conversationListCursorRef.current } : { limit: 50 });
+      if (sequence !== conversationListRequestSequence.current) return;
       if (!result.ok) {
         setConversationListError("No se pudo cargar el historial de conversaciones.");
         return;
@@ -323,8 +328,9 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         : result.conversations);
       setConversationListCursor(result.nextCursor);
     } catch {
+      if (sequence !== conversationListRequestSequence.current) return;
       setConversationListError("No se pudo cargar el historial de conversaciones.");
-    } finally { setConversationListLoading(false); }
+    } finally { if (sequence === conversationListRequestSequence.current) setConversationListLoading(false); }
   }, [isIsolated]);
 
   useEffect(() => { void refreshConversationList(); }, [refreshConversationList]);
@@ -592,6 +598,14 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   };
 
   const handleChatEvent = useCallback((event: ChatEventEnvelope) => {
+    if (event.status === "conversation_title_updated") {
+      const alreadyListed = conversationItemsRef.current.some((item) => item.conversationId === event.conversationId);
+      conversationListRequestSequence.current += 1;
+      setConversationItems((current) => current.map((item) => item.conversationId === event.conversationId
+        ? { ...item, title: event.title } : item));
+      if (!alreadyListed) void refreshConversationList();
+      return;
+    }
     if (event.conversationId !== chatConversationIdRef.current || !knownChatRequests.current.has(event.requestId)
       || terminalChatRequests.current.has(event.requestId)) return;
     if (event.status === "text_delta") {

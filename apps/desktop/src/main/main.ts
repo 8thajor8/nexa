@@ -2,6 +2,8 @@ import { app, BrowserWindow, ipcMain, Menu, protocol, screen, session, shell } f
 import { lstat, mkdir, readFile } from "node:fs/promises";
 // @ts-expect-error The repository's JavaScript Runtime intentionally has no generated declaration file.
 import { createConversationRuntime } from "../../../../src/core/conversation-runtime.js";
+// @ts-expect-error The repository's JavaScript OpenAI client intentionally has no generated declaration file.
+import { generateConversationTitle } from "../../../../src/brain/openai.js";
 // @ts-expect-error The local Conversation Store is JavaScript and deliberately has no generated declaration file.
 import { createConversationStore } from "../../../../src/core/conversation-store.js";
 // @ts-expect-error The shared Runtime diagnostics intentionally has no generated declaration file.
@@ -803,7 +805,7 @@ function installWebContentsGuards(): void {
         desktopOperationalDiagnostics.recordVoiceOperation({ requestId, stage: "runtime", state: "success", durationMs,
           ...desktopVoiceConfiguration, durations: { runtimeMs: durationMs } });
       },
-    }, conversationStore);
+    }, conversationStore, generateConversationTitle);
     if (startupPolicy.registerMemoryMode) registerMemoryModeIpcHandlers({
       getWindow: () => mainWindow,
       getRuntime: () => conversationRuntime,

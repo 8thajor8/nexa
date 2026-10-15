@@ -130,7 +130,7 @@ export interface ChatPresentationMetadata {
   kind: "diagnostic" | "tool_catalog";
   technicalDetail: string;
 }
-export type ChatEventStatus = "processing" | "text_delta" | "text_reset" | "completed" | "cancelled" | "error" | "authorization_required" | "spotify_now_playing";
+export type ChatEventStatus = "processing" | "text_delta" | "text_reset" | "completed" | "cancelled" | "error" | "authorization_required" | "spotify_now_playing" | "conversation_title_updated";
 interface ChatEventBase {
   conversationId: string;
   requestId: string;
@@ -138,6 +138,7 @@ interface ChatEventBase {
 export type ChatEventEnvelope =
   | AuthorizationRequiredEvent
   | SpotifyNowPlayingEvent
+  | (ChatEventBase & { status: "conversation_title_updated"; title: string })
   | (ChatEventBase & { status: "text_delta"; delta: string })
   | (ChatEventBase & { status: "text_reset" })
   | (ChatEventBase & { status: "processing" })

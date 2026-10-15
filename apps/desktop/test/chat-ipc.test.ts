@@ -15,6 +15,7 @@ import path from "node:path";
 import { createAgent } from "../../../src/core/agent.js";
 import { askOpenAI } from "../../../src/brain/openai.js";
 import { executeTool, getToolsForModel } from "../../../src/tools/index.js";
+import { generateConversationTitle } from "../../../src/brain/openai.js";
 
 function id(value: string): string { return `00000000-0000-4000-8000-${value.padStart(12, "0")}`; }
 const conversationId = id("1");
@@ -44,7 +45,8 @@ function fakeRuntime(result: Promise<RuntimeMessageResult> = Promise.resolve({
 function harness(runtime: ConversationRuntimeApi | null,
   diagnostic?: (event: string, details: Readonly<Record<string, string | number | boolean | null>>) => void,
   voiceHooks?: Parameters<typeof registerChatIpcHandlers>[4],
-  conversationStore?: Parameters<typeof registerChatIpcHandlers>[5]) {
+  conversationStore?: Parameters<typeof registerChatIpcHandlers>[5],
+  titleGenerator?: Parameters<typeof registerChatIpcHandlers>[6]) {
   const handlers = new Map<string, (event: never, payload?: unknown) => unknown>();
   const ipc = {
     handle: vi.fn((channel: string, listener: (event: never, payload?: unknown) => unknown) => handlers.set(channel, listener)),
@@ -53,7 +55,7 @@ function harness(runtime: ConversationRuntimeApi | null,
   const contents = { mainFrame: {}, send: vi.fn(), isDestroyed: vi.fn(() => false) };
   const window = { webContents: contents, isDestroyed: vi.fn(() => false) };
   const getWindow = () => window;
-  const service = registerChatIpcHandlers(getWindow as never, () => runtime, ipc as never, diagnostic, voiceHooks, conversationStore);
+  const service = registerChatIpcHandlers(getWindow as never, () => runtime, ipc as never, diagnostic, voiceHooks, conversationStore, titleGenerator);
   const event = { sender: contents, senderFrame: contents.mainFrame } as never;
   const invoke = (channel: string, payload?: unknown, overrideEvent = event) => handlers.get(channel)!(overrideEvent, payload);
   return { handlers, ipc, contents, window, service, invoke, event };
@@ -61,6 +63,88 @@ function harness(runtime: ConversationRuntimeApi | null,
 
 describe("Main chat IPC to Conversation Runtime", () => {
   beforeEach(() => vi.clearAllMocks());
+
+  it("generates and publishes a title for a PTT-first exchange after persistence without delaying voice", async () => {
+    const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "nexa-conversation-title-"));
+    const store = createConversationStore({ baseDirectory: path.join(temporaryRoot, "conversations") });
+    const title = deferred<string | null>();
+    const runtime = fakeRuntime(Promise.resolve({ conversationId, requestId: request.requestId,
+      status: "completed", text: "Te recomiendo opciones seguras para guardar tus copias." }));
+    runtime.runtime.restoreConversation = vi.fn(() => true);
+    const titleGenerator = vi.fn(() => title.promise);
+    const onVoiceResponse = vi.fn();
+    const h = harness(runtime.runtime, undefined, { onVoiceResponse }, store, titleGenerator);
+    try {
+      h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+      await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, source: "voice", text: "¿Cómo organizo mis copias de seguridad?" });
+      await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) =>
+        (call[1] as ChatEventEnvelope).status === "completed")).toBe(true));
+      const persisted = await store.listMessages(conversationId, { limit: 10 });
+      expect(persisted.messages.map(({ role, sequence }) => ({ role, sequence }))).toEqual([
+        { role: "user", sequence: 1 }, { role: "assistant", sequence: 2 },
+      ]);
+      expect(titleGenerator).toHaveBeenCalledOnce();
+      expect(titleGenerator).toHaveBeenCalledWith({ userMessage: "¿Cómo organizo mis copias de seguridad?",
+        assistantMessage: "Te recomiendo opciones seguras para guardar tus copias." });
+      expect(onVoiceResponse).toHaveBeenCalledOnce();
+      expect((await store.getConversation(conversationId))?.title).toBe("Nueva conversación");
+
+      const otherConversation = await store.createConversation(id("8"));
+      await expect(h.invoke(CHAT_OPEN_CONVERSATION_CHANNEL, { conversationId: otherConversation.conversationId }))
+        .resolves.toMatchObject({ ok: true, conversationId: otherConversation.conversationId });
+
+      title.resolve("Copias de seguridad seguras");
+      await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) =>
+        (call[1] as ChatEventEnvelope).status === "conversation_title_updated")).toBe(true));
+      expect(await store.getConversation(conversationId)).toMatchObject({
+        title: "Copias de seguridad seguras", titleSource: "automatic",
+      });
+      expect((await store.getConversation(otherConversation.conversationId))?.title).toBe("Nueva conversación");
+      expect(h.contents.send).toHaveBeenCalledWith(CHAT_EVENT_CHANNEL, {
+        conversationId, requestId: request.requestId, status: "conversation_title_updated", title: "Copias de seguridad seguras",
+      });
+    } finally {
+      h.service.dispose();
+      const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(temporaryRoot));
+      expect(relative && !relative.startsWith("..") && !path.isAbsolute(relative)).toBeTruthy();
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the response successful when automatic title generation fails", async () => {
+    const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "nexa-conversation-title-failure-"));
+    const store = createConversationStore({ baseDirectory: path.join(temporaryRoot, "conversations") });
+    const runtime = fakeRuntime();
+    runtime.runtime.sendMessage = vi.fn(async (input) => ({ conversationId: input.conversationId,
+      requestId: input.requestId, status: "completed", text: "Respuesta disponible." }));
+    const diagnostics = vi.fn();
+    const h = harness(runtime.runtime, diagnostics, undefined, store, vi.fn(async () => { throw new Error("title provider unavailable"); }));
+    try {
+      h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+      await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, request);
+      await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) =>
+        (call[1] as ChatEventEnvelope).status === "completed")).toBe(true));
+      await vi.waitFor(() => expect(diagnostics).toHaveBeenCalledWith("conversation_title_generation_failed",
+        { requestId: request.requestId }));
+      expect((await store.getConversation(conversationId))?.title).toBe("Nueva conversación");
+      expect(h.contents.send.mock.calls.some((call) =>
+        (call[1] as ChatEventEnvelope).status === "conversation_title_updated")).toBe(false);
+    } finally {
+      h.service.dispose();
+      const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(temporaryRoot));
+      expect(relative && !relative.startsWith("..") && !path.isAbsolute(relative)).toBeTruthy();
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the existing configured OpenAI client for bounded title generation", async () => {
+    const create = vi.fn(async (_request: Record<string, unknown>) => ({ status: "completed", output_text: "  ‘Planificar un viaje’  " }));
+    await expect(generateConversationTitle({ userMessage: "Quiero planificar un viaje", assistantMessage: "Podemos empezar por las fechas.",
+      client: { responses: { create } } as never })).resolves.toBe("Planificar un viaje");
+    expect(create).toHaveBeenCalledOnce();
+    const requestBody = create.mock.calls[0]?.[0] as { model: string; tools: unknown[]; store: boolean; max_output_tokens: number };
+    expect(requestBody).toMatchObject({ model: expect.any(String), tools: [], store: false, max_output_tokens: 48 });
+  });
 
   it("keeps a provisional conversation in Runtime only until its first message", () => {
     const { runtime } = fakeRuntime();

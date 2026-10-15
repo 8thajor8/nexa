@@ -20,6 +20,9 @@ describe("Conversations panel", () => {
       busy={false} loading={false} hasMore={false} error={null} onNew={vi.fn()} onSelect={vi.fn()} onLoadMore={vi.fn()} />);
     expect(screen.getByText("Primera").closest("button")?.getAttribute("aria-current")).toBe("true");
     expect(screen.getByText("4 mensajes")).toBeTruthy();
+    expect(screen.getByText("Primera").classList.contains("conversation-history-title")).toBe(true);
+    expect(screen.getByText("4 mensajes").classList.contains("conversation-history-count")).toBe(true);
+    expect(document.querySelector(".conversation-history-time")?.textContent).toMatch(/\d/);
     expect(screen.getByRole("button", { name: "Nueva conversación" })).toBeTruthy();
   });
 

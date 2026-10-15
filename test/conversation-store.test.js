@@ -27,11 +27,44 @@ test('creates UUID conversation metadata and recovers it after store reinstantia
     const created = await f.store.createConversation();
     assert.match(created.conversationId, UUID);
     assert.equal(created.title, 'Nueva conversación');
+    assert.equal(created.titleSource, 'provisional');
     assert.equal(created.version, 1);
     assert.equal(created.messageCount, 0);
     assert.equal(await f.store.getConversation(created.conversationId).then(value => value.createdAt), created.createdAt);
     const reopened = createConversationStore(f.options);
     assert.deepEqual(await reopened.getConversation(created.conversationId), created);
+});
+
+test('automatic titles are bounded, applied once, and never replace a manual title', async t => {
+    const f = await fixture(t);
+    const conversation = await f.store.createConversation();
+    assert.equal(await f.store.updateTitle(conversation.conversationId, 'Plan de viaje', 'automatic'), true);
+    assert.equal(await f.store.updateTitle(conversation.conversationId, 'Otro título', 'automatic'), false);
+    assert.equal(await f.store.getConversation(conversation.conversationId).then(value => value.title), 'Plan de viaje');
+    assert.equal(await f.store.updateTitle(conversation.conversationId, 'Título elegido por mí', 'manual'), true);
+    assert.equal(await f.store.updateTitle(conversation.conversationId, 'Sugerencia tardía', 'automatic'), false);
+    const updated = await f.store.getConversation(conversation.conversationId);
+    assert.equal(updated.title, 'Título elegido por mí');
+    assert.equal(updated.titleSource, 'manual');
+    await assert.rejects(f.store.updateTitle(conversation.conversationId, 'x'.repeat(61), 'automatic'), code('conversation_title_invalid'));
+});
+
+test('reads legacy manifests and protects pre-existing non-placeholder titles', async t => {
+    const f = await fixture(t);
+    const provisional = await f.store.createConversation();
+    const custom = await f.store.createConversation();
+    for (const [conversation, title] of [[provisional, 'Nueva conversación'], [custom, 'Título anterior']]) {
+        const manifestPath = path.join(f.options.baseDirectory, 'conversations', conversation.conversationId, 'manifest.json');
+        const manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8'));
+        delete manifest.titleSource;
+        manifest.title = title;
+        await fs.writeFile(manifestPath, `${JSON.stringify(manifest)}\n`, 'utf8');
+    }
+    assert.equal(await f.store.updateTitle(provisional.conversationId, 'Conversación nueva', 'automatic'), true);
+    assert.equal(await f.store.updateTitle(custom.conversationId, 'Título generado', 'automatic'), false);
+    const expectLegacyTitle = await f.store.getConversation(custom.conversationId);
+    assert.equal(expectLegacyTitle.title, 'Título anterior');
+    assert.equal(expectLegacyTitle.titleSource, 'manual');
 });
 
 test('persists a provisional Runtime conversation under its existing ID only when explicitly requested', async t => {

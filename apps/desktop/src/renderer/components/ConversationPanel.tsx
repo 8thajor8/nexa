@@ -63,6 +63,14 @@ interface ConversationPanelProps {
   onRecover(): void;
 }
 
+function NexaCoreMark({ className = "", "aria-hidden": ariaHidden }: { className?: string; "aria-hidden"?: boolean | "true" | "false" }) {
+  return <span className={`nexa-core-mark${className ? ` ${className}` : ""}`} aria-hidden={ariaHidden}>
+    <span className="nexa-core-mark__orbit nexa-core-mark__orbit--one" />
+    <span className="nexa-core-mark__orbit nexa-core-mark__orbit--two" />
+    <span className="nexa-core-mark__ring" /><span className="nexa-core-mark__core" />
+  </span>;
+}
+
 const ERROR_MESSAGES: Record<string, string> = {
   permission_denied: "Permiso del micrófono denegado. Revisa los permisos de Windows y vuelve a intentarlo.",
   microphone_unavailable: "No se encontró un micrófono disponible.",
@@ -222,11 +230,7 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
             onLoadOlderMessages?.();
           }}>{olderMessagesLoading ? "Cargando mensajes…" : "Cargar mensajes anteriores"}</button>}
         {welcomeMessage && chatMessages.length === 0 && transcripts.length === 0 && <div className="conversation-welcome" role="status">
-          <div className="nexa-core-mark conversation-welcome-core" aria-hidden="true">
-            <span className="nexa-core-mark__orbit nexa-core-mark__orbit--one" />
-            <span className="nexa-core-mark__orbit nexa-core-mark__orbit--two" />
-            <span className="nexa-core-mark__ring" /><span className="nexa-core-mark__core" />
-          </div>
+          <NexaCoreMark className="conversation-welcome-core" aria-hidden="true" />
           <h1>{welcomeMessage}</h1>
         </div>}
         {[...transcripts.map((transcript): ConversationChatMessage => ({
@@ -249,7 +253,9 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
           </article>
         ) : (
           <article className="message message--nexa message--runtime-response" data-message-source="runtime" key={entry.id}>
-            <div className="message-meta"><span className="message-marker message-marker--nexa" aria-hidden="true">N</span><strong>Nexa</strong><time>{new Date(entry.createdAt).toLocaleTimeString()}</time></div>
+            <div className="message-meta"><span className="message-marker message-marker--nexa" aria-hidden="true">
+              <NexaCoreMark className="message-marker__core-mark" />
+            </span><strong>Nexa</strong><time>{new Date(entry.createdAt).toLocaleTimeString()}</time></div>
             <div className="assistant-message-bubble">
               <AssistantResponseText text={entry.text} presentation={entry.presentation} streamed={entry.streamed === true} />
               {authorizationRequirements[entry.requestId] && (() => {

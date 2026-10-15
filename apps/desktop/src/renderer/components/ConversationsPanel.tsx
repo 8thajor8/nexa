@@ -40,9 +40,9 @@ export function ConversationsPanel({ conversations, activeConversationId, isVisi
         className={`conversation-history-item${conversation.conversationId === activeConversationId ? " conversation-history-item--active" : ""}`}
         type="button" disabled={busy || loading} aria-current={conversation.conversationId === activeConversationId ? "true" : undefined}
         onClick={() => onSelect(conversation.conversationId)}>
-        <span className="conversation-history-item-copy"><strong>{conversation.title || "Nueva conversación"}</strong>
-          <small>{conversation.messageCount === 0 ? "Sin mensajes" : `${conversation.messageCount} mensajes`}</small></span>
-        <time dateTime={conversation.updatedAt}>{activityLabel(conversation.updatedAt)}</time>
+        <span className="conversation-history-item-copy"><strong className="conversation-history-title">{conversation.title || "Nueva conversación"}</strong>
+          <small className="conversation-history-count">{conversation.messageCount === 0 ? "Sin mensajes" : `${conversation.messageCount} mensajes`}</small></span>
+        <time className="conversation-history-time" dateTime={conversation.updatedAt}>{activityLabel(conversation.updatedAt)}</time>
       </button>)}
       {!loading && conversations.length === 0 && !error && <p className="conversation-history-empty">Todavía no hay conversaciones guardadas.</p>}
       {loading && conversations.length === 0 && <p className="conversation-history-empty" role="status">Cargando conversaciones…</p>}

@@ -30,6 +30,9 @@ describe("chat IPC contracts", () => {
     expect(isChatSendResponse({ ok: true, accepted: true, conversationId, requestId, response: "fake" })).toBe(false);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "processing" })).toBe(true);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "completed", response: "actual" })).toBe(true);
+    expect(isChatEventEnvelope({ conversationId, requestId, status: "conversation_title_updated", title: "Clima en Madrid" })).toBe(true);
+    expect(isChatEventEnvelope({ conversationId, requestId, status: "conversation_title_updated", title: "x".repeat(61) })).toBe(false);
+    expect(isChatEventEnvelope({ conversationId, requestId, status: "conversation_title_updated", title: "Título", secret: "extra" })).toBe(false);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "completed", response: "actual",
       presentation: { kind: "diagnostic", technicalDetail: '{"schema":"nexa-system-diagnostic/v1"}' } })).toBe(true);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "completed", response: "actual",
