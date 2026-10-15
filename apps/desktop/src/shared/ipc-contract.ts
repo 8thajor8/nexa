@@ -135,7 +135,7 @@ export interface ChatPresentationMetadata {
   kind: "diagnostic" | "tool_catalog";
   technicalDetail: string;
 }
-export type ChatEventStatus = "processing" | "text_delta" | "text_reset" | "completed" | "cancelled" | "error" | "authorization_required" | "spotify_now_playing" | "conversation_title_updated";
+export type ChatEventStatus = "queued" | "processing" | "text_delta" | "text_reset" | "completed" | "cancelled" | "error" | "authorization_required" | "spotify_now_playing" | "conversation_title_updated";
 interface ChatEventBase {
   conversationId: string;
   requestId: string;
@@ -146,6 +146,7 @@ export type ChatEventEnvelope =
   | (ChatEventBase & { status: "conversation_title_updated"; title: string; source?: "automatic" | "manual" })
   | (ChatEventBase & { status: "text_delta"; delta: string })
   | (ChatEventBase & { status: "text_reset" })
+  | (ChatEventBase & { status: "queued" })
   | (ChatEventBase & { status: "processing" })
   | (ChatEventBase & { status: "cancelled" })
   | (ChatEventBase & { status: "completed"; response: string; presentation?: ChatPresentationMetadata })

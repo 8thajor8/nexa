@@ -52,6 +52,20 @@ describe("chat composer focus", () => {
     expect(document.activeElement).toBe(input);
   });
 
+  it("shows a queued turn and lets the user cancel that pending message", () => {
+    const onSendMessage = vi.fn();
+    const onCancelQueuedRequest = vi.fn();
+    const queuedMessage = { ...userMessage, status: "queued" as const };
+    render(panel({ onSendMessage, onCancelQueuedRequest, chatMessages: [queuedMessage] }));
+    expect(screen.getByText("En cola")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Cancelar mensaje en cola" }));
+    expect(onCancelQueuedRequest).toHaveBeenCalledWith(userMessage.requestId);
+    const input = screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" }) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: "Siguiente intervención" } });
+    fireEvent.submit(input.closest("form")!);
+    expect(onSendMessage).toHaveBeenCalledWith("Siguiente intervención");
+  });
+
   it("does not reclaim focus moved intentionally and preserves Shift+Enter and voice controls", () => {
     const onSendMessage = vi.fn();
     const view = render(panel({ onSendMessage }));

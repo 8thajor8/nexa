@@ -87,6 +87,7 @@ interface ActiveRequest {
   streamedTextLength?: number;
   streamedTextBytes?: number;
   titleUserMessage?: string;
+  queued?: boolean;
 }
 export type ConversationTitleGenerator = (input: { userMessage: string; assistantMessage: string }) => Promise<string | null>;
 
@@ -149,6 +150,8 @@ function isRuntimeEvent(value: unknown): value is RuntimeMessageEvent {
 /** Main-process allowlisted transport; Runtime is injected only into this Main-process service. */
 export class ChatIpcService {
   private readonly activeByRequest = new Map<string, ActiveRequest>();
+  private readonly queuedRequests: ActiveRequest[] = [];
+  private runningRequestId: string | null = null;
   private readonly seenRequestIds = new WeakMap<object, Set<string>>();
   private conversationId: string | null = null;
   private conversationPersisted = false;
@@ -325,8 +328,9 @@ export class ChatIpcService {
     );
     const seen = this.seenRequestIds.get(window as object) ?? new Set<string>();
     if (seen.has(request.requestId)) return reject("busy", "This request identifier was already used.");
-    // Runtime enforces one active request across all conversations it owns.
-    if (this.activeByRequest.size > 0) return reject("busy", "Runtime is processing another conversation request.");
+    const pendingForConversation = this.queuedRequests.filter((activeRequest) =>
+      activeRequest.request.conversationId === request.conversationId).length;
+    if (pendingForConversation >= 3) return reject("busy", "The conversation queue is full.");
     seen.add(request.requestId);
     if (seen.size > 1_024) seen.delete(seen.values().next().value as string);
     this.seenRequestIds.set(window as object, seen);
@@ -336,27 +340,42 @@ export class ChatIpcService {
     if (request.source === "typed" || request.source === "voice") {
       try { this.voiceHooks.onNewInteraction?.(request.requestId, request.source); } catch { /* Speech cancellation must not block chat. */ }
     }
-    let operation: Promise<RuntimeMessageResult>;
-    const sendToRuntime = (): Promise<RuntimeMessageResult> => {
-      if (active.cancellationRequested) return Promise.resolve({ conversationId: request.conversationId,
-        requestId: request.requestId, status: "cancelled" });
-      this.trace("runtime_dispatch_started", { requestId: request.requestId, source: request.source,
-        durationMs: performance.now() - active.startedAt });
-      try { return runtime.sendMessage(request); }
-      catch { return Promise.reject(new Error("runtime_send_failed")); }
-    };
-    if (this.conversationStore) {
-      active.persistencePending = true;
-      operation = (async () => {
+    this.trace("ipc_request_accepted", { conversationId: request.conversationId, requestId: request.requestId });
+    if (this.runningRequestId) {
+      active.queued = true;
+      this.queuedRequests.push(active);
+      this.trace("request_queued", { conversationId: request.conversationId, requestId: request.requestId,
+        queueDepth: pendingForConversation + 1 });
+      this.emit(active, { conversationId: request.conversationId, requestId: request.requestId, status: "queued" });
+    } else this.startRequest(active);
+    return { ok: true as const, accepted: true as const, conversationId: request.conversationId, requestId: request.requestId };
+  }
+
+  private startRequest(active: ActiveRequest): void {
+    if (active.terminal) return;
+    const { request } = active;
+    const runtime = this.getRuntime();
+    if (!runtime) {
+      this.complete(active, { conversationId: request.conversationId, requestId: request.requestId, status: "error",
+        error: { code: "runtime_unavailable", message: "Runtime is not connected." } });
+      return;
+    }
+    active.queued = false;
+    this.runningRequestId = request.requestId;
+    this.trace("request_dequeued", { conversationId: request.conversationId, requestId: request.requestId,
+      queueDepth: this.queuedRequests.length });
+    const operation = (async (): Promise<RuntimeMessageResult> => {
+      if (this.conversationStore) {
+        active.persistencePending = true;
         if (!this.conversationPersisted) {
           const persistenceStartedAt = performance.now();
-          await this.conversationStore!.createConversation(request.conversationId);
+          await this.conversationStore.createConversation(request.conversationId);
           this.conversationPersisted = true;
           this.trace("conversation_created_persisted", { requestId: request.requestId,
             durationMs: performance.now() - persistenceStartedAt });
         }
         const persistenceStartedAt = performance.now();
-        const savedUserMessage = await this.conversationStore!.appendMessage(request.conversationId,
+        const savedUserMessage = await this.conversationStore.appendMessage(request.conversationId,
           { role: "user", content: request.text });
         const savedRecord = typeof savedUserMessage === "object" && savedUserMessage !== null
           ? savedUserMessage as { message?: { sequence?: unknown } } : null;
@@ -364,24 +383,29 @@ export class ChatIpcService {
         active.persistencePending = false;
         this.trace("user_message_persisted", { requestId: request.requestId, source: request.source,
           durationMs: performance.now() - persistenceStartedAt });
-        return sendToRuntime();
-      })().catch((error) => {
-          active.persistencePending = false;
-          this.trace("conversation_persist_failed", { stage: "user_message" });
-          throw error;
-        });
-    } else operation = sendToRuntime();
-    this.trace("ipc_request_accepted", { conversationId: request.conversationId, requestId: request.requestId });
+      }
+      if (active.cancellationRequested) return { conversationId: request.conversationId,
+        requestId: request.requestId, status: "cancelled" };
+      this.trace("runtime_dispatch_started", { requestId: request.requestId, source: request.source,
+        durationMs: performance.now() - active.startedAt });
+      return runtime.sendMessage(request);
+    })();
     void operation.then((result) => {
-      if (active.terminal) return;
-      this.completeFromResult(active, result);
+      if (!active.terminal) this.completeFromResult(active, result);
     }).catch(() => {
       if (!active.terminal) this.complete(active, {
         conversationId: request.conversationId, requestId: request.requestId, status: "error",
         error: { code: "operation_failed", message: "The conversation could not be saved or completed." },
       });
     });
-    return { ok: true as const, accepted: true as const, conversationId: request.conversationId, requestId: request.requestId };
+  }
+
+  private drainQueue(): void {
+    if (this.runningRequestId) return;
+    const next = this.queuedRequests.shift();
+    if (!next) return;
+    if (next.terminal) { this.drainQueue(); return; }
+    this.startRequest(next);
   }
 
   cancel(event: ChatIpcEvent, payload: unknown) {
@@ -395,6 +419,17 @@ export class ChatIpcService {
     if (!active || active.window !== window || active.terminal) return failure(
       payload.requestId, "request_not_found", "No active request matches this identifier.",
     );
+    if (active.queued) {
+      const index = this.queuedRequests.indexOf(active);
+      if (index < 0) return failure(payload.requestId, "request_not_found", "No queued request matches this identifier.",
+        active.request.conversationId);
+      this.queuedRequests.splice(index, 1);
+      this.trace("queued_request_cancelled", { conversationId: active.request.conversationId,
+        requestId: active.request.requestId, origin: "user" });
+      this.complete(active, { conversationId: active.request.conversationId,
+        requestId: active.request.requestId, status: "cancelled" });
+      return { ok: true as const, accepted: true as const, requestId: payload.requestId };
+    }
     if (active.cancelPending) return failure(payload.requestId, "busy", "Cancellation is already pending.", active.request.conversationId);
     this.trace("cancel_ipc_received", { conversationId: active.request.conversationId,
       requestId: payload.requestId, origin: "renderer_cancel_action" });
@@ -419,14 +454,29 @@ export class ChatIpcService {
   }
 
   cleanupWindow(window: ChatWindowContext, origin: ChatCleanupOrigin = "window_closed"): void {
+    for (const queued of [...this.queuedRequests]) {
+      if (queued.window !== window) continue;
+      const index = this.queuedRequests.indexOf(queued);
+      if (index >= 0) this.queuedRequests.splice(index, 1);
+      this.complete(queued, { conversationId: queued.request.conversationId,
+        requestId: queued.request.requestId, status: "cancelled" });
+    }
     for (const active of [...this.activeByRequest.values()]) {
-      if (active.window !== window) continue;
+      if (active.window !== window || active.queued) continue;
       this.trace("request_cleanup_cancel", { conversationId: active.request.conversationId,
         requestId: active.request.requestId, origin });
+      if (active.persistencePending) active.cancellationRequested = true;
+      else {
+        try { this.getRuntime()?.cancelRequest(active.request.requestId, origin); }
+        catch { /* Runtime closes with the app. */ }
+      }
+      // The window is no longer a valid recipient. Finalize locally so late Runtime
+      // events cannot be forwarded into a torn-down renderer.
       active.terminal = true;
-      try { this.getRuntime()?.cancelRequest(active.request.requestId, origin); } catch { /* Runtime closes with the app. */ }
       this.activeByRequest.delete(active.request.requestId);
+      if (this.runningRequestId === active.request.requestId) this.runningRequestId = null;
     }
+    this.drainQueue();
   }
 
   dispose(): void {
@@ -490,6 +540,7 @@ export class ChatIpcService {
   }
 
   private completeFromResult(active: ActiveRequest, result: RuntimeMessageResult): void {
+    if (active.terminal) return;
     if (!result || result.requestId !== active.request.requestId || result.conversationId !== active.request.conversationId) {
       this.complete(active, {
         conversationId: active.request.conversationId, requestId: active.request.requestId, status: "error",
@@ -574,6 +625,8 @@ export class ChatIpcService {
     if (safeEvent.status === "completed") this.trace("response_ipc_dispatched", { requestId: active.request.requestId,
       source: active.request.source, durationMs: performance.now() - active.startedAt });
     this.activeByRequest.delete(active.request.requestId);
+    if (this.runningRequestId === active.request.requestId) this.runningRequestId = null;
+    this.drainQueue();
     if (active.request.source === "voice" && (safeEvent.status === "cancelled" || safeEvent.status === "error")) {
       try { this.voiceHooks.onVoiceRequestTerminal?.(active.request.requestId, safeEvent.status); }
       catch { /* Voice cleanup cannot affect the terminal chat result. */ }

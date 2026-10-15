@@ -20,7 +20,7 @@ export interface ConversationChatMessage {
   readonly role: "user" | "assistant";
   readonly text: string;
   readonly source: "typed" | "voice" | "history";
-  readonly status: "sending" | "processing" | "completed" | "cancelled" | "error";
+  readonly status: "sending" | "queued" | "processing" | "completed" | "cancelled" | "error";
   readonly createdAt: number;
   readonly streamed?: boolean;
   readonly sessionId?: string;
@@ -52,6 +52,7 @@ interface ConversationPanelProps {
   cancellationPending?: boolean;
   chatBusy?: boolean;
   onSendMessage?(text: string): void;
+  onCancelQueuedRequest?(requestId: string): void;
   onCancelInteraction?(): void;
   onConnectAuthorization?(provider: AuthorizationProvider, requestId: string): void;
   onCancelAuthorization?(provider: AuthorizationProvider, requestId: string): void;
@@ -133,7 +134,7 @@ function resizeComposer(textarea: HTMLTextAreaElement): boolean {
 }
 
 export function ConversationPanel({ snapshot, transcripts, chatMessages = [], authorizationRequirements = {}, spotifyNowPlayingCards = {},
-  authorizationAttempts = {}, chatNotice, chatBusy = false, onSendMessage, onCancelInteraction,
+  authorizationAttempts = {}, chatNotice, chatBusy = false, onSendMessage, onCancelQueuedRequest, onCancelInteraction,
   welcomeMessage = null, showVoiceRepliesToggle = false, voiceRepliesEnabled = false, onVoiceRepliesChange,
   hasOlderMessages = false, olderMessagesLoading = false, onLoadOlderMessages,
   onConnectAuthorization, onCancelAuthorization, onRetryAuthorizedRequest, onOpenSpotifyTrack, transcriptNotice,
@@ -247,7 +248,12 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
                 <svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><rect x="9" y="3" width="6" height="12" rx="3" stroke="currentColor" strokeWidth="1.7"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21m-4 0h8" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg>
                 <span>Voz</span>
               </span> : <span className="message-source-badge">{entry.source === "history" ? "Historial" : "Texto"}</span>}
-              {(entry.status === "cancelled" || entry.status === "error") && <span className={`chat-message-status chat-message-status--${entry.status}`}>{entry.error ?? (entry.status === "cancelled" ? "Cancelado" : "Error")}</span>}
+              {entry.status === "queued" && <span className="chat-message-status chat-message-status--queued" role="status">En cola
+                <button type="button" className="chat-message-queue-cancel" onClick={() => onCancelQueuedRequest?.(entry.requestId)}
+                  aria-label="Cancelar mensaje en cola" title="Cancelar mensaje en cola">Cancelar</button>
+              </span>}
+              {entry.status === "processing" && <span className="chat-message-status chat-message-status--processing" role="status">Procesando</span>}
+              {(entry.status === "cancelled" || entry.status === "error") && <span className={`chat-message-status chat-message-status--${entry.status}`}>{entry.error ?? (entry.status === "cancelled" ? "Cancelado" : "No enviado")}</span>}
             </div>
             <p>{entry.text}</p>
           </article>

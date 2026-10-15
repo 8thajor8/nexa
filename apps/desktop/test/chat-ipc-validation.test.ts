@@ -38,6 +38,8 @@ describe("chat IPC contracts", () => {
     expect(isChatSendResponse({ ok: false, requestId, error: { code: "runtime_unavailable", message: "offline" } })).toBe(true);
     expect(isChatSendResponse({ ok: true, accepted: true, conversationId, requestId, response: "fake" })).toBe(false);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "processing" })).toBe(true);
+    expect(isChatEventEnvelope({ conversationId, requestId, status: "queued" })).toBe(true);
+    expect(isChatEventEnvelope({ conversationId, requestId, status: "queued", extra: true })).toBe(false);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "completed", response: "actual" })).toBe(true);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "conversation_title_updated", title: "Clima en Madrid" })).toBe(true);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "conversation_title_updated", title: "x".repeat(61) })).toBe(false);

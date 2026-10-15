@@ -233,23 +233,44 @@ describe("Main chat IPC to Conversation Runtime", () => {
     h.service.dispose();
   });
 
-  it("creates and persists one provisional conversation for concurrent first sends", async () => {
-    const creation = deferred<{ conversationId: string }>();
-    const store = { createConversation: vi.fn(() => creation.promise),
+  it("queues typed and PTT turns FIFO and persists each completed exchange before the next user turn", async () => {
+    const firstId = id("81");
+    const secondId = id("82");
+    const firstResult = deferred<RuntimeMessageResult>();
+    const secondResult = deferred<RuntimeMessageResult>();
+    const calls: string[] = [];
+    const store = { createConversation: vi.fn(async () => { calls.push("create"); return { conversationId }; }),
       listConversations: vi.fn(async () => ({ conversations: [], nextCursor: null })),
-      getConversation: vi.fn(async () => null), appendMessage: vi.fn(async () => undefined),
+      getConversation: vi.fn(async () => null),
+      appendMessage: vi.fn(async (_id: string, message: { role: string; content: string }) => { calls.push(`${message.role}:${message.content}`); }),
       listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, incompleteTail: false })) };
-    const { runtime } = fakeRuntime();
+    const { runtime, listeners } = fakeRuntime(firstResult.promise);
+    runtime.sendMessage = vi.fn((input) => {
+      calls.push(`runtime:${input.requestId}:${input.source}`);
+      for (const listener of listeners) listener({ conversationId: input.conversationId, requestId: input.requestId, status: "processing" });
+      return input.requestId === firstId ? firstResult.promise : secondResult.promise;
+    });
     const h = harness(runtime, undefined, undefined, store);
     await h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
-    const first = await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, requestId: id("81") });
-    const second = await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, requestId: id("82") });
-    expect(first).toMatchObject({ ok: true, accepted: true });
-    expect(second).toMatchObject({ ok: false, error: { code: "busy" } });
-    expect(store.createConversation).toHaveBeenCalledOnce();
-    creation.resolve({ conversationId });
-    await vi.waitFor(() => expect(store.appendMessage).toHaveBeenCalledOnce());
+    expect(h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, requestId: firstId, text: "primero" }))
+      .toMatchObject({ ok: true, accepted: true });
+    expect(h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, requestId: secondId, text: "seguí", source: "voice" }))
+      .toMatchObject({ ok: true, accepted: true });
+    expect(h.contents.send).toHaveBeenCalledWith(CHAT_EVENT_CHANNEL,
+      { conversationId, requestId: secondId, status: "queued" });
     await vi.waitFor(() => expect(runtime.sendMessage).toHaveBeenCalledOnce());
+    expect(calls).toEqual(["create", "user:primero", `runtime:${firstId}:typed`]);
+
+    firstResult.resolve({ conversationId, requestId: firstId, status: "completed", text: "respuesta uno" });
+    await vi.waitFor(() => expect(runtime.sendMessage).toHaveBeenCalledTimes(2));
+    expect(calls).toEqual(["create", "user:primero", `runtime:${firstId}:typed`, "assistant:respuesta uno",
+      "user:seguí", `runtime:${secondId}:voice`]);
+    secondResult.resolve({ conversationId, requestId: secondId, status: "completed", text: "respuesta dos" });
+    await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) => {
+      const event = call[1] as ChatEventEnvelope;
+      return event.requestId === secondId && event.status === "completed";
+    })).toBe(true));
+    expect(calls.at(-1)).toBe("assistant:respuesta dos");
     h.service.dispose();
   });
 
@@ -1180,15 +1201,44 @@ describe("Main chat IPC to Conversation Runtime", () => {
     await runtime.close();
   });
 
-  it("returns busy globally without queueing or retrying", async () => {
-    const pending = deferred<RuntimeMessageResult>();
-    const { runtime } = fakeRuntime(pending.promise);
+  it("bounds the FIFO queue, permits explicit cancellation, and continues after a failed turn", async () => {
+    const ids = [id("91"), id("92"), id("93"), id("94"), id("95")];
+    const results = new Map(ids.map((requestId) => [requestId, deferred<RuntimeMessageResult>()]));
+    const order: string[] = [];
+    const { runtime, listeners } = fakeRuntime(results.get(ids[0]!)!.promise);
+    runtime.sendMessage = vi.fn((input) => {
+      order.push(input.requestId);
+      for (const listener of listeners) listener({ conversationId: input.conversationId, requestId: input.requestId, status: "processing" });
+      return results.get(input.requestId)!.promise;
+    });
     const h = harness(runtime);
     h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
-    await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, request);
-    const second = { ...request, requestId: id("3"), text: "Segundo" };
-    expect(h.invoke(CHAT_SEND_MESSAGE_CHANNEL, second)).toMatchObject({ ok: false, error: { code: "busy" } });
-    expect(runtime.sendMessage).toHaveBeenCalledOnce();
+    for (const requestId of ids.slice(0, 4)) {
+      expect(h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, requestId, text: requestId }))
+        .toMatchObject({ ok: true, accepted: true });
+    }
+    expect(h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, requestId: ids[4], text: "límite" }))
+      .toMatchObject({ ok: false, error: { code: "busy" } });
+    expect(h.invoke(CHAT_CANCEL_REQUEST_CHANNEL, { requestId: ids[1] }))
+      .toEqual({ ok: true, accepted: true, requestId: ids[1] });
+    expect(h.contents.send).toHaveBeenCalledWith(CHAT_EVENT_CHANNEL,
+      { conversationId, requestId: ids[1], status: "cancelled" });
+    expect(h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, requestId: ids[4], text: "límite" }))
+      .toMatchObject({ ok: true, accepted: true });
+
+    results.get(ids[0]!)!.resolve({ conversationId, requestId: ids[0]!, status: "error",
+      error: { code: "agent_error", message: "falló el primer turno" } });
+    await vi.waitFor(() => expect(order).toEqual([ids[0], ids[2]]));
+    results.get(ids[2]!)!.resolve({ conversationId, requestId: ids[2]!, status: "completed", text: "dos" });
+    await vi.waitFor(() => expect(order).toEqual([ids[0], ids[2], ids[3]]));
+    results.get(ids[3]!)!.resolve({ conversationId, requestId: ids[3]!, status: "completed", text: "tres" });
+    await vi.waitFor(() => expect(order).toEqual([ids[0], ids[2], ids[3], ids[4]]));
+    results.get(ids[4]!)!.resolve({ conversationId, requestId: ids[4]!, status: "completed", text: "cuatro" });
+    await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) => {
+      const event = call[1] as ChatEventEnvelope;
+      return event.requestId === ids[4] && event.status === "completed";
+    })).toBe(true));
+    h.service.dispose();
   });
 
   it("requests cooperative cancellation and waits for Runtime's terminal event", async () => {
