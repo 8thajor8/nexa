@@ -11,6 +11,12 @@ const MAX_MANIFEST_BYTES = 16 * 1024;
 const MAX_MESSAGE_BYTES = 1024 * 1024;
 const PAGE_SIZE_MAX = 100;
 const READ_CHUNK_BYTES = 64 * 1024;
+const SEARCH_MAX_QUERY_CHARACTERS = 512;
+const SEARCH_MAX_TERMS = 12;
+const SEARCH_MAX_RESULTS = 10;
+const SEARCH_MAX_EXCERPT_CHARACTERS = 600;
+const SEARCH_MAX_SCAN_BYTES = 32 * 1024 * 1024;
+const SEARCH_MAX_MESSAGES = 20_000;
 const MAX_TOOL_RECORDS = 512;
 const MAX_TOOL_RECORDS_BYTES = 256 * 1024;
 
@@ -27,6 +33,7 @@ const ERROR_MESSAGES = Object.freeze({
     conversation_id_collision: 'A unique conversation could not be created.',
     conversation_title_invalid: 'Conversation title is invalid.',
     conversation_tool_record_invalid: 'Conversation tool record is invalid.',
+    conversation_search_invalid: 'Conversation search request is invalid.',
 });
 const MESSAGE_VALIDATION_REASONS = new Set(['invalid_shape', 'invalid_role', 'content_not_string',
     'content_too_large', 'disallowed_control_character', 'empty_content', 'invalid_status']);
@@ -136,6 +143,46 @@ async function readLastRecord(handle, size, conversationId) {
     }
     if (!validMessage(record, conversationId)) throw new ConversationStoreError('conversation_store_corrupt');
     return { sequence: record.sequence, message: record, recoveredTail: false, terminated, start, size };
+}
+
+const SEARCH_STOP_WORDS = new Set(['a', 'al', 'de', 'del', 'el', 'en', 'la', 'las', 'lo', 'los', 'me', 'mi',
+    'mis', 'que', 'se', 'un', 'una', 'unos', 'unas', 'y', 'o', 'por', 'para', 'con', 'sobre', 'the', 'and', 'of']);
+
+function normalizeSearch(value) {
+    return value.normalize('NFD').replace(/\p{M}/gu, '').toLocaleLowerCase('es');
+}
+
+function searchTerms(query) {
+    if (typeof query !== 'string' || query.length < 1 || query.length > SEARCH_MAX_QUERY_CHARACTERS
+        || /[\u0000-\u001f\u007f-\u009f]/u.test(query)) return null;
+    const terms = [...new Set(normalizeSearch(query).match(/[\p{L}\p{N}]{2,}/gu) ?? [])]
+        .filter(term => !SEARCH_STOP_WORDS.has(term));
+    return terms.length > 0 && terms.length <= SEARCH_MAX_TERMS ? terms : null;
+}
+
+function normalizedTextWithOffsets(value) {
+    let normalized = '';
+    const offsets = [];
+    let originalOffset = 0;
+    for (const character of value) {
+        const part = normalizeSearch(character);
+        normalized += part;
+        for (let index = 0; index < part.length; index++) offsets.push(originalOffset);
+        originalOffset += character.length;
+    }
+    return { normalized, offsets };
+}
+
+function excerptAt(content, normalizedContent, offsets, terms) {
+    const firstMatch = terms.map(term => normalizedContent.indexOf(term)).filter(index => index >= 0)
+        .reduce((first, index) => Math.min(first, index), Number.POSITIVE_INFINITY);
+    const originalMatch = Number.isFinite(firstMatch) ? offsets[firstMatch] ?? 0 : 0;
+    let start = Math.max(0, originalMatch - Math.floor(SEARCH_MAX_EXCERPT_CHARACTERS / 3));
+    if (start > 0 && /[\uDC00-\uDFFF]/u.test(content[start])) start++;
+    let end = Math.min(content.length, start + SEARCH_MAX_EXCERPT_CHARACTERS);
+    if (end < content.length && /[\uD800-\uDBFF]/u.test(content[end - 1])) end--;
+    const excerpt = `${start > 0 ? '…' : ''}${content.slice(start, end)}${end < content.length ? '…' : ''}`;
+    return { excerpt, excerptStart: start };
 }
 
 /**
@@ -573,6 +620,89 @@ export function createConversationStore({ baseDirectory, fileSystem = {}, now = 
         });
     }
 
+    async function searchMessages(conversationId, { query, limit = 5 } = {}) {
+        await initialize();
+        if (typeof conversationId !== 'string' || !UUID.test(conversationId))
+            throw new ConversationStoreError('conversation_id_invalid');
+        const terms = searchTerms(query);
+        if (!terms || !Number.isSafeInteger(limit) || limit < 1 || limit > SEARCH_MAX_RESULTS)
+            throw new ConversationStoreError('conversation_search_invalid');
+        return serialize(conversationId, async () => {
+            if (!await readManifest(conversationId)) throw new ConversationStoreError('conversation_not_found');
+            const { directory, messages: messagesPath } = pathsFor(conversationId);
+            await assertSafeDirectory(directory);
+            let handle;
+            try {
+                const info = await fs.lstat(messagesPath);
+                if (!info.isFile() || info.isSymbolicLink()) throw new ConversationStoreError('conversation_store_corrupt');
+                handle = await fs.open(messagesPath, 'r');
+                const size = (await handle.stat()).size;
+                const scanStart = Math.max(0, size - SEARCH_MAX_SCAN_BYTES);
+                let cursor = size;
+                let carry = Buffer.alloc(0);
+                let firstChunk = true;
+                let bytesScanned = 0;
+                let messagesExamined = 0;
+                const best = [];
+                const compare = (left, right) => right.matchedTermCount - left.matchedTermCount
+                    || Number(right.exactPhrase) - Number(left.exactPhrase)
+                    || right.sequence - left.sequence;
+                const examineLine = line => {
+                    if (Buffer.byteLength(line, 'utf8') > MAX_MESSAGE_BYTES + 2048)
+                        throw new ConversationStoreError('conversation_store_corrupt');
+                    let message;
+                    try { message = JSON.parse(line); }
+                    catch (cause) { throw new ConversationStoreError('conversation_store_corrupt', { cause }); }
+                    if (!validMessage(message, conversationId)) throw new ConversationStoreError('conversation_store_corrupt');
+                    messagesExamined++;
+                    const normalizedContent = normalizeSearch(message.content);
+                    const contentTerms = new Set(normalizedContent.match(/[\p{L}\p{N}]{2,}/gu) ?? []);
+                    const matchedTermCount = terms.reduce((count, term) => count + Number(contentTerms.has(term)), 0);
+                    if (!matchedTermCount) return;
+                    const normalizedQuery = normalizeSearch(query).trim();
+                    const candidate = { conversationId, messageId: message.id, sequence: message.sequence,
+                        role: message.role, createdAt: message.createdAt, matchedTermCount,
+                        exactPhrase: normalizedQuery.length > 0 && normalizedContent.includes(normalizedQuery) };
+                    const insertionIndex = best.findIndex(existing => compare(candidate, existing) < 0);
+                    const indexToUse = insertionIndex < 0 ? best.length : insertionIndex;
+                    if (indexToUse >= limit) return;
+                    const { normalized, offsets } = normalizedTextWithOffsets(message.content);
+                    best.splice(indexToUse, 0, { ...candidate,
+                        ...excerptAt(message.content, normalized, offsets, terms) });
+                    if (best.length > limit) best.pop();
+                };
+
+                while (cursor > scanStart && messagesExamined < SEARCH_MAX_MESSAGES) {
+                    const chunkStart = Math.max(scanStart, cursor - READ_CHUNK_BYTES);
+                    const chunk = await readExactly(handle, cursor - chunkStart, chunkStart);
+                    bytesScanned += chunk.length;
+                    cursor = chunkStart;
+                    const combined = carry.length ? Buffer.concat([chunk, carry]) : chunk;
+                    let lines = combined.toString('utf8').split('\n');
+                    if (firstChunk && combined.at(-1) !== 0x0a) lines.pop(); // Ignore an incomplete append tail.
+                    firstChunk = false;
+                    for (let index = lines.length - 1; index >= 1 && messagesExamined < SEARCH_MAX_MESSAGES; index--) {
+                        const line = lines[index];
+                        if (!line) continue;
+                        examineLine(line);
+                    }
+                    carry = Buffer.from(lines[0] ?? '', 'utf8');
+                    if (carry.length > MAX_MESSAGE_BYTES + 2048)
+                        throw new ConversationStoreError('conversation_store_corrupt');
+                }
+                if (scanStart === 0 && cursor === 0 && carry.length > 0
+                    && messagesExamined < SEARCH_MAX_MESSAGES) examineLine(carry.toString('utf8'));
+                const truncated = scanStart > 0 || messagesExamined >= SEARCH_MAX_MESSAGES;
+                return Object.freeze({ results: Object.freeze(best.sort((a, b) => a.sequence - b.sequence)
+                    .map(result => Object.freeze(result))), messagesExamined, bytesScanned, truncated });
+            } catch (cause) {
+                if (cause instanceof ConversationStoreError) throw cause;
+                if (cause?.code === 'ENOENT') throw new ConversationStoreError('conversation_not_found');
+                throw new ConversationStoreError('conversation_store_unavailable', { cause });
+            } finally { await handle?.close().catch(() => {}); }
+        });
+    }
+
     async function deleteConversation(conversationId) {
         await initialize();
         if (typeof conversationId !== 'string' || !UUID.test(conversationId))
@@ -589,5 +719,5 @@ export function createConversationStore({ baseDirectory, fileSystem = {}, now = 
     }
 
     return Object.freeze({ initialize, createConversation, listConversations, getConversation,
-        appendMessage, appendToolRecord, listToolRecords, listMessages, updateTitle, deleteConversation });
+        appendMessage, appendToolRecord, listToolRecords, listMessages, searchMessages, updateTitle, deleteConversation });
 }
