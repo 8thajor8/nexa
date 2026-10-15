@@ -14,7 +14,8 @@ import { isTrustedIpcSender } from "../shared/ipc-security.js";
 
 export interface ConversationRuntimeApi {
   createConversation(): string;
-  restoreConversation?(conversationId: string, messages: readonly Pick<ChatConversationMessage, "role" | "content">[]): boolean;
+  restoreConversation?(conversationId: string, messages: readonly (Pick<ChatConversationMessage, "role" | "content"> & { sequence?: number })[],
+    toolRecords?: readonly unknown[]): boolean;
   sendMessage(input: Readonly<ChatSendMessageRequest>): Promise<RuntimeMessageResult>;
   cancelRequest(requestId: string, origin?: string): boolean;
   onEvent(listener: (event: RuntimeMessageEvent) => void): () => void;
@@ -29,9 +30,12 @@ export interface ConversationStoreApi {
   }>;
   getConversation(conversationId: string): Promise<unknown | null>;
   appendMessage(conversationId: string, message: { role: "user" | "assistant"; content: string }): Promise<unknown>;
+  appendToolRecord?(conversationId: string, record: { turnId: string; userSequence: number; toolName: string;
+    callIdHash: string; status: "succeeded" | "failed" | "unknown" }): Promise<unknown>;
+  listToolRecords?(conversationId: string, options?: { limit?: number }): Promise<readonly unknown[]>;
   updateTitle?(conversationId: string, title: string, source: "automatic" | "manual"): Promise<boolean>;
   listMessages(conversationId: string, options?: { limit?: number; cursor?: ChatMessageCursor | null }): Promise<{
-    messages: ChatConversationMessage[]; nextCursor: ChatMessageCursor | null; incompleteTail: boolean;
+    messages: Array<ChatConversationMessage & { sequence?: number }>; nextCursor: ChatMessageCursor | null; incompleteTail: boolean;
   }>;
 }
 export type RuntimeMessageResult =
@@ -213,9 +217,10 @@ export class ChatIpcService {
       if (!conversation) return { ok: false as const,
         error: { code: "conversation_not_found" as const, message: "The conversation does not exist." } };
       const page = await this.conversationStore.listMessages(payload.conversationId, { limit: 100 });
+      const toolRecords = await this.conversationStore.listToolRecords?.(payload.conversationId, { limit: 512 }) ?? [];
       if (this.conversationId !== payload.conversationId)
         runtime.restoreConversation(payload.conversationId, page.messages.filter(message => message.content.trim().length > 0)
-          .map(({ role, content }) => ({ role, content })));
+          .map(({ role, content, sequence }) => ({ role, content, sequence })), toolRecords);
       this.conversationId = payload.conversationId;
       this.conversationPersisted = true;
       return { ok: true as const, conversationId: payload.conversationId,

@@ -1,14 +1,18 @@
 import * as nativeFs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { isConversationToolOutcome, isConversationToolRecord } from './conversation-tool-records.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const MANIFEST_NAME = 'manifest.json';
 const MESSAGES_NAME = 'messages.jsonl';
+const TOOL_RECORDS_NAME = 'tool-outcomes.jsonl';
 const MAX_MANIFEST_BYTES = 16 * 1024;
 const MAX_MESSAGE_BYTES = 1024 * 1024;
 const PAGE_SIZE_MAX = 100;
 const READ_CHUNK_BYTES = 64 * 1024;
+const MAX_TOOL_RECORDS = 512;
+const MAX_TOOL_RECORDS_BYTES = 256 * 1024;
 
 const ERROR_MESSAGES = Object.freeze({
     conversation_store_invalid: 'Conversation store configuration is invalid.',
@@ -22,6 +26,7 @@ const ERROR_MESSAGES = Object.freeze({
     conversation_commit_uncertain: 'The conversation write could not be confirmed.',
     conversation_id_collision: 'A unique conversation could not be created.',
     conversation_title_invalid: 'Conversation title is invalid.',
+    conversation_tool_record_invalid: 'Conversation tool record is invalid.',
 });
 const MESSAGE_VALIDATION_REASONS = new Set(['invalid_shape', 'invalid_role', 'content_not_string',
     'content_too_large', 'disallowed_control_character', 'empty_content', 'invalid_status']);
@@ -130,13 +135,14 @@ async function readLastRecord(handle, size, conversationId) {
         return { sequence: null, recoveredTail: true, tailStart: start, tail };
     }
     if (!validMessage(record, conversationId)) throw new ConversationStoreError('conversation_store_corrupt');
-    return { sequence: record.sequence, recoveredTail: false, terminated, start, size };
+    return { sequence: record.sequence, message: record, recoveredTail: false, terminated, start, size };
 }
 
 /**
- * Local visible-conversation persistence. The consumer supplies only visible
- * user/assistant text; tool payloads, audio, credentials and Memory2 are outside
- * this store's contract. Construction performs no filesystem I/O.
+ * Local conversation persistence. Visible messages remain separate from a
+ * tightly bounded, allowlisted tool-outcome log; raw tool payloads, audio,
+ * credentials and Memory2 are outside this store's contract. Construction
+ * performs no filesystem I/O.
  */
 export function createConversationStore({ baseDirectory, fileSystem = {}, now = () => new Date().toISOString(), idFactory = randomUUID } = {}) {
     if (typeof baseDirectory !== 'string' || !path.isAbsolute(baseDirectory))
@@ -190,7 +196,8 @@ export function createConversationStore({ baseDirectory, fileSystem = {}, now = 
 
     function pathsFor(conversationId) {
         const directory = conversationDirectory(conversationId);
-        return { directory, manifest: path.join(directory, MANIFEST_NAME), messages: path.join(directory, MESSAGES_NAME) };
+        return { directory, manifest: path.join(directory, MANIFEST_NAME), messages: path.join(directory, MESSAGES_NAME),
+            toolRecords: path.join(directory, TOOL_RECORDS_NAME) };
     }
 
     async function readManifest(conversationId) {
@@ -441,6 +448,121 @@ export function createConversationStore({ baseDirectory, fileSystem = {}, now = 
         });
     }
 
+    async function readToolRecordsUnlocked(conversationId, limit = MAX_TOOL_RECORDS) {
+        const { directory, toolRecords: toolRecordsPath } = pathsFor(conversationId);
+        try {
+            await assertSafeDirectory(directory);
+            const info = await fs.lstat(toolRecordsPath);
+            if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_TOOL_RECORDS_BYTES)
+                throw new ConversationStoreError('conversation_store_corrupt');
+            const text = await fs.readFile(toolRecordsPath, 'utf8');
+            if (text && !text.endsWith('\n')) throw new ConversationStoreError('conversation_store_corrupt');
+            const lines = text ? text.slice(0, -1).split('\n') : [];
+            if (lines.length > MAX_TOOL_RECORDS) throw new ConversationStoreError('conversation_store_corrupt');
+            let previousSequence = 0;
+            const records = lines.map(line => {
+                let record;
+                try { record = JSON.parse(line); } catch (cause) { throw new ConversationStoreError('conversation_store_corrupt', { cause }); }
+                if (!isConversationToolRecord(record, conversationId) || record.sequence <= previousSequence)
+                    throw new ConversationStoreError('conversation_store_corrupt');
+                previousSequence = record.sequence;
+                return Object.freeze(record);
+            });
+            return records.slice(-limit);
+        } catch (cause) {
+            if (cause instanceof ConversationStoreError) throw cause;
+            if (cause?.code === 'ENOENT') return [];
+            throw new ConversationStoreError('conversation_store_unavailable', { cause });
+        }
+    }
+
+    async function appendToolRecord(conversationId, input = {}) {
+        await initialize();
+        if (typeof conversationId !== 'string' || !UUID.test(conversationId))
+            throw new ConversationStoreError('conversation_id_invalid');
+        const keys = ['turnId', 'userSequence', 'toolName', 'callIdHash', 'status'];
+        if (!input || typeof input !== 'object' || Array.isArray(input) || Object.getPrototypeOf(input) !== Object.prototype
+            || Object.keys(input).length !== keys.length
+            || keys.some(key => !Object.hasOwn(input, key)) || !isConversationToolOutcome({
+                toolName: input.toolName, callIdHash: input.callIdHash, status: input.status,
+            }) || typeof input.turnId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/u.test(input.turnId)
+            || !Number.isSafeInteger(input.userSequence) || input.userSequence < 1)
+            throw new ConversationStoreError('conversation_tool_record_invalid');
+        return serialize(conversationId, async () => {
+            const manifest = await readManifest(conversationId);
+            if (!manifest) throw new ConversationStoreError('conversation_not_found');
+            if (manifest.messageCount !== input.userSequence)
+                throw new ConversationStoreError('conversation_tool_record_invalid');
+            const { messages: messagesPath, toolRecords: toolRecordsPath, directory } = pathsFor(conversationId);
+            await assertSafeDirectory(directory);
+            let messageHandle;
+            try {
+                messageHandle = await fs.open(messagesPath, 'r');
+                const size = (await messageHandle.stat()).size;
+                const tail = await readLastRecord(messageHandle, size, conversationId);
+                if (tail.message?.role !== 'user' || tail.sequence !== input.userSequence)
+                    throw new ConversationStoreError('conversation_tool_record_invalid');
+            } catch (cause) {
+                if (cause instanceof ConversationStoreError) throw cause;
+                throw new ConversationStoreError('conversation_store_unavailable', { cause });
+            } finally { await messageHandle?.close().catch(() => {}); }
+
+            const existing = await readToolRecordsUnlocked(conversationId);
+            if (existing.some(record => record.turnId === input.turnId && record.callIdHash === input.callIdHash))
+                return existing.find(record => record.turnId === input.turnId && record.callIdHash === input.callIdHash);
+            const timestamp = now();
+            if (!validDate(timestamp)) throw new ConversationStoreError('conversation_store_invalid');
+            const record = Object.freeze({ version: 1, id: idFactory(), conversationId, turnId: input.turnId,
+                userSequence: input.userSequence, sequence: (existing.at(-1)?.sequence ?? 0) + 1, toolName: input.toolName,
+                callIdHash: input.callIdHash, status: input.status, createdAt: timestamp });
+            if (!UUID.test(record.id) || !isConversationToolRecord(record, conversationId))
+                throw new ConversationStoreError('conversation_store_invalid');
+            const retained = [...existing, record];
+            while (retained.length > MAX_TOOL_RECORDS
+                || Buffer.byteLength(`${retained.map(item => JSON.stringify(item)).join('\n')}\n`, 'utf8') > MAX_TOOL_RECORDS_BYTES) {
+                if (retained.length <= 1) throw new ConversationStoreError('conversation_persist_failed');
+                retained.shift();
+            }
+            const bytes = Buffer.from(`${retained.map(item => JSON.stringify(item)).join('\n')}\n`, 'utf8');
+            try {
+                const info = await fs.lstat(toolRecordsPath).catch(error => error?.code === 'ENOENT' ? null : Promise.reject(error));
+                if (info && (!info.isFile() || info.isSymbolicLink())) throw new ConversationStoreError('conversation_store_corrupt');
+                const temporaryPath = path.join(directory, `.tool-outcomes-${idFactory()}.tmp`);
+                let handle;
+                let ownsTemporary = false;
+                try {
+                    handle = await fs.open(temporaryPath, 'wx', 0o600);
+                    ownsTemporary = true;
+                    await handle.writeFile(bytes);
+                    await handle.sync();
+                    await handle.close();
+                    handle = undefined;
+                    await fs.rename(temporaryPath, toolRecordsPath);
+                    ownsTemporary = false;
+                } finally {
+                    if (handle) await handle.close().catch(() => {});
+                    if (ownsTemporary) await fs.unlink(temporaryPath).catch(() => {});
+                }
+                return record;
+            } catch (cause) {
+                if (cause instanceof ConversationStoreError) throw cause;
+                throw new ConversationStoreError('conversation_persist_failed', { cause });
+            }
+        });
+    }
+
+    async function listToolRecords(conversationId, { limit = MAX_TOOL_RECORDS } = {}) {
+        await initialize();
+        if (typeof conversationId !== 'string' || !UUID.test(conversationId))
+            throw new ConversationStoreError('conversation_id_invalid');
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_TOOL_RECORDS)
+            throw new ConversationStoreError('conversation_page_invalid');
+        return serialize(conversationId, async () => {
+            if (!await readManifest(conversationId)) throw new ConversationStoreError('conversation_not_found');
+            return Object.freeze(await readToolRecordsUnlocked(conversationId, limit));
+        });
+    }
+
     async function listMessages(conversationId, options = {}) {
         await initialize();
         if (typeof conversationId !== 'string' || !UUID.test(conversationId))
@@ -467,5 +589,5 @@ export function createConversationStore({ baseDirectory, fileSystem = {}, now = 
     }
 
     return Object.freeze({ initialize, createConversation, listConversations, getConversation,
-        appendMessage, listMessages, updateTitle, deleteConversation });
+        appendMessage, appendToolRecord, listToolRecords, listMessages, updateTitle, deleteConversation });
 }

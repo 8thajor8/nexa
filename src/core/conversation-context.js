@@ -1,3 +1,5 @@
+import { isConversationToolRecordContextItem } from './conversation-tool-records.js';
+
 const DEFAULT_MAX_MESSAGES = 12;
 const DEFAULT_MAX_CHARACTERS = 12_000;
 
@@ -48,6 +50,7 @@ function cost(turns) {
 
 function hasRecoverableOutcome(turn) {
     if (turn.some(item => item?.role === 'assistant')) return true;
+    if (turn.some(isConversationToolRecordContextItem)) return true;
     const calls = new Set(turn.filter(item => item?.type === 'function_call')
         .map(item => item.call_id).filter(id => typeof id === 'string'));
     return turn.some(item => item?.type === 'function_call_output' && calls.has(item.call_id));

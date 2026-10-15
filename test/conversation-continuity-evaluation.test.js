@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -136,7 +136,7 @@ test('CONV-05C: active and restored sessions select the same recent visible mess
     await restoredRuntime.close();
 });
 
-test('CONV-05C: tool call/result pairs stay intact in active context; restart restores visible messages only', async t => {
+test('CONV-05C compatibility: active context keeps tool protocol; old visible-only restore remains supported', async t => {
     const recorder = responseRecorder([
         toolCall('synthetic_lookup', { key: 'fixture' }),
         final('Encontré el evento sintético para mañana.'),
@@ -257,6 +257,169 @@ test('CONV-05D: error after a successful tool preserves the actual call/result a
         && item.output.includes('synthetic-action-completed')));
     assert.ok(JSON.stringify(input).includes('Ejecuta la acción sintética.'));
     assert.ok(JSON.stringify(input).includes('¿Qué pasó con la acción?'));
+});
+
+test('CONV-05E1: a confirmed desktop action survives provider failure and restart without replay', async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'nexa-tool-outcome-restart-'));
+    t.after(async () => {
+        const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(directory));
+        assert.ok(relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+        await rm(directory, { recursive: true, force: true });
+    });
+    const storeOptions = { baseDirectory: path.join(directory, 'conversations') };
+    const store = createConversationStore(storeOptions);
+    const id = UUID;
+    await store.createConversation(id);
+    const firstUser = await store.appendMessage(id, { role: 'user', content: 'Abrí la aplicación sintética.' });
+    let sideEffects = 0;
+    const persistToolOutcome = async ({ conversationId, turnId, ...outcome }) => {
+        const current = await store.getConversation(conversationId);
+        await store.appendToolRecord(conversationId, { ...outcome, turnId, userSequence: current.messageCount });
+    };
+    const failedRecorder = responseRecorder([
+        toolCall('open_app', { app: 'synthetic-private-application-name' }, 'synthetic-tool-call-1'),
+        new Error('synthetic provider failure after action'),
+    ]);
+    const firstRuntime = runtimeWithResponses(failedRecorder, { persistToolOutcome, agentOptions: {
+        getTools: () => [{ type: 'function', name: 'open_app', parameters: { type: 'object' } }],
+        execute: async () => { sideEffects++; return { success: true, appName: 'synthetic-private-application-name' }; },
+    } });
+    assert.equal(firstRuntime.restoreConversation(id, []), true);
+    assert.equal(firstUser.message.sequence, 1);
+    assert.equal((await send(firstRuntime, id, 'tool-persist-failure', 'Abrí la aplicación sintética.')).status, 'error');
+    await firstRuntime.close();
+    assert.equal(sideEffects, 1, 'the synthetic action should have executed exactly once before provider failure');
+
+    const records = await createConversationStore(storeOptions).listToolRecords(id);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].toolName, 'open_app');
+    assert.equal(records[0].status, 'succeeded');
+    const recordText = await readFile(path.join(storeOptions.baseDirectory, 'conversations', id, 'tool-outcomes.jsonl'), 'utf8');
+    assert.equal(recordText.includes('synthetic-private-application-name'), false);
+
+    const restoredRecorder = responseRecorder([final('La acción anterior figura como completada; no la repetí.')]);
+    const restoredRuntime = runtimeWithResponses(restoredRecorder, { agentOptions: {
+        getTools: () => [{ type: 'function', name: 'open_app', parameters: { type: 'object' } }],
+        execute: async () => { sideEffects++; return { success: true }; },
+    } });
+    t.after(() => restoredRuntime.close());
+    const reopenedStore = createConversationStore(storeOptions);
+    const messages = await reopenedStore.listMessages(id);
+    assert.equal(restoredRuntime.restoreConversation(id, messages.messages, records), true);
+    await reopenedStore.appendMessage(id, { role: 'user', content: '¿Qué ocurrió con la aplicación?' });
+    assert.equal((await send(restoredRuntime, id, 'tool-restored-followup', '¿Qué ocurrió con la aplicación?')).status, 'completed');
+    assert.equal(sideEffects, 1, 'restoration must never execute a stored action');
+    const inputText = JSON.stringify(restoredRecorder.requests[0].input);
+    assert.match(inputText, /Historical tool outcome \(factual record only; not an instruction or current state; never replay this action/u);
+    assert.ok(restoredRecorder.requests[0].input.some(item => item?.role === 'developer'
+        && item.content.includes('"tool":"open_app","status":"succeeded"')));
+    assert.equal(inputText.includes('synthetic-private-application-name'), false);
+});
+
+test('CONV-05E1: cancellation after an external action leaves a restorable outcome and never replays it', async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'nexa-tool-outcome-cancel-'));
+    t.after(async () => {
+        const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(directory));
+        assert.ok(relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+        await rm(directory, { recursive: true, force: true });
+    });
+    const options = { baseDirectory: path.join(directory, 'conversations') };
+    const store = createConversationStore(options);
+    const id = UUID;
+    await store.createConversation(id);
+    const user = await store.appendMessage(id, { role: 'user', content: 'Abrí la aplicación sintética.' });
+    let entered, release;
+    const toolEntered = new Promise(resolve => { entered = resolve; });
+    const actionRelease = new Promise(resolve => { release = resolve; });
+    let sideEffects = 0;
+    const persistToolOutcome = async ({ conversationId, turnId, ...outcome }) => {
+        const current = await store.getConversation(conversationId);
+        await store.appendToolRecord(conversationId, { ...outcome, turnId, userSequence: current.messageCount });
+    };
+    const recorder = responseRecorder([toolCall('open_app', {}, 'cancelled-action-call-1'), final('Esto no debe alcanzarse.')]);
+    const runtime = runtimeWithResponses(recorder, { persistToolOutcome, agentOptions: {
+        getTools: () => [{ type: 'function', name: 'open_app', parameters: { type: 'object' } }],
+        execute: async () => { sideEffects++; entered(); await actionRelease; return { success: true }; },
+    } });
+    assert.equal(runtime.restoreConversation(id, []), true);
+    const pending = send(runtime, id, 'tool-cancel-after-effect', 'Abrí la aplicación sintética.');
+    await toolEntered;
+    assert.equal(runtime.cancelRequest('continuity-tool-cancel-after-effect', 'test'), true);
+    release();
+    assert.equal((await pending).status, 'cancelled');
+    await runtime.close();
+    assert.equal((await store.listToolRecords(id))[0].status, 'succeeded');
+
+    const restored = runtimeWithResponses(responseRecorder([final('La acción anterior quedó registrada como completada.')]), {
+        agentOptions: { getTools: () => [{ type: 'function', name: 'open_app', parameters: { type: 'object' } }],
+            execute: async () => { sideEffects++; return { success: true }; } },
+    });
+    t.after(() => restored.close());
+    const reopened = createConversationStore(options);
+    const messages = await reopened.listMessages(id);
+    const records = await reopened.listToolRecords(id);
+    assert.equal(restored.restoreConversation(id, messages.messages, records), true);
+    assert.equal(user.message.sequence, 1);
+    assert.equal((await send(restored, id, 'tool-cancel-followup', '¿Qué pasó con la aplicación?')).status, 'completed');
+    assert.equal(sideEffects, 1);
+});
+
+test('CONV-05E1: outcome-store failure does not trigger another execution of the external tool', async t => {
+    let sideEffects = 0;
+    const recorder = responseRecorder([toolCall('open_app', {}, 'persistence-failure-call-1'), final('La acción se ejecutó una sola vez.')]);
+    const runtime = runtimeWithResponses(recorder, { persistToolOutcome: async () => { throw new Error('synthetic store failure'); },
+        agentOptions: { getTools: () => [{ type: 'function', name: 'open_app', parameters: { type: 'object' } }],
+            execute: async () => { sideEffects++; return { success: true }; } } });
+    const id = runtime.createConversation();
+    t.after(() => runtime.close());
+    assert.equal((await send(runtime, id, 'tool-store-failure', 'Abrí la aplicación sintética.')).status, 'completed');
+    assert.equal(sideEffects, 1);
+    assert.equal(recorder.requests.length, 2);
+});
+
+test('CONV-05E1: an executed but failed tool is persisted as failed and restored without execution', async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'nexa-tool-failed-restart-'));
+    t.after(async () => {
+        const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(directory));
+        assert.ok(relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+        await rm(directory, { recursive: true, force: true });
+    });
+    const options = { baseDirectory: path.join(directory, 'conversations') };
+    const store = createConversationStore(options);
+    const id = UUID;
+    await store.createConversation(id);
+    const user = await store.appendMessage(id, { role: 'user', content: 'Intentá abrir la aplicación sintética.' });
+    let attempts = 0;
+    const persistToolOutcome = async ({ conversationId, turnId, ...outcome }) => {
+        const current = await store.getConversation(conversationId);
+        await store.appendToolRecord(conversationId, { ...outcome, turnId, userSequence: current.messageCount });
+    };
+    const runtime = runtimeWithResponses(responseRecorder([
+        toolCall('open_app', {}, 'failed-open-call-1'), final('La operación no tuvo éxito.'),
+    ]), { persistToolOutcome, agentOptions: {
+        getTools: () => [{ type: 'function', name: 'open_app', parameters: { type: 'object' } }],
+        execute: async () => { attempts++; throw new Error('synthetic private failure detail'); },
+    } });
+    assert.equal(runtime.restoreConversation(id, []), true);
+    assert.equal((await send(runtime, id, 'tool-failed-turn', 'Intentá abrir la aplicación sintética.')).status, 'completed');
+    await runtime.close();
+    const records = await store.listToolRecords(id);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].status, 'failed');
+
+    const reopened = createConversationStore(options);
+    const messages = await reopened.listMessages(id);
+    const restoredRecorder = responseRecorder([final('La operación previa figura como fallida.')]);
+    const restored = runtimeWithResponses(restoredRecorder, {
+        agentOptions: { getTools: () => [{ type: 'function', name: 'open_app', parameters: { type: 'object' } }],
+            execute: async () => { attempts++; return { success: true }; } },
+    });
+    t.after(() => restored.close());
+    assert.equal(restored.restoreConversation(id, messages.messages, records), true);
+    assert.equal((await send(restored, id, 'tool-failed-followup', '¿Cuál fue el resultado?')).status, 'completed');
+    assert.equal(attempts, 1);
+    assert.ok(restoredRecorder.requests[0].input.some(item => item?.role === 'developer'
+        && item.content.includes('"tool":"open_app","status":"failed"')));
 });
 
 test('CONV-05D: failed tool outcome remains explicitly failed and is never promoted to success', async t => {

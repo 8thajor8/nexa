@@ -8,6 +8,7 @@ import { openMemoryBackend } from '../memory/backend.js';
 import { classifySystemDiagnosticRequest, createOperationalDiagnostics, createTechnicalDiagnosticReport,
     formatMemoryDiagnostics, formatSystemStatus, formatToolCatalog, formatVoiceStatus } from './system-diagnostics.js';
 import { getToolsForModel, hostedToolRegistry, localToolRegistry } from '../tools/index.js';
+import { conversationToolRecordContextItem, isConversationToolRecord } from './conversation-tool-records.js';
 
 const ID_MAX_LENGTH = 128;
 
@@ -92,17 +93,31 @@ function validIdentifier(value) {
 }
 
 const CONVERSATION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
-function restoredHistory(messages, policy) {
+function restoredHistory(messages, toolRecords, conversationId, policy) {
     if (!Array.isArray(messages) || messages.length > 100)
         throw new TypeError('conversation_history_invalid');
-    const normalized = messages.map(message => {
+    if (!Array.isArray(toolRecords) || toolRecords.length > 512
+        || toolRecords.some(record => !isConversationToolRecord(record, conversationId)))
+        throw new TypeError('conversation_tool_records_invalid');
+    const normalized = [];
+    const recordsByUserSequence = new Map();
+    for (const record of toolRecords) {
+        const records = recordsByUserSequence.get(record.userSequence) ?? [];
+        records.push(record);
+        recordsByUserSequence.set(record.userSequence, records);
+    }
+    for (const message of messages) {
         if (!message || typeof message !== 'object' || Array.isArray(message)
             || !['user', 'assistant'].includes(message.role) || typeof message.content !== 'string'
             || message.content.trim() === '' || message.content.length > 1_000_000
             || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(message.content))
             throw new TypeError('conversation_history_invalid');
-        return Object.freeze({ role: message.role, content: message.content });
-    });
+        normalized.push(Object.freeze({ role: message.role, content: message.content }));
+        if (message.role === 'user' && Number.isSafeInteger(message.sequence)) {
+            for (const record of recordsByUserSequence.get(message.sequence) ?? [])
+                normalized.push(conversationToolRecordContextItem(record));
+        }
+    }
     return selectConversationContext(normalized, policy);
 }
 
@@ -126,8 +141,11 @@ export function createConversationRuntime({
     maxRestoredHistoryMessages,
     maxRestoredHistoryCharacters,
     operationalDiagnostics = createOperationalDiagnostics({ memoryMode }),
+    persistToolOutcome = null,
 } = {}) {
     if (typeof agentFactory !== 'function') throw new TypeError('agent_factory_invalid');
+    if (persistToolOutcome !== null && typeof persistToolOutcome !== 'function')
+        throw new TypeError('conversation_tool_persistence_invalid');
     const contextPolicy = normalizeConversationContextPolicy(conversationContextPolicy ?? {
         maxMessages: maxRestoredHistoryMessages ?? DEFAULT_CONVERSATION_CONTEXT_POLICY.maxMessages,
         maxCharacters: maxRestoredHistoryCharacters ?? DEFAULT_CONVERSATION_CONTEXT_POLICY.maxCharacters,
@@ -306,6 +324,9 @@ export function createConversationRuntime({
                 onSpotifyNowPlaying: card => {
                     if (!entry.terminal && card && typeof card === 'object') emit(entry, 'spotify_now_playing', { card });
                 },
+                onToolOutcome: persistToolOutcome ? async outcome => {
+                    await persistToolOutcome({ conversationId: entry.conversationId, turnId: entry.requestId, ...outcome });
+                } : undefined,
             });
             trace('agent_run_completed', { conversationId: entry.conversationId, requestId: entry.requestId,
                 durationMs: performance.now() - agentRunStartedAt });
@@ -355,14 +376,14 @@ export function createConversationRuntime({
         return conversationId;
     }
 
-    function restoreConversation(conversationId, messages = []) {
+    function restoreConversation(conversationId, messages = [], toolRecords = []) {
         if (closed) throw new Error('conversation_runtime_closed');
         if (typeof conversationId !== 'string' || !CONVERSATION_UUID.test(conversationId))
             throw new TypeError('conversation_id_invalid');
         if (conversations.has(conversationId)) return false;
         if (activeRequests.size > 0) throw new Error('conversation_runtime_busy');
         conversations.set(conversationId, { agent: null, agentPromise: null,
-            initialConversationHistory: restoredHistory(messages, contextPolicy) });
+            initialConversationHistory: restoredHistory(messages, toolRecords, conversationId, contextPolicy) });
         return true;
     }
 

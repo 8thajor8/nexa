@@ -4,6 +4,7 @@ import * as fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createConversationStore, ConversationStoreError } from '../src/core/conversation-store.js';
+import { createConversationToolOutcome } from '../src/core/conversation-tool-records.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const code = expected => error => error instanceof ConversationStoreError && error.code === expected;
@@ -106,6 +107,44 @@ test('appends visible user and assistant messages with stable chronological sequ
     const page = await f.store.listMessages(conversation.conversationId);
     assert.deepEqual(page.messages.map(item => item.id), [user.message.id, assistant.message.id]);
     assert.equal(page.nextCursor, null);
+});
+
+test('persists bounded, minimized tool outcomes and restores them without arguments or payloads', async t => {
+    const f = await fixture(t);
+    const conversation = await f.store.createConversation();
+    const user = await f.store.appendMessage(conversation.conversationId, { role: 'user', content: 'Abrí la aplicación sintética.' });
+    const succeeded = createConversationToolOutcome({ toolName: 'open_app', callId: 'call-private-1',
+        result: { success: true, appName: 'synthetic-secret-app' } });
+    const failed = createConversationToolOutcome({ toolName: 'spotify_next', callId: 'call-private-2',
+        result: { success: false, error: { code: 'private-error-payload' } } });
+    const uncertain = createConversationToolOutcome({ toolName: 'spotify_play', callId: 'call-private-3',
+        result: { success: false, outcome: 'uncertain', verification: 'private-result-payload' } });
+    const first = await f.store.appendToolRecord(conversation.conversationId, { turnId: 'synthetic-turn-1',
+        userSequence: user.message.sequence, ...succeeded });
+    const duplicate = await f.store.appendToolRecord(conversation.conversationId, { turnId: 'synthetic-turn-1',
+        userSequence: user.message.sequence, ...succeeded });
+    await f.store.appendToolRecord(conversation.conversationId, { turnId: 'synthetic-turn-1',
+        userSequence: user.message.sequence, ...failed });
+    await f.store.appendToolRecord(conversation.conversationId, { turnId: 'synthetic-turn-1',
+        userSequence: user.message.sequence, ...uncertain });
+    assert.equal(duplicate.id, first.id);
+    assert.deepEqual((await createConversationStore(f.options).listToolRecords(conversation.conversationId))
+        .map(({ toolName, status, sequence, userSequence }) => ({ toolName, status, sequence, userSequence })), [
+            { toolName: 'open_app', status: 'succeeded', sequence: 1, userSequence: user.message.sequence },
+            { toolName: 'spotify_next', status: 'failed', sequence: 2, userSequence: user.message.sequence },
+            { toolName: 'spotify_play', status: 'unknown', sequence: 3, userSequence: user.message.sequence },
+        ]);
+    const logPath = path.join(f.options.baseDirectory, 'conversations', conversation.conversationId, 'tool-outcomes.jsonl');
+    const stored = await fs.readFile(logPath, 'utf8');
+    assert.equal(stored.includes('synthetic-secret-app'), false);
+    assert.equal(stored.includes('private-error-payload'), false);
+    assert.equal(stored.includes('private-result-payload'), false);
+    const otherConversation = await f.store.createConversation();
+    assert.deepEqual(await f.store.listToolRecords(otherConversation.conversationId), []);
+    await assert.rejects(f.store.appendToolRecord(conversation.conversationId, {
+        turnId: 'synthetic-turn-1', userSequence: user.message.sequence,
+        ...succeeded, arguments: { secret: 'must-not-persist' },
+    }), code('conversation_tool_record_invalid'));
 });
 
 test('lists conversations by most recent activity with stable tie ordering', async t => {

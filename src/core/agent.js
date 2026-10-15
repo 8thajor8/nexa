@@ -24,6 +24,7 @@ import { screenMemorySecret } from '../memory/secret-screening.js';
 import { getOrganicMemoryAttributePolicy } from './organic-memory-authorization.js';
 import { DEFAULT_CONVERSATION_CONTEXT_POLICY, normalizeConversationContextPolicy,
     selectConversationContext } from './conversation-context.js';
+import { createConversationToolOutcome, isConversationToolRecordContextItem } from './conversation-tool-records.js';
 
 function stableValue(value) {
     if (Array.isArray(value)) return value.map(stableValue);
@@ -565,7 +566,8 @@ export async function createAgent({
     }
     if (!Array.isArray(initialConversationHistory) || initialConversationHistory.length > 100
         || initialConversationHistory.some(message => !message || typeof message !== 'object'
-            || !['user', 'assistant'].includes(message.role) || typeof message.content !== 'string'
+            || (!['user', 'assistant'].includes(message.role) && !isConversationToolRecordContextItem(message))
+            || typeof message.content !== 'string'
             || !message.content.trim() || message.content.length > 1_000_000
             || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(message.content)))
         throw new TypeError('conversation_history_invalid');
@@ -1632,6 +1634,16 @@ ${memoryToPrompt(memory)}
                     });
                 }
                 const authorization = authorizationRequirement(toolCall.name, result);
+                const persistentOutcome = createConversationToolOutcome({ toolName: toolCall.name,
+                    callId: toolCall.call_id, result, authorizationRequired: Boolean(authorization) });
+                if (persistentOutcome && typeof options?.onToolOutcome === 'function') {
+                    try { await options.onToolOutcome(persistentOutcome); }
+                    catch {
+                        // A persistence failure must not cause this already-dispatched action
+                        // to be retried. The active agent still retains its call/result pair.
+                        diagnostic('tool_outcome_persist_failed', { tool: toolCall.name });
+                    }
+                }
                 const hasDesktopAuthorizationUi = authorization && typeof options?.onAuthorizationRequired === 'function';
                 if (hasDesktopAuthorizationUi) {
                     try { options.onAuthorizationRequired(authorization); } catch { /* UI notification cannot change tool execution. */ }

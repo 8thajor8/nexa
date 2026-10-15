@@ -278,6 +278,15 @@ function createDesktopConversationRuntime(memoryMode: "memory1" | "memory2-reado
   const runtime = createConversationRuntime({
     memoryMode,
     streamResponses: true,
+    persistToolOutcome: async ({ conversationId, turnId, toolName, callIdHash, status }: {
+      conversationId: string; turnId: string; toolName: string; callIdHash: string;
+      status: "succeeded" | "failed" | "unknown";
+    }) => {
+      const current = await conversationStore.getConversation(conversationId) as { messageCount?: unknown } | null;
+      if (!current || !Number.isSafeInteger(current.messageCount)) throw new Error("conversation_tool_turn_unavailable");
+      await conversationStore.appendToolRecord(conversationId, { turnId, userSequence: current.messageCount,
+        toolName, callIdHash, status });
+    },
     ...(storePath ? { storePath } : {}),
     operationalDiagnostics: desktopOperationalDiagnostics,
     agentOptions: { ...agentOptions,
