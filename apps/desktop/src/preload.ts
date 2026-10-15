@@ -14,6 +14,7 @@ import {
   CHAT_CREATE_CONVERSATION_CHANNEL,
   CHAT_EVENT_CHANNEL,
   CHAT_LIST_CONVERSATIONS_CHANNEL,
+  CHAT_RENAME_CONVERSATION_CHANNEL,
   CHAT_LIST_MESSAGES_CHANNEL,
   CHAT_OPEN_CONVERSATION_CHANNEL,
   CHAT_SEND_MESSAGE_CHANNEL,
@@ -80,6 +81,7 @@ import {
   isChatCancelRequest, isChatCancelResponse, isChatConversationCreateRequest, isChatConversationResponse, isChatEventEnvelope,
   isChatConversationListRequest, isChatConversationListResponse,
   isChatConversationMessagesRequest, isChatConversationMessagesResponse, isChatConversationOpenRequest,
+  isChatConversationRenameRequest, isChatConversationRenameResponse,
   isChatSendMessageRequest, isChatSendResponse,
 } from "./shared/chat-ipc-validation";
 
@@ -272,6 +274,14 @@ const api: NexaDesktopApi = {
       if (!isChatConversationListRequest(request)) throw new Error("invalid_chat_conversation_list_request");
       const response: unknown = await ipcRenderer.invoke(CHAT_LIST_CONVERSATIONS_CHANNEL, request);
       if (!isChatConversationListResponse(response)) throw new Error("invalid_chat_conversation_list_response");
+      return response;
+    },
+    async renameConversation(request) {
+      if (!isChatConversationRenameRequest(request)) throw new Error("invalid_chat_conversation_rename_request");
+      const response: unknown = await ipcRenderer.invoke(CHAT_RENAME_CONVERSATION_CHANNEL, request);
+      if (!isChatConversationRenameResponse(response)
+        || (response.ok && response.conversationId !== request.conversationId))
+        throw new Error("invalid_chat_conversation_rename_response");
       return response;
     },
     async sendMessage(request) {

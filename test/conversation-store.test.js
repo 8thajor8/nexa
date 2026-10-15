@@ -49,6 +49,22 @@ test('automatic titles are bounded, applied once, and never replace a manual tit
     await assert.rejects(f.store.updateTitle(conversation.conversationId, 'x'.repeat(61), 'automatic'), code('conversation_title_invalid'));
 });
 
+test('manual titles normalize whitespace, preserve Unicode, and remain protected from late automatic results', async t => {
+    const f = await fixture(t);
+    const conversation = await f.store.createConversation();
+    assert.equal(await f.store.updateTitle(conversation.conversationId, '  Viaje   a Córdoba 🚆  ', 'manual'), true);
+    assert.equal(await f.store.updateTitle(conversation.conversationId, 'Título tardío', 'automatic'), false);
+    assert.deepEqual(await f.store.getConversation(conversation.conversationId).then(({ title, titleSource }) => ({ title, titleSource })),
+        { title: 'Viaje a Córdoba 🚆', titleSource: 'manual' });
+    const reopened = createConversationStore(f.options);
+    assert.deepEqual(await reopened.getConversation(conversation.conversationId).then(({ title, titleSource }) => ({ title, titleSource })),
+        { title: 'Viaje a Córdoba 🚆', titleSource: 'manual' });
+    await assert.rejects(f.store.updateTitle(conversation.conversationId, '   ', 'manual'), code('conversation_title_invalid'));
+    await assert.rejects(f.store.updateTitle(conversation.conversationId, 'x'.repeat(121), 'manual'), code('conversation_title_invalid'));
+    await assert.rejects(f.store.updateTitle('00000000-0000-4000-8000-000000000099', 'No existe', 'manual'), code('conversation_not_found'));
+    assert.equal((await f.store.getConversation(conversation.conversationId)).title, 'Viaje a Córdoba 🚆');
+});
+
 test('reads legacy manifests and protects pre-existing non-placeholder titles', async t => {
     const f = await fixture(t);
     const provisional = await f.store.createConversation();

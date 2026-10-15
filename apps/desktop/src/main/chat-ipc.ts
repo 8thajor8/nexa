@@ -2,10 +2,10 @@ import { ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from "electron";
 import { performance } from "node:perf_hooks";
 import { createHash, type Hash } from "node:crypto";
 import { isChatCancelRequest, isChatConversationCreateRequest, isChatConversationListRequest, isChatConversationMessagesRequest, isChatConversationOpenRequest,
-  isChatConversationResponse, isChatEventEnvelope, isChatSendMessageRequest } from "../shared/chat-ipc-validation.js";
+  isChatConversationRenameRequest, isChatConversationResponse, isChatEventEnvelope, isChatSendMessageRequest } from "../shared/chat-ipc-validation.js";
 import {
   CHAT_CANCEL_REQUEST_CHANNEL, CHAT_CREATE_CONVERSATION_CHANNEL, CHAT_EVENT_CHANNEL, CHAT_LIST_CONVERSATIONS_CHANNEL,
-  CHAT_LIST_MESSAGES_CHANNEL, CHAT_OPEN_CONVERSATION_CHANNEL, CHAT_SEND_MESSAGE_CHANNEL,
+  CHAT_LIST_MESSAGES_CHANNEL, CHAT_OPEN_CONVERSATION_CHANNEL, CHAT_RENAME_CONVERSATION_CHANNEL, CHAT_SEND_MESSAGE_CHANNEL,
   type AuthorizationRequiredEvent, type ChatConversationMessage, type ChatConversationMessagesRequest,
   type ChatConversationResponse, type ChatMessageCursor, type ChatConversationListRequest, type SpotifyNowPlayingEvent,
   type ChatEventEnvelope, type ChatIpcErrorCode, type ChatSendMessageRequest,
@@ -29,7 +29,7 @@ export interface ConversationStoreApi {
   }>;
   getConversation(conversationId: string): Promise<unknown | null>;
   appendMessage(conversationId: string, message: { role: "user" | "assistant"; content: string }): Promise<unknown>;
-  updateTitle?(conversationId: string, title: string, source: "automatic"): Promise<boolean>;
+  updateTitle?(conversationId: string, title: string, source: "automatic" | "manual"): Promise<boolean>;
   listMessages(conversationId: string, options?: { limit?: number; cursor?: ChatMessageCursor | null }): Promise<{
     messages: ChatConversationMessage[]; nextCursor: ChatMessageCursor | null; incompleteTail: boolean;
   }>;
@@ -268,6 +268,36 @@ export class ChatIpcService {
     }
   }
 
+  async renameConversation(event: ChatIpcEvent, payload: unknown) {
+    const window = this.getWindow();
+    if (!window || !isTrustedIpcSender(event, window)) throw new Error("untrusted_ipc_sender");
+    if (!isChatConversationRenameRequest(payload)) return { ok: false as const,
+      error: { code: "invalid_request" as const, message: "The conversation rename request is invalid." } };
+    const store = this.conversationStore;
+    if (!store?.updateTitle) return { ok: false as const,
+      error: { code: "operation_failed" as const, message: "Conversation titles cannot be changed right now." } };
+    const title = payload.title.replace(/\s+/gu, " ").trim();
+    if (!title || title.length > 120 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(title))
+      return { ok: false as const, error: { code: "invalid_title" as const,
+        message: "The title must contain 1 to 120 characters." } };
+    try {
+      const updated = await store.updateTitle(payload.conversationId, title, "manual");
+      if (!updated) return { ok: false as const, error: { code: "operation_failed" as const,
+        message: "The conversation title could not be updated." } };
+      return { ok: true as const, conversationId: payload.conversationId, title };
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? error.code : null;
+      this.trace("conversation_rename_failed", { stage: "persistent_write",
+        errorCode: typeof code === "string" && ["conversation_not_found", "conversation_title_invalid"].includes(code) ? code : null });
+      if (code === "conversation_not_found") return { ok: false as const,
+        error: { code: "conversation_not_found" as const, message: "This conversation no longer exists." } };
+      if (code === "conversation_title_invalid") return { ok: false as const,
+        error: { code: "invalid_title" as const, message: "The title must contain 1 to 120 characters." } };
+      return { ok: false as const, error: { code: "operation_failed" as const,
+        message: "The conversation title could not be saved." } };
+    }
+  }
+
   send(event: ChatIpcEvent, payload: unknown) {
     const window = this.getWindow();
     if (!window || !isTrustedIpcSender(event, window)) throw new Error("untrusted_ipc_sender");
@@ -502,7 +532,7 @@ export class ChatIpcService {
       if (!title) return;
       const updated = await store.updateTitle!(conversationId, title, "automatic");
       if (!updated || active.window.isDestroyed?.()) return;
-      const event: ChatEventEnvelope = { conversationId, requestId, status: "conversation_title_updated", title };
+      const event: ChatEventEnvelope = { conversationId, requestId, status: "conversation_title_updated", title, source: "automatic" };
       if (!isChatEventEnvelope(event)) return;
       try {
         active.window.webContents.send(CHAT_EVENT_CHANNEL, event);
@@ -583,6 +613,7 @@ export function registerChatIpcHandlers(
     ipc.handle(CHAT_OPEN_CONVERSATION_CHANNEL, (event, payload) => service!.openConversation(event, payload));
     ipc.handle(CHAT_LIST_MESSAGES_CHANNEL, (event, payload) => service!.listMessages(event, payload));
     ipc.handle(CHAT_LIST_CONVERSATIONS_CHANNEL, (event, payload) => service!.listConversations(event, payload));
+    ipc.handle(CHAT_RENAME_CONVERSATION_CHANNEL, (event, payload) => service!.renameConversation(event, payload));
   }
   ipc.handle(CHAT_SEND_MESSAGE_CHANNEL, (event, payload) => service!.send(event, payload));
   ipc.handle(CHAT_CANCEL_REQUEST_CHANNEL, (event, payload) => service!.cancel(event, payload));
@@ -599,6 +630,7 @@ export function removeChatIpcHandlers(ipc: IpcMainLike = ipcMain): void {
   ipc.removeHandler(CHAT_OPEN_CONVERSATION_CHANNEL);
   ipc.removeHandler(CHAT_LIST_MESSAGES_CHANNEL);
   ipc.removeHandler(CHAT_LIST_CONVERSATIONS_CHANNEL);
+  ipc.removeHandler(CHAT_RENAME_CONVERSATION_CHANNEL);
   ipc.removeHandler(CHAT_SEND_MESSAGE_CHANNEL);
   ipc.removeHandler(CHAT_CANCEL_REQUEST_CHANNEL);
   service?.dispose();

@@ -17,41 +17,67 @@ afterEach(cleanup);
 describe("Conversations panel", () => {
   it("shows persisted conversations and marks the active one", () => {
     render(<ConversationsPanel conversations={conversations} activeConversationId={conversations[0].conversationId}
-      busy={false} loading={false} hasMore={false} error={null} onNew={vi.fn()} onSelect={vi.fn()} onLoadMore={vi.fn()} />);
+      busy={false} loading={false} hasMore={false} error={null} onNew={vi.fn()} onSelect={vi.fn()} onLoadMore={vi.fn()} onRenameCommitted={vi.fn()} />);
     expect(screen.getByText("Primera").closest("button")?.getAttribute("aria-current")).toBe("true");
     expect(screen.getByText("4 mensajes")).toBeTruthy();
     expect(screen.getByText("Primera").classList.contains("conversation-history-title")).toBe(true);
     expect(screen.getByText("4 mensajes").classList.contains("conversation-history-count")).toBe(true);
     expect(document.querySelector(".conversation-history-time")?.textContent).toMatch(/\d/);
     expect(screen.getByRole("button", { name: "Nueva conversación" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Renombrar Primera" })).toBeTruthy();
   });
 
   it("routes new/select/page actions and blocks them while the chat is busy", () => {
     const onNew = vi.fn(); const onSelect = vi.fn(); const onLoadMore = vi.fn();
+    const onRenameCommitted = vi.fn();
     const view = render(<ConversationsPanel conversations={conversations} activeConversationId={null} busy={false}
-      loading={false} hasMore={true} error={null} onNew={onNew} onSelect={onSelect} onLoadMore={onLoadMore} />);
+      loading={false} hasMore={true} error={null} onNew={onNew} onSelect={onSelect} onLoadMore={onLoadMore} onRenameCommitted={onRenameCommitted} />);
     fireEvent.click(screen.getByRole("button", { name: "Nueva conversación" }));
-    fireEvent.click(screen.getByRole("button", { name: /Primera/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Abrir conversación Primera" }));
     fireEvent.click(screen.getByRole("button", { name: /Ver conversaciones anteriores/ }));
     expect(onNew).toHaveBeenCalledOnce();
     expect(onSelect).toHaveBeenCalledWith(conversations[0].conversationId);
     expect(onLoadMore).toHaveBeenCalledOnce();
 
     view.rerender(<ConversationsPanel conversations={conversations} activeConversationId={null} busy={true} loading={false}
-      hasMore={true} error={null} onNew={onNew} onSelect={onSelect} onLoadMore={onLoadMore} />);
+      hasMore={true} error={null} onNew={onNew} onSelect={onSelect} onLoadMore={onLoadMore} onRenameCommitted={onRenameCommitted} />);
     expect((screen.getByRole("button", { name: "Nueva conversación" }) as HTMLButtonElement).disabled).toBe(true);
-    expect((screen.getByRole("button", { name: /Primera/ }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Abrir conversación Primera" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("shows loading, empty, and error states", () => {
     const view = render(<ConversationsPanel conversations={[]} activeConversationId={null} busy={false} loading
-      hasMore={false} error={null} onNew={vi.fn()} onSelect={vi.fn()} onLoadMore={vi.fn()} />);
+      hasMore={false} error={null} onNew={vi.fn()} onSelect={vi.fn()} onLoadMore={vi.fn()} onRenameCommitted={vi.fn()} />);
     expect(screen.getByRole("status").textContent).toContain("Cargando");
     view.rerender(<ConversationsPanel conversations={[]} activeConversationId={null} busy={false} loading={false}
-      hasMore={false} error={null} onNew={vi.fn()} onSelect={vi.fn()} onLoadMore={vi.fn()} />);
+      hasMore={false} error={null} onNew={vi.fn()} onSelect={vi.fn()} onLoadMore={vi.fn()} onRenameCommitted={vi.fn()} />);
     expect(screen.getByText("Todavía no hay conversaciones guardadas.")).toBeTruthy();
     view.rerender(<ConversationsPanel conversations={[]} activeConversationId={null} busy={false} loading={false}
-      hasMore={false} error="No se pudo cargar" onNew={vi.fn()} onSelect={vi.fn()} onLoadMore={vi.fn()} />);
+      hasMore={false} error="No se pudo cargar" onNew={vi.fn()} onSelect={vi.fn()} onLoadMore={vi.fn()} onRenameCommitted={vi.fn()} />);
     expect(screen.getByRole("alert").textContent).toContain("No se pudo cargar");
+  });
+
+  it("edits inline, saves with Enter, cancels with Escape, and keeps editing separate from navigation", async () => {
+    const onSelect = vi.fn();
+    const onRenameCommitted = vi.fn();
+    const renameConversation = vi.fn(async ({ conversationId, title }: { conversationId: string; title: string }) =>
+      ({ ok: true as const, conversationId, title }));
+    Object.assign(window, { nexaDesktop: { chat: { renameConversation } } });
+    render(<ConversationsPanel conversations={conversations} activeConversationId={conversations[0].conversationId}
+      busy={false} loading={false} hasMore={false} error={null} onNew={vi.fn()} onSelect={onSelect} onLoadMore={vi.fn()}
+      onRenameCommitted={onRenameCommitted} />);
+    fireEvent.click(screen.getByRole("button", { name: "Renombrar Primera" }));
+    const input = screen.getByRole("textbox", { name: "Nuevo título de conversación" }) as HTMLInputElement;
+    expect(input.value).toBe("Primera");
+    fireEvent.change(input, { target: { value: "  Viaje   a Córdoba  " } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await vi.waitFor(() => expect(renameConversation).toHaveBeenCalledWith({ conversationId: conversations[0].conversationId, title: "Viaje a Córdoba" }));
+    expect(onRenameCommitted).toHaveBeenCalledWith(conversations[0].conversationId, "Viaje a Córdoba");
+    expect(onSelect).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(screen.queryByRole("textbox", { name: "Nuevo título de conversación" })).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Renombrar Primera" }));
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Nuevo título de conversación" }), { key: "Escape" });
+    expect(screen.queryByRole("textbox", { name: "Nuevo título de conversación" })).toBeNull();
+    expect(renameConversation).toHaveBeenCalledOnce();
   });
 });

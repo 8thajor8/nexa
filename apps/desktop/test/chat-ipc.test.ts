@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CHAT_CANCEL_REQUEST_CHANNEL, CHAT_CREATE_CONVERSATION_CHANNEL, CHAT_EVENT_CHANNEL, CHAT_LIST_CONVERSATIONS_CHANNEL, CHAT_LIST_MESSAGES_CHANNEL,
-  CHAT_OPEN_CONVERSATION_CHANNEL, CHAT_SEND_MESSAGE_CHANNEL,
+  CHAT_OPEN_CONVERSATION_CHANNEL, CHAT_RENAME_CONVERSATION_CHANNEL, CHAT_SEND_MESSAGE_CHANNEL,
   type ChatEventEnvelope,
 } from "../src/shared/ipc-contract.js";
 import { registerChatIpcHandlers, type ConversationRuntimeApi, type RuntimeMessageEvent, type RuntimeMessageResult } from "../src/main/chat-ipc.js";
@@ -101,7 +101,7 @@ describe("Main chat IPC to Conversation Runtime", () => {
       });
       expect((await store.getConversation(otherConversation.conversationId))?.title).toBe("Nueva conversación");
       expect(h.contents.send).toHaveBeenCalledWith(CHAT_EVENT_CHANNEL, {
-        conversationId, requestId: request.requestId, status: "conversation_title_updated", title: "Copias de seguridad seguras",
+        conversationId, requestId: request.requestId, status: "conversation_title_updated", title: "Copias de seguridad seguras", source: "automatic",
       });
     } finally {
       h.service.dispose();
@@ -426,6 +426,34 @@ describe("Main chat IPC to Conversation Runtime", () => {
     expect(store.listConversations).toHaveBeenCalledWith({ limit: 25 });
     expect(runtime.restoreConversation).not.toHaveBeenCalled();
     h.service.dispose();
+  });
+
+  it("renames only the requested saved conversation, normalizes Unicode titles, and persists manual priority", async () => {
+    const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "nexa-conversation-rename-"));
+    const store = createConversationStore({ baseDirectory: path.join(temporaryRoot, "conversations") });
+    const h = harness(fakeRuntime().runtime, undefined, undefined, store);
+    try {
+      await store.createConversation(conversationId);
+      const result = await h.invoke(CHAT_RENAME_CONVERSATION_CHANNEL,
+        { conversationId, title: "  Viaje   a Córdoba 🚆  " });
+      expect(result).toEqual({ ok: true, conversationId, title: "Viaje a Córdoba 🚆" });
+      expect(await store.getConversation(conversationId)).toMatchObject({ title: "Viaje a Córdoba 🚆", titleSource: "manual" });
+      expect(await store.updateTitle(conversationId, "Resultado automático tardío", "automatic")).toBe(false);
+      expect((await store.getConversation(conversationId))?.title).toBe("Viaje a Córdoba 🚆");
+      expect(await h.invoke(CHAT_RENAME_CONVERSATION_CHANNEL, { conversationId: id("9"), title: "Otro título" }))
+        .toMatchObject({ ok: false, error: { code: "conversation_not_found" } });
+      expect(await h.invoke(CHAT_RENAME_CONVERSATION_CHANNEL, { conversationId, title: "  " }))
+        .toMatchObject({ ok: false, error: { code: "invalid_title" } });
+      expect(await h.invoke(CHAT_RENAME_CONVERSATION_CHANNEL, { conversationId, title: "x".repeat(121) }))
+        .toMatchObject({ ok: false, error: { code: "invalid_title" } });
+      await expect(h.invoke(CHAT_RENAME_CONVERSATION_CHANNEL, { conversationId, title: "Unauthorized" }, {} as never))
+        .rejects.toThrow("untrusted_ipc_sender");
+    } finally {
+      h.service.dispose();
+      const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(temporaryRoot));
+      expect(relative && !relative.startsWith("..") && !path.isAbsolute(relative)).toBeTruthy();
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
   });
 
   it("logs a safe conversation-list failure code without exposing the error message", async () => {

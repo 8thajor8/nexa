@@ -26,6 +26,7 @@ export const CHAT_CREATE_CONVERSATION_CHANNEL = "chat:create-conversation" as co
 export const CHAT_OPEN_CONVERSATION_CHANNEL = "chat:open-conversation" as const;
 export const CHAT_LIST_MESSAGES_CHANNEL = "chat:list-messages" as const;
 export const CHAT_LIST_CONVERSATIONS_CHANNEL = "chat:list-conversations" as const;
+export const CHAT_RENAME_CONVERSATION_CHANNEL = "chat:rename-conversation" as const;
 export const CHAT_EVENT_CHANNEL = "chat:event" as const;
 export const MEMORY_MODE_GET_CHANNEL = "memory:mode:get" as const;
 export const MEMORY_MODE_SET_CHANNEL = "memory:mode:set" as const;
@@ -81,6 +82,10 @@ export interface ChatConversationSummary {
   messageCount: number;
 }
 export interface ChatConversationListRequest { limit?: number; cursor?: ChatConversationListCursor | null; }
+export interface ChatConversationRenameRequest { conversationId: string; title: string; }
+export type ChatConversationRenameResponse =
+  | { ok: true; conversationId: string; title: string }
+  | { ok: false; error: { code: "invalid_request" | "conversation_not_found" | "invalid_title" | "operation_failed"; message: string } };
 export type ChatConversationListResponse =
   | { ok: true; conversations: ChatConversationSummary[]; nextCursor: ChatConversationListCursor | null }
   | { ok: false; error: { code: "runtime_unavailable" | "operation_failed"; message: string } };
@@ -138,7 +143,7 @@ interface ChatEventBase {
 export type ChatEventEnvelope =
   | AuthorizationRequiredEvent
   | SpotifyNowPlayingEvent
-  | (ChatEventBase & { status: "conversation_title_updated"; title: string })
+  | (ChatEventBase & { status: "conversation_title_updated"; title: string; source?: "automatic" | "manual" })
   | (ChatEventBase & { status: "text_delta"; delta: string })
   | (ChatEventBase & { status: "text_reset" })
   | (ChatEventBase & { status: "processing" })
@@ -150,6 +155,7 @@ export interface ChatDesktopApi {
   openConversation(conversationId: string): Promise<ChatConversationMessagesResponse>;
   listMessages(request: ChatConversationMessagesRequest): Promise<ChatConversationMessagesResponse>;
   listConversations(request?: ChatConversationListRequest): Promise<ChatConversationListResponse>;
+  renameConversation(request: ChatConversationRenameRequest): Promise<ChatConversationRenameResponse>;
   sendMessage(request: ChatSendMessageRequest): Promise<ChatSendResponse>;
   cancelRequest(requestId: string): Promise<ChatCancelResponse>;
   onEvent(listener: (event: ChatEventEnvelope) => void): () => void;

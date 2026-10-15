@@ -1,10 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { isChatCancelRequest, isChatConversationCreateRequest, isChatEventEnvelope, isChatSendMessageRequest, isChatSendResponse } from "../src/shared/chat-ipc-validation.js";
+import { isChatCancelRequest, isChatConversationCreateRequest, isChatConversationRenameRequest,
+  isChatConversationRenameResponse, isChatEventEnvelope, isChatSendMessageRequest, isChatSendResponse } from "../src/shared/chat-ipc-validation.js";
 
 const conversationId = "00000000-0000-4000-8000-000000000001";
 const requestId = "00000000-0000-4000-8000-000000000002";
 
 describe("chat IPC contracts", () => {
+  it("validates bounded rename requests and correlated responses", () => {
+    expect(isChatConversationRenameRequest({ conversationId, title: "Título" })).toBe(true);
+    expect(isChatConversationRenameRequest({ conversationId, title: "x".repeat(4_097) })).toBe(false);
+    expect(isChatConversationRenameRequest({ conversationId, title: "x", path: "arbitrary" })).toBe(false);
+    expect(isChatConversationRenameResponse({ ok: true, conversationId, title: "Título" })).toBe(true);
+    expect(isChatConversationRenameResponse({ ok: true, conversationId: "bad", title: "Título" })).toBe(false);
+  });
+
   it("accepts only the optional explicit new-conversation flag", () => {
     expect(isChatConversationCreateRequest(undefined)).toBe(true);
     expect(isChatConversationCreateRequest({})).toBe(true);
@@ -32,6 +41,7 @@ describe("chat IPC contracts", () => {
     expect(isChatEventEnvelope({ conversationId, requestId, status: "completed", response: "actual" })).toBe(true);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "conversation_title_updated", title: "Clima en Madrid" })).toBe(true);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "conversation_title_updated", title: "x".repeat(61) })).toBe(false);
+    expect(isChatEventEnvelope({ conversationId, requestId, status: "conversation_title_updated", title: "Título manual", source: "manual" })).toBe(true);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "conversation_title_updated", title: "Título", secret: "extra" })).toBe(false);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "completed", response: "actual",
       presentation: { kind: "diagnostic", technicalDetail: '{"schema":"nexa-system-diagnostic/v1"}' } })).toBe(true);

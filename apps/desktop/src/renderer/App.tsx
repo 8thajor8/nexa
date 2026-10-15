@@ -207,6 +207,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const [conversationItems, setConversationItems] = useState<ChatConversationSummary[]>([]);
   const conversationItemsRef = useRef(conversationItems);
   conversationItemsRef.current = conversationItems;
+  const manuallyTitledConversations = useRef(new Set<string>());
   const [conversationListCursor, setConversationListCursor] = useState<ChatConversationListCursor | null>(null);
   const conversationListCursorRef = useRef(conversationListCursor);
   conversationListCursorRef.current = conversationListCursor;
@@ -334,6 +335,12 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   }, [isIsolated]);
 
   useEffect(() => { void refreshConversationList(); }, [refreshConversationList]);
+
+  const commitConversationTitle = useCallback((conversationId: string, title: string) => {
+    manuallyTitledConversations.current.add(conversationId);
+    conversationListRequestSequence.current += 1;
+    setConversationItems((current) => current.map((item) => item.conversationId === conversationId ? { ...item, title } : item));
+  }, []);
 
   useEffect(() => {
     if (isIsolated && !isSyntheticOrganicPilot) return;
@@ -599,6 +606,8 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
 
   const handleChatEvent = useCallback((event: ChatEventEnvelope) => {
     if (event.status === "conversation_title_updated") {
+      if (event.source !== "manual" && manuallyTitledConversations.current.has(event.conversationId)) return;
+      if (event.source === "manual") manuallyTitledConversations.current.add(event.conversationId);
       const alreadyListed = conversationItemsRef.current.some((item) => item.conversationId === event.conversationId);
       conversationListRequestSequence.current += 1;
       setConversationItems((current) => current.map((item) => item.conversationId === event.conversationId
@@ -1162,7 +1171,8 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
             hasMore={conversationListCursor !== null} error={conversationListError}
             onNew={() => { void createNewConversation(); }}
             onSelect={(conversationId) => { void openStoredConversation(conversationId); }}
-            onLoadMore={() => { void refreshConversationList(true); }} />
+            onLoadMore={() => { void refreshConversationList(true); }}
+            onRenameCommitted={commitConversationTitle} />
           <ConversationPanel
             key={chatConversationId ?? "conversation-uninitialized"}
             snapshot={voiceSnapshot}

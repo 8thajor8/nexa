@@ -2,6 +2,7 @@ import type {
   ChatCancelRequest, ChatCancelResponse, ChatConversationResponse, ChatEventEnvelope, ChatIpcErrorCode,
   ChatConversationListRequest, ChatConversationListResponse, ChatConversationMessagesRequest,
   ChatConversationMessagesResponse, ChatConversationListCursor, ChatMessageCursor,
+  ChatConversationRenameRequest, ChatConversationRenameResponse,
   ChatSendMessageRequest, ChatSendResponse,
 } from "./ipc-contract.js";
 import { isSpotifyTrackUrl } from "./spotify-link-validation.js";
@@ -78,6 +79,19 @@ export function isChatConversationListRequest(value: unknown): value is ChatConv
   return (value.limit === undefined || (Number.isSafeInteger(value.limit) && (value.limit as number) >= 1 && (value.limit as number) <= 100))
     && (value.cursor === undefined || value.cursor === null || isConversationListCursor(value.cursor));
 }
+export function isChatConversationRenameRequest(value: unknown): value is ChatConversationRenameRequest {
+  return isRecord(value) && exactKeys(value, ["conversationId", "title"])
+    && isIdentifier(value.conversationId) && typeof value.title === "string" && value.title.length <= 4_096;
+}
+export function isChatConversationRenameResponse(value: unknown): value is ChatConversationRenameResponse {
+  if (!isRecord(value)) return false;
+  if (value.ok === true) return exactKeys(value, ["ok", "conversationId", "title"])
+    && isIdentifier(value.conversationId) && typeof value.title === "string" && value.title.length >= 1 && value.title.length <= 120;
+  return value.ok === false && exactKeys(value, ["ok", "error"]) && isRecord(value.error)
+    && exactKeys(value.error, ["code", "message"])
+    && ["invalid_request", "conversation_not_found", "invalid_title", "operation_failed"].includes(String(value.error.code))
+    && typeof value.error.message === "string" && value.error.message.length <= 300;
+}
 export function isChatConversationListResponse(value: unknown): value is ChatConversationListResponse {
   if (!isRecord(value)) return false;
   if (value.ok === false) return exactKeys(value, ["ok", "error"]) && isRecord(value.error)
@@ -140,8 +154,11 @@ export function isChatEventEnvelope(value: unknown): value is ChatEventEnvelope 
       && (card.spotifyUrl === null || isSpotifyTrackUrl(card.spotifyUrl))
       && typeof card.playing === "boolean";
   }
-  if (value.status === "conversation_title_updated") return exactKeys(value, ["conversationId", "requestId", "status", "title"])
-    && typeof value.title === "string" && value.title.trim().length > 0 && value.title.length <= 60
+  if (value.status === "conversation_title_updated") return (exactKeys(value, ["conversationId", "requestId", "status", "title"])
+    || exactKeys(value, ["conversationId", "requestId", "status", "title", "source"]))
+    && (value.source === undefined || value.source === "automatic" || value.source === "manual")
+    && typeof value.title === "string" && value.title.trim().length > 0
+    && value.title.length <= (value.source === "manual" ? 120 : 60)
     && !/[\u0000-\u001f\u007f-\u009f]/u.test(value.title);
   if (value.status === "authorization_required") {
     if (!exactKeys(value, ["conversationId", "requestId", "status", "requirement"]) || !isRecord(value.requirement)) return false;

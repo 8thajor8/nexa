@@ -367,15 +367,17 @@ export function createConversationStore({ baseDirectory, fileSystem = {}, now = 
         await initialize();
         if (typeof conversationId !== 'string' || !UUID.test(conversationId))
             throw new ConversationStoreError('conversation_id_invalid');
+        const normalizedTitle = source === 'manual' && typeof title === 'string'
+            ? title.replace(/\s+/gu, ' ').trim() : title;
         const maxLength = source === 'automatic' ? 60 : 120;
-        if (!validTitleSource(source) || source === 'provisional' || typeof title !== 'string'
-            || title.trim() !== title || title.length < 1 || title.length > maxLength || !safeTitle(title))
+        if (!validTitleSource(source) || source === 'provisional' || typeof normalizedTitle !== 'string'
+            || normalizedTitle.length < 1 || normalizedTitle.length > maxLength || !safeTitle(normalizedTitle))
             throw new ConversationStoreError('conversation_title_invalid');
         return serialize(conversationId, async () => {
             const manifest = await readManifest(conversationId);
             if (!manifest) throw new ConversationStoreError('conversation_not_found');
             if (source === 'automatic' && manifest.titleSource !== 'provisional') return false;
-            await writeManifest({ ...manifest, title, titleSource: source });
+            await writeManifest({ ...manifest, title: normalizedTitle, titleSource: source });
             return true;
         });
     }
