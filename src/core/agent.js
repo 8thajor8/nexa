@@ -22,6 +22,8 @@ import { createAutomaticMemoryAssessmentBoundary } from '../memory/automatic/ass
 import { getAutomaticMemorySourcePolicy, getAutomaticMemoryToolSource } from '../memory/automatic/source-registry.js';
 import { screenMemorySecret } from '../memory/secret-screening.js';
 import { getOrganicMemoryAttributePolicy } from './organic-memory-authorization.js';
+import { DEFAULT_CONVERSATION_CONTEXT_POLICY, normalizeConversationContextPolicy,
+    selectConversationContext } from './conversation-context.js';
 
 function stableValue(value) {
     if (Array.isArray(value)) return value.map(stableValue);
@@ -524,6 +526,7 @@ export async function createAgent({
     operationalMemoryMode = null,
     operationalMemoryStoreIdentity = 'unknown',
     initialConversationHistory = [],
+    conversationContextPolicy = DEFAULT_CONVERSATION_CONTEXT_POLICY,
 } = {}) {
     if (typeof enableAutomaticMemoryAssessment !== 'boolean'
         || (automaticMemoryDetector !== null && typeof automaticMemoryDetector?.detect !== 'function')
@@ -566,6 +569,7 @@ export async function createAgent({
             || !message.content.trim() || message.content.length > 1_000_000
             || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(message.content)))
         throw new TypeError('conversation_history_invalid');
+    const normalizedConversationContextPolicy = normalizeConversationContextPolicy(conversationContextPolicy);
     let selectedBackend;
     const readOnlyMemory2 = memory2ReadOnlyReader !== null;
     if (memory2ReadOnlyAllowExternalTools && !readOnlyMemory2) {
@@ -642,7 +646,9 @@ export async function createAgent({
     let currentMessage = '', currentSource = 'untrusted', contextDigest = null;
     let memoryTopicRecordIds = new Set();
     let activeDiagnosticRequestId = null;
-    let recentUserTurns = initialConversationHistory.filter(message => message.role === 'user')
+    const selectedInitialConversationHistory = selectConversationContext(initialConversationHistory,
+        normalizedConversationContextPolicy);
+    let recentUserTurns = selectedInitialConversationHistory.filter(message => message.role === 'user')
         .map(message => message.content.slice(0, 1000)).slice(-8), currentRecentUserMessages = [];
     let pendingAutomaticMemoryAssessment = null;
     let pendingConfirmedMemoryWrite = null;
@@ -960,7 +966,7 @@ ${memoryToPrompt(memory)}
         return { success: true, outcome: 'evaluated', persistedCount, unchangedCount, rejectedCount };
     }
 
-    const conversation = initialConversationHistory.map(message => ({ role: message.role, content: message.content }));
+    const conversation = selectedInitialConversationHistory.map(message => structuredClone(message));
 
     function getSystemDiagnostics() {
         const snapshot = operationalDiagnostics?.snapshot?.() ?? { runtime: null, operations: [], lastMemoryRetrieval: null };
@@ -1049,13 +1055,16 @@ ${memoryToPrompt(memory)}
             spotifyStateToolAvailable: tools.some(tool => tool.name === 'spotify_get_current_track'),
             historyFactsProvided: Boolean(historicalFacts) });
         const modelStartedAt = performance.now();
+        const currentTurnStartIndex = conversation.findLastIndex(item => item?.role === 'user');
+        const selectedConversation = selectConversationContext(conversation, normalizedConversationContextPolicy,
+            { currentTurnStartIndex });
         let streamedText = '';
         let firstTextDeltaReported = false;
         diagnostic('model_request_started', { iteration, finalOnly });
         const response = await ask({
             instructions: getInstructions() + (historicalFacts ? MEMORY_HISTORY_POLICY : ''),
             input: [...(memoryContext?.items ?? []), ...historyContextItems,
-                ...(historicalFacts ? [{ role: 'user', content: currentMessage }] : structuredClone(conversation))],
+                ...(historicalFacts ? [{ role: 'user', content: currentMessage }] : selectedConversation)],
             tools: historicalFacts ? [MEMORY_HISTORY_RESPONSE_TOOL] : readOnlyMemory2
                 ? (memory2ReadOnlyAllowExternalTools ? tools.filter(tool => !memoryToolNames.has(tool.name)) : [])
                 : memory2 ? tools.filter(tool => !memoryToolNames.has(tool.name)) : tools,

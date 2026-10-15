@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { config, resolveCliMemoryMode } from '../config.js';
 import { createRuntimeAgent } from './runtime-agent.js';
+import { DEFAULT_CONVERSATION_CONTEXT_POLICY, normalizeConversationContextPolicy,
+    selectConversationContext } from './conversation-context.js';
 import { openMemoryBackend } from '../memory/backend.js';
 import { classifySystemDiagnosticRequest, createOperationalDiagnostics, createTechnicalDiagnosticReport,
     formatMemoryDiagnostics, formatSystemStatus, formatToolCatalog, formatVoiceStatus } from './system-diagnostics.js';
@@ -90,7 +92,7 @@ function validIdentifier(value) {
 }
 
 const CONVERSATION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
-function restoredHistory(messages, maxMessages, maxCharacters) {
+function restoredHistory(messages, policy) {
     if (!Array.isArray(messages) || messages.length > 100)
         throw new TypeError('conversation_history_invalid');
     const normalized = messages.map(message => {
@@ -101,11 +103,7 @@ function restoredHistory(messages, maxMessages, maxCharacters) {
             throw new TypeError('conversation_history_invalid');
         return Object.freeze({ role: message.role, content: message.content });
     });
-    let selected = maxMessages === 0 ? [] : normalized.slice(-maxMessages);
-    let characters = selected.reduce((total, message) => total + message.content.length, 0);
-    while (selected.length && characters > maxCharacters)
-        characters -= selected.shift().content.length;
-    return Object.freeze(selected);
+    return selectConversationContext(normalized, policy);
 }
 
 function resultError(conversationId, requestId, code, message) {
@@ -124,14 +122,16 @@ export function createConversationRuntime({
     memoryMode = config.cliMemoryMode,
     storePath = config.memory2ReadOnlyStorePath,
     streamResponses = false,
-    maxRestoredHistoryMessages = 12,
-    maxRestoredHistoryCharacters = 12_000,
+    conversationContextPolicy = null,
+    maxRestoredHistoryMessages,
+    maxRestoredHistoryCharacters,
     operationalDiagnostics = createOperationalDiagnostics({ memoryMode }),
 } = {}) {
     if (typeof agentFactory !== 'function') throw new TypeError('agent_factory_invalid');
-    if (!Number.isSafeInteger(maxRestoredHistoryMessages) || maxRestoredHistoryMessages < 0 || maxRestoredHistoryMessages > 100
-        || !Number.isSafeInteger(maxRestoredHistoryCharacters) || maxRestoredHistoryCharacters < 0
-        || maxRestoredHistoryCharacters > 100_000) throw new TypeError('conversation_history_budget_invalid');
+    const contextPolicy = normalizeConversationContextPolicy(conversationContextPolicy ?? {
+        maxMessages: maxRestoredHistoryMessages ?? DEFAULT_CONVERSATION_CONTEXT_POLICY.maxMessages,
+        maxCharacters: maxRestoredHistoryCharacters ?? DEFAULT_CONVERSATION_CONTEXT_POLICY.maxCharacters,
+    });
 
     const conversations = new Map();
     const activeRequests = new Map();
@@ -210,7 +210,8 @@ export function createConversationRuntime({
         if (conversation.agent) return conversation.agent;
         if (!conversation.agentPromise) {
             conversation.agentPromise = Promise.resolve().then(async () => {
-                const options = { ...agentOptions, operationalDiagnostics, operationalMemoryMode: memoryMode };
+                const options = { ...agentOptions, conversationContextPolicy: contextPolicy,
+                    operationalDiagnostics, operationalMemoryMode: memoryMode };
                 // A writable Memory2 repository owns an exclusive process lock. Keep
                 // one repository for this Runtime while retaining a separate agent
                 // and conversational history for every conversation.
@@ -369,7 +370,7 @@ export function createConversationRuntime({
         if (conversations.has(conversationId)) return false;
         if (activeRequests.size > 0) throw new Error('conversation_runtime_busy');
         conversations.set(conversationId, { agent: null, agentPromise: null,
-            initialConversationHistory: restoredHistory(messages, maxRestoredHistoryMessages, maxRestoredHistoryCharacters) });
+            initialConversationHistory: restoredHistory(messages, contextPolicy) });
         return true;
     }
 
