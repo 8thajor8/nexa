@@ -1,10 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { isChatCancelRequest, isChatEventEnvelope, isChatSendMessageRequest, isChatSendResponse } from "../src/shared/chat-ipc-validation.js";
+import { isChatCancelRequest, isChatConversationCreateRequest, isChatEventEnvelope, isChatSendMessageRequest, isChatSendResponse } from "../src/shared/chat-ipc-validation.js";
 
 const conversationId = "00000000-0000-4000-8000-000000000001";
 const requestId = "00000000-0000-4000-8000-000000000002";
 
 describe("chat IPC contracts", () => {
+  it("accepts only the optional explicit new-conversation flag", () => {
+    expect(isChatConversationCreateRequest(undefined)).toBe(true);
+    expect(isChatConversationCreateRequest({})).toBe(true);
+    expect(isChatConversationCreateRequest({ newConversation: true })).toBe(true);
+    expect(isChatConversationCreateRequest({ newConversation: "yes" })).toBe(false);
+    expect(isChatConversationCreateRequest({ newConversation: true, path: "arbitrary" })).toBe(false);
+  });
+
   it("accepts only bounded typed and voice messages with UUID correlation", () => {
     expect(isChatSendMessageRequest({ conversationId, requestId, text: "hola", source: "typed" })).toBe(true);
     expect(isChatSendMessageRequest({ conversationId, requestId, text: "hola", source: "voice" })).toBe(true);

@@ -27,7 +27,11 @@ function NavIcon({ name }: { name: IconName }) {
   return <svg aria-hidden="true" className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">{paths[name]}</svg>;
 }
 
-export function Sidebar({ onOpenSettings = () => undefined, showSettings = true }: { onOpenSettings?: () => void; showSettings?: boolean }) {
+export function Sidebar({ onOpenSettings = () => undefined, onOpenCommandCenter = () => undefined,
+  onOpenConversations = () => undefined, activeView = "command", showSettings = true, showConversations = true }: {
+    onOpenSettings?: () => void; onOpenCommandCenter?: () => void; onOpenConversations?: () => void;
+    activeView?: "command" | "conversations"; showSettings?: boolean; showConversations?: boolean;
+  }) {
   return (
     <aside className="sidebar" aria-label="Navegación principal">
       <div className="brand-lockup">
@@ -35,12 +39,17 @@ export function Sidebar({ onOpenSettings = () => undefined, showSettings = true 
       </div>
 
       <nav className="primary-nav" aria-label="Secciones, lista desplazable" tabIndex={0}>
-        {navigation.filter(item => showSettings || item.icon !== "settings").map((item) => {
-          const contents = <><NavIcon name={item.icon} /><span className="nav-label">{item.label}</span>{!item.active && <span className="nav-soon">PRONTO</span>}<HolographicFrame variant="navigation" /></>;
-          return item.active ? (
-            <div className="nav-item nav-item--active" key={item.label} aria-current="page" aria-label={item.label}>
+        {navigation.filter(item => (showSettings || item.icon !== "settings")
+          && (showConversations || item.icon !== "conversations")).map((item) => {
+          const isView = item.icon === "command" || item.icon === "conversations";
+          const selected = item.icon === activeView || item.active && activeView === "command";
+          const contents = <><NavIcon name={item.icon} /><span className="nav-label">{item.label}</span>{!isView && !item.active && <span className="nav-soon">PRONTO</span>}<HolographicFrame variant="navigation" /></>;
+          return isView ? (
+            <button className={`nav-item${selected ? " nav-item--active" : ""}`} key={item.label} type="button"
+              onClick={item.icon === "command" ? onOpenCommandCenter : onOpenConversations}
+              aria-current={selected ? "page" : undefined} aria-label={item.label}>
               {contents}
-            </div>
+            </button>
           ) : item.icon === "settings" ? (
             <button
               className="nav-item nav-item--settings"

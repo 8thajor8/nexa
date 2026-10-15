@@ -52,6 +52,10 @@ export function isChatConversationResponse(value: unknown): value is ChatConvers
     && (value.error.code === "runtime_unavailable" || value.error.code === "operation_failed")
     && typeof value.error.message === "string" && value.error.message.length <= 300;
 }
+export function isChatConversationCreateRequest(value: unknown): value is { newConversation?: boolean } {
+  return value === undefined || (isRecord(value) && Object.keys(value).every(key => key === "newConversation")
+    && (value.newConversation === undefined || typeof value.newConversation === "boolean"));
+}
 export function isChatConversationOpenRequest(value: unknown): value is { conversationId: string } {
   return isRecord(value) && exactKeys(value, ["conversationId"]) && isIdentifier(value.conversationId);
 }

@@ -58,6 +58,7 @@ export type ChatIpcErrorCode = "invalid_request" | "busy" | "conversation_not_fo
 export type ChatConversationResponse =
   | { ok: true; conversationId: string }
   | { ok: false; error: { code: "runtime_unavailable" | "operation_failed"; message: string } };
+export interface ChatConversationCreateRequest { newConversation?: boolean; }
 export interface ChatMessageCursor { offset: number; beforeSequence: number; }
 export interface ChatConversationMessage {
   id: string;
@@ -139,7 +140,7 @@ export type ChatEventEnvelope =
   | (ChatEventBase & { status: "completed"; response: string; presentation?: ChatPresentationMetadata })
   | (ChatEventBase & { status: "error"; error: { code: ChatIpcErrorCode; message: string } });
 export interface ChatDesktopApi {
-  createConversation(): Promise<ChatConversationResponse>;
+  createConversation(request?: ChatConversationCreateRequest): Promise<ChatConversationResponse>;
   openConversation(conversationId: string): Promise<ChatConversationMessagesResponse>;
   listMessages(request: ChatConversationMessagesRequest): Promise<ChatConversationMessagesResponse>;
   listConversations(request?: ChatConversationListRequest): Promise<ChatConversationListResponse>;

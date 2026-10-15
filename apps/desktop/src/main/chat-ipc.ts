@@ -1,6 +1,6 @@
 import { ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from "electron";
 import { performance } from "node:perf_hooks";
-import { isChatCancelRequest, isChatConversationListRequest, isChatConversationMessagesRequest, isChatConversationOpenRequest,
+import { isChatCancelRequest, isChatConversationCreateRequest, isChatConversationListRequest, isChatConversationMessagesRequest, isChatConversationOpenRequest,
   isChatConversationResponse, isChatEventEnvelope, isChatSendMessageRequest } from "../shared/chat-ipc-validation.js";
 import {
   CHAT_CANCEL_REQUEST_CHANNEL, CHAT_CREATE_CONVERSATION_CHANNEL, CHAT_EVENT_CHANNEL, CHAT_LIST_CONVERSATIONS_CHANNEL,
@@ -119,13 +119,18 @@ export class ChatIpcService {
     if (runtime) this.unsubscribeRuntime = runtime.onEvent((event) => this.handleRuntimeEvent(event));
   }
 
-  createConversation(event: ChatIpcEvent): ChatConversationResponse | Promise<ChatConversationResponse> {
+  createConversation(event: ChatIpcEvent, payload?: unknown): ChatConversationResponse | Promise<ChatConversationResponse> {
     const window = this.getWindow();
     if (!window || !isTrustedIpcSender(event, window)) throw new Error("untrusted_ipc_sender");
+    if (!isChatConversationCreateRequest(payload)) return { ok: false,
+      error: { code: "operation_failed", message: "The conversation request is invalid." } };
+    const newConversation = payload?.newConversation === true;
     if (this.runtimeSwitching) return { ok: false, error: { code: "runtime_unavailable", message: "Runtime is changing memory mode." } };
+    if (newConversation && this.activeByRequest.size > 0) return { ok: false,
+      error: { code: "runtime_unavailable", message: "A conversation cannot be created while Runtime is busy." } };
     const runtime = this.getRuntime();
     if (!runtime) return { ok: false, error: { code: "runtime_unavailable", message: "Runtime is not connected." } };
-    if (this.conversationId) return { ok: true, conversationId: this.conversationId };
+    if (this.conversationId && !newConversation) return { ok: true, conversationId: this.conversationId };
     if (!this.conversationStore) {
       try {
         const conversationId = runtime.createConversation();
@@ -461,7 +466,7 @@ export function registerChatIpcHandlers(
 ): ChatIpcService {
   removeChatIpcHandlers(ipc);
   service = new ChatIpcService(getWindow, getRuntime, diagnostic, voiceHooks, conversationStore);
-  ipc.handle(CHAT_CREATE_CONVERSATION_CHANNEL, (event) => service!.createConversation(event));
+  ipc.handle(CHAT_CREATE_CONVERSATION_CHANNEL, (event, payload) => service!.createConversation(event, payload));
   if (conversationStore) {
     ipc.handle(CHAT_OPEN_CONVERSATION_CHANNEL, (event, payload) => service!.openConversation(event, payload));
     ipc.handle(CHAT_LIST_MESSAGES_CHANNEL, (event, payload) => service!.listMessages(event, payload));

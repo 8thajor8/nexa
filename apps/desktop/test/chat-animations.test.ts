@@ -141,4 +141,13 @@ describe("Nexa chat animations", () => {
     renderConversation(true);
     expect(document.querySelector(".assistant-processing")).toBeNull();
   });
+
+  it("shows the welcome in an empty conversation and removes it once messages exist", () => {
+    const view = render(createElement(ConversationPanel, { snapshot: idleSnapshot, transcripts: [], chatMessages: [],
+      welcomeMessage: "Buen día, Jor. ¿Qué hacemos hoy?", transcriptNotice: null, onStart: vi.fn(), onFinish: vi.fn(), onRecover: vi.fn() }));
+    expect(screen.getByRole("heading", { name: "Buen día, Jor. ¿Qué hacemos hoy?" })).toBeTruthy();
+    view.rerender(createElement(ConversationPanel, { snapshot: idleSnapshot, transcripts: [], chatMessages: [pendingUserMessage],
+      welcomeMessage: "Buen día, Jor. ¿Qué hacemos hoy?", transcriptNotice: null, onStart: vi.fn(), onFinish: vi.fn(), onRecover: vi.fn() }));
+    expect(screen.queryByRole("heading", { name: "Buen día, Jor. ¿Qué hacemos hoy?" })).toBeNull();
+  });
 });

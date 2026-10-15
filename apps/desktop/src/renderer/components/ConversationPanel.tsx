@@ -19,7 +19,7 @@ export interface ConversationChatMessage {
   readonly conversationId: string;
   readonly role: "user" | "assistant";
   readonly text: string;
-  readonly source: "typed" | "voice";
+  readonly source: "typed" | "voice" | "history";
   readonly status: "sending" | "processing" | "completed" | "cancelled" | "error";
   readonly createdAt: number;
   readonly sessionId?: string;
@@ -37,6 +37,10 @@ interface ConversationPanelProps {
   spotifyNowPlayingCards?: Readonly<Record<string, SpotifyNowPlayingCard>>;
   authorizationAttempts?: Readonly<Record<string, { state: "connecting" | "connected" | "cancelled" | "error"; message?: string }>>;
   chatNotice?: string | null;
+  welcomeMessage?: string | null;
+  hasOlderMessages?: boolean;
+  olderMessagesLoading?: boolean;
+  onLoadOlderMessages?(): void;
   voiceSpeechStatus?: { requestId: string; state: "preparing" | "speaking" | "cancelling" | "error"; message?: string } | null;
   followupStatus?: VoiceFollowupStatus;
   followupError?: string | null;
@@ -118,6 +122,7 @@ function resizeComposer(textarea: HTMLTextAreaElement): boolean {
 
 export function ConversationPanel({ snapshot, transcripts, chatMessages = [], authorizationRequirements = {}, spotifyNowPlayingCards = {},
   authorizationAttempts = {}, chatNotice, chatBusy = false, onSendMessage, onCancelInteraction,
+  welcomeMessage = null, hasOlderMessages = false, olderMessagesLoading = false, onLoadOlderMessages,
   onConnectAuthorization, onCancelAuthorization, onRetryAuthorizedRequest, onOpenSpotifyTrack, transcriptNotice,
   voiceSpeechStatus = null, interactionCancelable = false, cancellationPending = false,
   followupStatus = "idle", followupError = null,
@@ -130,6 +135,7 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
     && (entry.status === "sending" || entry.status === "processing"));
   const [processingPhase, setProcessingPhase] = useState<ProcessingPhase>(() => runtimeProcessing ? "visible" : "hidden");
   const followTailRef = useRef(true);
+  const olderScrollRef = useRef<{ top: number; height: number } | null>(null);
   const lastTranscriptKeyRef = useRef<string | null>(null);
   const canStart = snapshot.canStart;
   const canFinish = snapshot.status === "listening";
@@ -167,6 +173,11 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
   useLayoutEffect(() => {
     const list = messageListRef.current;
     if (!list) return;
+    if (olderScrollRef.current) {
+      list.scrollTop = olderScrollRef.current.top + (list.scrollHeight - olderScrollRef.current.height);
+      olderScrollRef.current = null;
+      return;
+    }
     const latestMessage = [...chatMessages].sort((a, b) => a.createdAt - b.createdAt).at(-1);
     const lastTranscript = transcripts.at(-1);
     const lastTranscriptKey = latestMessage ? latestMessage.id
@@ -193,6 +204,20 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
       </header>
 
       <div ref={messageListRef} className="message-list" aria-label="Historial de conversación" tabIndex={0} onScroll={updateTailFollowing}>
+        {hasOlderMessages && <button className="conversation-load-older" type="button" disabled={olderMessagesLoading || chatBusy}
+          onClick={() => {
+            const list = messageListRef.current;
+            if (list) olderScrollRef.current = { top: list.scrollTop, height: list.scrollHeight };
+            onLoadOlderMessages?.();
+          }}>{olderMessagesLoading ? "Cargando mensajes…" : "Cargar mensajes anteriores"}</button>}
+        {welcomeMessage && chatMessages.length === 0 && transcripts.length === 0 && <div className="conversation-welcome" role="status">
+          <div className="nexa-core-mark conversation-welcome-core" aria-hidden="true">
+            <span className="nexa-core-mark__orbit nexa-core-mark__orbit--one" />
+            <span className="nexa-core-mark__orbit nexa-core-mark__orbit--two" />
+            <span className="nexa-core-mark__ring" /><span className="nexa-core-mark__core" />
+          </div>
+          <h1>{welcomeMessage}</h1>
+        </div>}
         {[...transcripts.map((transcript): ConversationChatMessage => ({
           id: `${transcript.sessionId}:${transcript.turnId}`, requestId: transcript.requestId, conversationId: "voice",
           role: "user", text: transcript.text, source: "voice", status: "completed", createdAt: 0,
@@ -206,7 +231,7 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
               {entry.source === "voice" ? <span className="voice-transcript-badge" aria-label="Transcripción real recibida por voz">
                 <svg aria-hidden="true" viewBox="0 0 24 24" fill="none"><rect x="9" y="3" width="6" height="12" rx="3" stroke="currentColor" strokeWidth="1.7"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21m-4 0h8" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round"/></svg>
                 <span>Voz</span>
-              </span> : <span className="message-source-badge">Texto</span>}
+              </span> : <span className="message-source-badge">{entry.source === "history" ? "Historial" : "Texto"}</span>}
               {(entry.status === "cancelled" || entry.status === "error") && <span className={`chat-message-status chat-message-status--${entry.status}`}>{entry.error ?? (entry.status === "cancelled" ? "Cancelado" : "Error")}</span>}
             </div>
             <p>{entry.text}</p>

@@ -63,6 +63,30 @@ describe("Main chat IPC to Conversation Runtime", () => {
     expect(runtime.createConversation).toHaveBeenCalledOnce();
   });
 
+  it("creates a distinct conversation only for the explicit new-conversation request", () => {
+    const { runtime } = fakeRuntime();
+    const secondId = id("9");
+    runtime.createConversation = vi.fn().mockReturnValueOnce(conversationId).mockReturnValueOnce(secondId);
+    const h = harness(runtime);
+    expect(h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL)).toEqual({ ok: true, conversationId });
+    expect(h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL)).toEqual({ ok: true, conversationId });
+    expect(h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL, { newConversation: true })).toEqual({ ok: true, conversationId: secondId });
+    expect(runtime.createConversation).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not create or switch conversations while a Runtime response is pending", async () => {
+    const result = deferred<RuntimeMessageResult>();
+    const { runtime } = fakeRuntime(result.promise);
+    const h = harness(runtime);
+    h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+    await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, request);
+    expect(h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL, { newConversation: true })).toMatchObject({
+      ok: false, error: { code: "runtime_unavailable" },
+    });
+    expect(runtime.createConversation).toHaveBeenCalledOnce();
+    result.resolve({ conversationId, requestId: request.requestId, status: "completed", text: "ok" });
+  });
+
   it("registers fixed channels and returns a correlated ACK before Runtime completion", async () => {
     const result = deferred<RuntimeMessageResult>();
     const { runtime } = fakeRuntime(result.promise);

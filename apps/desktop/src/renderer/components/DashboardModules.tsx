@@ -26,6 +26,7 @@ interface DashboardModulesProps {
   onOpenSpotifyTrack?: (url: string) => void;
   voiceRepliesEnabled?: boolean;
   onVoiceRepliesChange?: (enabled: boolean) => void;
+  className?: string;
 }
 
 function SpotifyMiniPlayer({ status, busyAction, error, onControl, onOpenTrack }: {
@@ -66,9 +67,9 @@ function SpotifyMiniPlayer({ status, busyAction, error, onControl, onOpenTrack }
 }
 
 export function DashboardModules({ assistantState, spotifyStatus, spotifyBusyAction = null, spotifyError = null,
-  onSpotifyControl, onOpenSpotifyTrack, voiceRepliesEnabled = false, onVoiceRepliesChange }: DashboardModulesProps) {
+  onSpotifyControl, onOpenSpotifyTrack, voiceRepliesEnabled = false, onVoiceRepliesChange, className = "" }: DashboardModulesProps) {
   return (
-    <section className="dashboard-modules" aria-label="Módulos del Command Center">
+    <section className={`dashboard-modules${className ? ` ${className}` : ""}`} aria-label="Módulos del Command Center">
       <section className="dashboard-module surface-panel" aria-labelledby="activity-title">
         <HolographicFrame />
         <ModuleHeading id="activity-title" title="Actividad reciente" label="DEMO · MOCK" />

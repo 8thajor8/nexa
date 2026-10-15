@@ -73,7 +73,7 @@ import {
   isVoiceSpeechEvent,
 } from "./shared/voice-ipc-validation";
 import {
-  isChatCancelRequest, isChatCancelResponse, isChatConversationResponse, isChatEventEnvelope,
+  isChatCancelRequest, isChatCancelResponse, isChatConversationCreateRequest, isChatConversationResponse, isChatEventEnvelope,
   isChatConversationListRequest, isChatConversationListResponse,
   isChatConversationMessagesRequest, isChatConversationMessagesResponse, isChatConversationOpenRequest,
   isChatSendMessageRequest, isChatSendResponse,
@@ -241,8 +241,11 @@ const api: NexaDesktopApi = {
     },
   },
   chat: {
-    async createConversation() {
-      const response: unknown = await ipcRenderer.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+    async createConversation(request = {}) {
+      if (!isChatConversationCreateRequest(request)) throw new Error("invalid_chat_conversation_create_request");
+      const response: unknown = request.newConversation
+        ? await ipcRenderer.invoke(CHAT_CREATE_CONVERSATION_CHANNEL, { newConversation: true })
+        : await ipcRenderer.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
       if (!isChatConversationResponse(response)) throw new Error("invalid_chat_conversation_response");
       return response;
     },

@@ -6,11 +6,12 @@ const futureModes = ["Sidebar", "Mini Presence", "Renderizador externo"];
 interface PresencePanelProps {
   status: PttVoiceStatus;
   statusLabel: string;
+  className?: string;
 }
 
-export function PresencePanel({ status, statusLabel }: PresencePanelProps) {
+export function PresencePanel({ status, statusLabel, className = "" }: PresencePanelProps) {
   return (
-    <aside className="presence-panel surface-panel" aria-labelledby="presence-title" data-renderer-slot="presence" data-voice-state={status}>
+    <aside className={`presence-panel surface-panel${className ? ` ${className}` : ""}`} aria-labelledby="presence-title" data-renderer-slot="presence" data-voice-state={status}>
       <HolographicFrame />
       <header className="panel-heading presence-heading">
         <h2 id="presence-title">Nexa Presence</h2>

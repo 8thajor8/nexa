@@ -16,7 +16,7 @@ vi.mock("electron", () => ({
 type ChatApi = {
   isIsolated: boolean;
   chat: {
-    createConversation(): Promise<unknown>;
+    createConversation(request?: { newConversation?: boolean }): Promise<unknown>;
     openConversation(conversationId: string): Promise<unknown>;
     listMessages(request: unknown): Promise<unknown>;
     sendMessage(request: unknown): Promise<unknown>;
@@ -72,6 +72,9 @@ describe("chat preload allowlist", () => {
     mocks.invoke.mockResolvedValueOnce({ ok: true, conversationId });
     await expect(api.chat.createConversation()).resolves.toEqual({ ok: true, conversationId });
     expect(mocks.invoke).toHaveBeenLastCalledWith("chat:create-conversation");
+    mocks.invoke.mockResolvedValueOnce({ ok: true, conversationId });
+    await expect(api.chat.createConversation({ newConversation: true })).resolves.toEqual({ ok: true, conversationId });
+    expect(mocks.invoke).toHaveBeenLastCalledWith("chat:create-conversation", { newConversation: true });
 
     const message = { id: "00000000-0000-4000-8000-000000000003", role: "user", content: "Hola",
       createdAt: "2035-01-01T00:00:00.000Z", status: "complete" };

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import type { AuthorizationProvider, ChatAuthorizationRequirement, ChatEventEnvelope, ChatIpcErrorCode, DesktopMemoryMode,
+import type { AuthorizationProvider, ChatAuthorizationRequirement, ChatConversationListCursor, ChatConversationSummary,
+  ChatEventEnvelope, ChatIpcErrorCode, ChatMessageCursor, DesktopMemoryMode,
   DesktopMemoryModeResult, SpotifyLiveStatus, SpotifyPlaybackControl, SpotifyNowPlayingCard, VoiceSpeechErrorCode,
   VoiceSpeechEvent, VoiceChatTimingOrigin, VoiceChatTimingPhase, WeatherCurrentStatus } from "../shared/ipc-contract";
 import { ASSISTANT_STATE_LABELS, createMockAssistantStateProvider } from "../shared/assistant-state";
@@ -7,17 +8,19 @@ import { loadDesktopPreferences, saveDesktopPreferences, type DesktopPreferences
 import type { PttVoiceControllerPort, PttVoiceSnapshot, PttVoiceStatus } from "./voice/ptt-voice-controller";
 import { VoiceFollowupController, type FollowupTranscript, type VoiceFollowupFailure } from "./voice/voice-followup-controller";
 import { ConversationPanel, type ConversationChatMessage, type VoiceTranscriptItem } from "./components/ConversationPanel";
+import { ConversationsPanel } from "./components/ConversationsPanel";
 import { PresencePanel } from "./components/PresencePanel";
 import { Sidebar } from "./components/Sidebar";
 import { WindowChrome } from "./components/WindowChrome";
 import { DashboardModules } from "./components/DashboardModules";
 import { CommandHeader } from "./components/CommandHeader";
 import { SettingsModal } from "./components/SettingsModal";
+import { welcomeGreeting } from "./conversation-welcome";
 import type { MicrophoneDeviceStore } from "./audio/microphone-device-store";
 
 interface AppProps { voiceController: PttVoiceControllerPort; microphoneDevices: MicrophoneDeviceStore; }
 
-const MAX_CHAT_HISTORY = 50;
+const MAX_CHAT_HISTORY = 100;
 const VOICE_ACKNOWLEDGEMENT_DELAY_MS = 1_500;
 const TYPED_VOICE_ACKNOWLEDGEMENT_DELAY_MS = 2_000;
 const CHAT_ERROR_MESSAGES: Partial<Record<ChatIpcErrorCode, string>> = {
@@ -74,6 +77,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const isSyntheticOrganicPilot = window.nexaDesktop.isSyntheticOrganicPilot;
   const [preferences, setPreferences] = useState<DesktopPreferences>(() => loadDesktopPreferences());
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [activeView, setActiveView] = useState<"command" | "conversations">("command");
   const stateProvider = useMemo(() => createMockAssistantStateProvider(), []);
   const assistantState = useSyncExternalStore(
     stateProvider.subscribe, stateProvider.getSnapshot, stateProvider.getSnapshot,
@@ -104,6 +108,17 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const [spotifyControlBusy, setSpotifyControlBusy] = useState<SpotifyPlaybackControl | null>(null);
   const [spotifyControlError, setSpotifyControlError] = useState<string | null>(null);
   const [chatConversationId, setChatConversationId] = useState<string | null>(null);
+  const [activeConversationEmpty, setActiveConversationEmpty] = useState(false);
+  const [welcomeMessage] = useState(() => welcomeGreeting(new Date()));
+  const [conversationItems, setConversationItems] = useState<ChatConversationSummary[]>([]);
+  const [conversationListCursor, setConversationListCursor] = useState<ChatConversationListCursor | null>(null);
+  const conversationListCursorRef = useRef(conversationListCursor);
+  conversationListCursorRef.current = conversationListCursor;
+  const [conversationListLoading, setConversationListLoading] = useState(false);
+  const [conversationListError, setConversationListError] = useState<string | null>(null);
+  const [conversationOpening, setConversationOpening] = useState(false);
+  const [olderMessagesCursor, setOlderMessagesCursor] = useState<ChatMessageCursor | null>(null);
+  const [olderMessagesLoading, setOlderMessagesLoading] = useState(false);
   const chatConversationIdRef = useRef(chatConversationId);
   chatConversationIdRef.current = chatConversationId;
   const activeChatRequest = useRef<string | null>(null);
@@ -176,29 +191,120 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       setChatMessages([]);
       setChatNotice(null);
       setChatConversationId(null);
+      setActiveConversationEmpty(false);
+      setOlderMessagesCursor(null);
       activeChatRequest.current = null;
       knownChatRequests.current.clear();
       terminalChatRequests.current.clear();
       originalRequestTexts.current.clear();
       const conversation = await window.nexaDesktop.chat.createConversation();
-      if (conversation.ok) setChatConversationId(conversation.conversationId);
+      if (conversation.ok) { setChatConversationId(conversation.conversationId); setActiveConversationEmpty(true); }
       else setChatNotice(CHAT_ERROR_MESSAGES[conversation.error.code] ?? "No se pudo preparar la conversación.");
     }
     return result;
   }, []);
+
+  const refreshConversationList = useCallback(async (append = false) => {
+    if (isIsolated) return;
+    setConversationListLoading(true);
+    setConversationListError(null);
+    try {
+      const result = await window.nexaDesktop.chat.listConversations(append && conversationListCursorRef.current
+        ? { limit: 50, cursor: conversationListCursorRef.current } : { limit: 50 });
+      if (!result.ok) {
+        setConversationListError("No se pudo cargar el historial de conversaciones.");
+        return;
+      }
+      setConversationItems((current) => append
+        ? [...current, ...result.conversations.filter((item) => !current.some((entry) => entry.conversationId === item.conversationId))]
+        : result.conversations);
+      setConversationListCursor(result.nextCursor);
+    } catch {
+      setConversationListError("No se pudo cargar el historial de conversaciones.");
+    } finally { setConversationListLoading(false); }
+  }, [isIsolated]);
+
+  useEffect(() => { void refreshConversationList(); }, [refreshConversationList]);
 
   useEffect(() => {
     if (isIsolated && !isSyntheticOrganicPilot) return;
     let mounted = true;
     void window.nexaDesktop.chat.createConversation().then((result) => {
       if (!mounted) return;
-      if (result.ok) setChatConversationId(result.conversationId);
+      if (result.ok) { setChatConversationId(result.conversationId); setActiveConversationEmpty(true); void refreshConversationList(); }
       else setChatNotice(CHAT_ERROR_MESSAGES[result.error.code] ?? "No se pudo preparar la conversación.");
     }).catch(() => {
       if (mounted) setChatNotice("No se pudo conectar con Runtime. La conversación no está disponible.");
     });
     return () => { mounted = false; };
-  }, [isIsolated, isSyntheticOrganicPilot]);
+  }, [isIsolated, isSyntheticOrganicPilot, refreshConversationList]);
+
+  const createNewConversation = useCallback(async () => {
+    if (isIsolated || activeChatRequest.current || conversationOpening) return;
+    setConversationOpening(true);
+    setConversationListError(null);
+    try {
+      const result = await window.nexaDesktop.chat.createConversation({ newConversation: true });
+      if (!result.ok) {
+        setConversationListError("No se pudo crear una conversación nueva.");
+        return;
+      }
+      setChatMessages([]);
+      setChatNotice(null);
+      setChatConversationId(result.conversationId);
+      setActiveConversationEmpty(true);
+      setOlderMessagesCursor(null);
+      await refreshConversationList();
+    } catch { setConversationListError("No se pudo crear una conversación nueva."); }
+    finally { setConversationOpening(false); }
+  }, [conversationOpening, isIsolated, refreshConversationList]);
+
+  const openStoredConversation = useCallback(async (conversationId: string) => {
+    if (isIsolated || activeChatRequest.current || conversationOpening || conversationId === chatConversationIdRef.current) return;
+    setConversationOpening(true);
+    setConversationListError(null);
+    try {
+      const result = await window.nexaDesktop.chat.openConversation(conversationId);
+      if (!result.ok) {
+        setConversationListError(result.error.code === "runtime_unavailable"
+          ? "La conversación no se puede cambiar mientras Nexa está ocupada."
+          : "No se pudo abrir esa conversación.");
+        return;
+      }
+      const messages: ConversationChatMessage[] = result.messages.map((message) => ({
+        id: message.id, requestId: message.id, conversationId: result.conversationId,
+        role: message.role, text: message.content, source: "history",
+        status: message.status === "complete" ? "completed" : "error",
+        createdAt: Date.parse(message.createdAt),
+        ...(message.status === "interrupted" ? { error: "Mensaje interrumpido." } : {}),
+      }));
+      setChatMessages(messages);
+      setChatNotice(null);
+      setChatConversationId(result.conversationId);
+      setActiveConversationEmpty(messages.length === 0);
+      setOlderMessagesCursor(result.nextCursor);
+    } catch { setConversationListError("No se pudo abrir esa conversación."); }
+    finally { setConversationOpening(false); }
+  }, [conversationOpening, isIsolated]);
+
+  const loadOlderMessages = useCallback(async () => {
+    const conversationId = chatConversationIdRef.current;
+    const cursor = olderMessagesCursor;
+    if (isIsolated || !conversationId || !cursor || olderMessagesLoading || activeChatRequest.current) return;
+    setOlderMessagesLoading(true);
+    try {
+      const result = await window.nexaDesktop.chat.listMessages({ conversationId, cursor });
+      if (!result.ok || chatConversationIdRef.current !== conversationId) return;
+      const older: ConversationChatMessage[] = result.messages.map((message) => ({
+        id: message.id, requestId: message.id, conversationId, role: message.role,
+        text: message.content, source: "history", status: message.status === "complete" ? "completed" : "error",
+        createdAt: Date.parse(message.createdAt), ...(message.status === "interrupted" ? { error: "Mensaje interrumpido." } : {}),
+      }));
+      setChatMessages((current) => [...older, ...current]);
+      setOlderMessagesCursor(result.nextCursor);
+    } catch { setConversationListError("No se pudieron cargar los mensajes anteriores."); }
+    finally { setOlderMessagesLoading(false); }
+  }, [isIsolated, olderMessagesCursor, olderMessagesLoading]);
 
   useEffect(() => {
     let mounted = true;
@@ -256,6 +362,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       ...(activeChatRequest.current ? { error: "Ya hay una solicitud activa en esta conversación." } : {}),
       ...(voice ? voice : {}),
     };
+    setActiveConversationEmpty(false);
     if (activeChatRequest.current) {
       setChatMessages((current) => [...current, message].slice(-MAX_CHAT_HISTORY));
       setChatNotice("La transcripción se conservó, pero no se envió porque hay otra solicitud activa.");
@@ -455,6 +562,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     }
     if (activeChatRequest.current === event.requestId) activeChatRequest.current = null;
     if (event.status === "completed") {
+      void refreshConversationList();
       if (!typedVoiceReplyEligible && fromVoice) {
         const timing = chatTimingByRequest.current.get(event.requestId);
         if (timing) {
@@ -502,7 +610,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         ? { ...entry, status: "error", error: message } : entry));
       setChatNotice(message);
     }
-  }, [reportChatTiming]);
+  }, [refreshConversationList, reportChatTiming]);
 
   useLayoutEffect(() => {
     for (const message of chatMessages) {
@@ -832,18 +940,27 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   }, []);
 
   return (
-    <div className={`app-shell${wallpaperEnabled && wallpaperDataUrl ? " app-shell--wallpaper" : ""}`}>
+    <div className={`app-shell${wallpaperEnabled && wallpaperDataUrl ? " app-shell--wallpaper" : ""}${activeView === "conversations" ? " app-shell--conversations" : ""}`}>
       {wallpaperEnabled && wallpaperDataUrl && (
         <img className="wallpaper-background" src={wallpaperDataUrl} alt="" aria-hidden="true" />
       )}
       <WindowChrome />
-      <Sidebar onOpenSettings={() => setSettingsOpen(true)} showSettings={!isSyntheticOrganicPilot} />
+      <Sidebar activeView={activeView} onOpenCommandCenter={() => setActiveView("command")}
+        onOpenConversations={() => setActiveView("conversations")}
+        onOpenSettings={() => setSettingsOpen(true)} showSettings={!isSyntheticOrganicPilot} showConversations={!isIsolated} />
       <main className="workspace-shell">
         {isSyntheticOrganicPilot && <div className="synthetic-pilot-banner" role="status">PILOTO SINTÉTICO — SIN DATOS PERSONALES</div>}
         <CommandHeader preferences={preferences} weather={weatherStatus} weatherLoading={weatherLoading} />
 
-        <div className="workspace-grid">
+        <div className={`workspace-grid${activeView === "conversations" ? " workspace-grid--conversations" : ""}`}>
+          <ConversationsPanel conversations={conversationItems} activeConversationId={chatConversationId}
+            busy={conversationOpening || conversationListLoading || activeChatRequest.current !== null} loading={conversationListLoading}
+            hasMore={conversationListCursor !== null} error={conversationListError}
+            onNew={() => { void createNewConversation(); }}
+            onSelect={(conversationId) => { void openStoredConversation(conversationId); }}
+            onLoadMore={() => { void refreshConversationList(true); }} />
           <ConversationPanel
+            key={chatConversationId ?? "conversation-uninitialized"}
             snapshot={voiceSnapshot}
             transcripts={[]}
             chatMessages={chatMessages}
@@ -851,7 +968,11 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
             spotifyNowPlayingCards={spotifyNowPlayingCards}
             authorizationAttempts={authorizationAttempts}
             chatNotice={chatNotice}
-            chatBusy={chatConversationId === null || activeChatRequest.current !== null}
+            chatBusy={chatConversationId === null || activeChatRequest.current !== null || conversationOpening}
+            welcomeMessage={activeConversationEmpty ? welcomeMessage : null}
+            hasOlderMessages={olderMessagesCursor !== null}
+            olderMessagesLoading={olderMessagesLoading}
+            onLoadOlderMessages={() => { void loadOlderMessages(); }}
             onSendMessage={(text) => { void submitChatMessage(text, "typed"); }}
             onCancelInteraction={() => { void cancelActiveInteraction(); }}
             onConnectAuthorization={(provider, requestId) => { void connectAuthorization(provider, requestId); }}
@@ -871,11 +992,13 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
               || (voiceSnapshot.status === "error" && !voiceSnapshot.canStart && Boolean(voiceSnapshot.sessionId))}
             cancellationPending={cancellationPending}
           />
-          <PresencePanel status={voiceSnapshot.status} statusLabel={VOICE_STATUS_LABELS[voiceSnapshot.status]} />
+          <PresencePanel className={activeView === "conversations" ? "presence-panel--offscreen" : ""}
+            status={voiceSnapshot.status} statusLabel={VOICE_STATUS_LABELS[voiceSnapshot.status]} />
         </div>
 
       </main>
-      <DashboardModules assistantState={ASSISTANT_STATE_LABELS[assistantState]} spotifyStatus={spotifyLiveStatus}
+      <DashboardModules className={activeView === "conversations" ? "dashboard-modules--hidden" : ""}
+        assistantState={ASSISTANT_STATE_LABELS[assistantState]} spotifyStatus={spotifyLiveStatus}
         spotifyBusyAction={spotifyControlBusy} spotifyError={spotifyControlError}
         voiceRepliesEnabled={preferences.voiceRepliesEnabled} onVoiceRepliesChange={changeVoiceReplies}
         onSpotifyControl={(action) => { void controlSpotify(action); }} onOpenSpotifyTrack={(url) => { void openSpotifyTrack(url); }} />
