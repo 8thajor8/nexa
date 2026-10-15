@@ -24,14 +24,39 @@ export function getOpenAIClient() {
     return client;
 }
 
-export async function askOpenAI({ instructions, input, tools = [], toolChoice, signal }) {
-    return getOpenAIClient().responses.create({
+export async function askOpenAI({ instructions, input, tools = [], toolChoice, signal, onTextDelta,
+    client = getOpenAIClient() }) {
+    const request = {
         model: config.model,
         instructions,
         input,
         tools,
         ...(toolChoice ? { tool_choice: toolChoice } : {}),
-    }, signal ? { signal } : undefined);
+    };
+    if (typeof onTextDelta !== 'function')
+        return client.responses.create(request, signal ? { signal } : undefined);
+
+    const stream = await client.responses.create({ ...request, stream: true }, signal ? { signal } : undefined);
+    let completedResponse = null;
+    for await (const event of stream) {
+        if (signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+        if (event?.type === 'response.output_text.delta' && typeof event.delta === 'string' && event.delta.length > 0) {
+            onTextDelta(event.delta);
+        } else if (event?.type === 'response.completed') {
+            completedResponse = event.response;
+        } else if (event?.type === 'response.failed' || event?.type === 'response.incomplete' || event?.type === 'error') {
+            const error = new Error('The OpenAI response stream did not complete.');
+            error.code = 'openai_stream_incomplete';
+            throw error;
+        }
+    }
+    if (signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+    if (!completedResponse || completedResponse.status !== 'completed') {
+        const error = new Error('The OpenAI response stream ended without a completed response.');
+        error.code = 'openai_stream_incomplete';
+        throw error;
+    }
+    return completedResponse;
 }
 
 export class AutomaticMemoryResponseError extends Error {

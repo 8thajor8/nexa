@@ -45,6 +45,47 @@ test('creates UUID conversations and returns correlated typed completion events'
     await runtime.close();
 });
 
+test('Desktop streaming emits correlated text deltas before one confirmed final result', async () => {
+    const events = [];
+    const runtime = createConversationRuntime({ streamResponses: true, agentFactory: async () => ({
+        run: async (_text, _source, options) => {
+            options.onTextDelta('Hola ');
+            options.onTextDelta('Nexa');
+            return 'Hola Nexa';
+        },
+        close: async () => {},
+    }) });
+    runtime.onEvent(event => events.push(event));
+    const conversationId = runtime.createConversation();
+    const requestId = 'request-stream-1';
+    const result = await runtime.sendMessage({ conversationId, requestId, text: 'Hola', source: 'typed' });
+
+    assert.equal(result.status, 'completed');
+    assert.deepEqual(events.map(({ status }) => status), ['processing', 'text_delta', 'text_delta', 'completed']);
+    assert.deepEqual(events.filter(({ status }) => status === 'text_delta').map(({ delta }) => delta), ['Hola ', 'Nexa']);
+    assert.ok(events.every(event => event.conversationId === conversationId && event.requestId === requestId));
+    assert.equal(events.at(-1).text, 'Hola Nexa');
+    await runtime.close();
+});
+
+test('Runtime without streaming keeps its prior event contract', async () => {
+    const events = [];
+    let receivedStreamingCallbacks = false;
+    const runtime = createConversationRuntime({ agentFactory: async () => ({
+        run: async (_text, _source, options) => {
+            receivedStreamingCallbacks = Boolean(options.onTextDelta || options.onTextReset);
+            return 'Respuesta completa';
+        },
+        close: async () => {},
+    }) });
+    runtime.onEvent(event => events.push(event));
+    const conversationId = runtime.createConversation();
+    await runtime.sendMessage({ conversationId, requestId: 'request-no-stream-1', text: 'Hola', source: 'typed' });
+    assert.equal(receivedStreamingCallbacks, false);
+    assert.deepEqual(events.map(({ status }) => status), ['processing', 'completed']);
+    await runtime.close();
+});
+
 test('restores only bounded visible conversation messages into the agent context', async () => {
     const inputs = [];
     const runtime = createConversationRuntime({ memoryMode: 'memory1', agentOptions: agentOptions({

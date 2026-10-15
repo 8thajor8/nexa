@@ -274,6 +274,7 @@ function createDesktopConversationRuntime(memoryMode: "memory1" | "memory2-reado
     : { logger: writeAgentTrace };
   const runtime = createConversationRuntime({
     memoryMode,
+    streamResponses: true,
     ...(storePath ? { storePath } : {}),
     operationalDiagnostics: desktopOperationalDiagnostics,
     agentOptions: { ...agentOptions,
@@ -502,7 +503,9 @@ function writeSafeTrace(area: string, event: string, details: Record<string, unk
     "transitionTargetDisplayId", "transitionTargetFullscreen", "currentX", "currentY", "currentWidth", "currentHeight",
     "initialX", "initialY", "initialWidth", "initialHeight", "targetX", "targetY", "targetWidth", "targetHeight",
     "targetWorkAreaX", "targetWorkAreaY", "targetWorkAreaWidth", "targetWorkAreaHeight", "targetDisplayBoundsX",
-    "targetDisplayBoundsY", "targetDisplayBoundsWidth", "targetDisplayBoundsHeight", "stableSamples", "checkpoint", "failurePhase"];
+    "targetDisplayBoundsY", "targetDisplayBoundsWidth", "targetDisplayBoundsHeight", "stableSamples", "checkpoint", "failurePhase",
+    "validationReason", "resultTextType", "resultTextLength", "resultTextBytes", "resultTextEmpty", "resultTextOverLimit",
+    "resultTextHasDisallowedControl", "streamedTextLength", "streamedTextBytes", "streamedTextMatchesFinal"];
   const safeDetails = Object.fromEntries(safeFields.filter((key) => {
     const value = details[key];
     return value === null || ["string", "number", "boolean"].includes(typeof value);

@@ -111,6 +111,29 @@ test('rejects unknown roles, internal payload fields, empty text and oversized m
     await assert.rejects(f.store.appendMessage(conversation.conversationId, { role: 'user', content: 'x'.repeat(1024 * 1024 + 1) }), code('conversation_message_invalid'));
 });
 
+test('classifies rejected message fields without retaining their content', async t => {
+    const f = await fixture(t);
+    const conversation = await f.store.createConversation();
+    const invalidInputs = [
+        ['invalid_shape', { role: 'assistant', content: 'synthetic', extra: true }],
+        ['invalid_role', { role: 'tool', content: 'synthetic' }],
+        ['content_not_string', { role: 'assistant', content: 7 }],
+        ['content_too_large', { role: 'assistant', content: 'x'.repeat(1024 * 1024 + 1) }],
+        ['disallowed_control_character', { role: 'assistant', content: 'synthetic\u0001text' }],
+        ['empty_content', { role: 'assistant', content: '  \n' }],
+        ['invalid_status', { role: 'assistant', content: 'synthetic', status: 'pending' }],
+    ];
+    for (const [reason, input] of invalidInputs) {
+        await assert.rejects(f.store.appendMessage(conversation.conversationId, input), error => {
+            assert.equal(error.code, 'conversation_message_invalid');
+            assert.equal(error.validationReason, reason);
+            assert.equal(Object.hasOwn(error, 'content'), false);
+            return true;
+        });
+    }
+    assert.equal((await f.store.getConversation(conversation.conversationId)).messageCount, 0);
+});
+
 test('preserves and reports an incomplete final JSONL tail before continuing safely', async t => {
     const f = await fixture(t);
     const conversation = await f.store.createConversation();

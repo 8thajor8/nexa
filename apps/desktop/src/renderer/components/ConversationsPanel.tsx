@@ -4,6 +4,7 @@ import { HolographicFrame } from "./HolographicFrame";
 interface ConversationsPanelProps {
   conversations: readonly ChatConversationSummary[];
   activeConversationId: string | null;
+  isVisible?: boolean;
   busy: boolean;
   loading: boolean;
   hasMore: boolean;
@@ -22,9 +23,10 @@ function activityLabel(value: string): string {
     : date.toLocaleDateString([], { day: "numeric", month: "short" });
 }
 
-export function ConversationsPanel({ conversations, activeConversationId, busy, loading, hasMore, error,
+export function ConversationsPanel({ conversations, activeConversationId, isVisible = true, busy, loading, hasMore, error,
   onNew, onSelect, onLoadMore }: ConversationsPanelProps) {
-  return <aside className="conversations-history surface-panel" aria-label="Historial de conversaciones">
+  return <aside className="conversations-history surface-panel" aria-label="Historial de conversaciones"
+    aria-hidden={!isVisible} inert={!isVisible}>
     <HolographicFrame />
     <header className="conversation-history-heading">
       <div><span className="section-kicker">ARCHIVO CONVERSACIONAL</span><h2>Conversaciones</h2></div>

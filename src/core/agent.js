@@ -7,6 +7,7 @@ import { createMemory2ReadOnly } from '../memory/read-only.js';
 import { MEMORY_CONTEXT_POLICY } from '../memory/context-provider.js';
 import { openMemoryBackend } from '../memory/backend.js';
 import { randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { askOpenAI, isAutomaticMemoryLiveDetector } from '../brain/openai.js';
 import { config } from '../config.js';
 import { NEXA_INSTRUCTIONS } from '../prompts/nexa.js';
@@ -988,10 +989,12 @@ ${memoryToPrompt(memory)}
                 }))) : Object.freeze([]) }) });
     }
 
-    async function getModelResponse(tools, iteration, finalOnly = false, signal, historicalFacts = null) {
+    async function getModelResponse(tools, iteration, finalOnly = false, signal, historicalFacts = null,
+        onTextDelta = null, onTextReset = null) {
         throwIfAborted(signal);
         let memoryContext = null;
         if (contextProvider && memoryRetrievalEnabled && !historicalFacts) {
+            const memoryStartedAt = performance.now();
             try {
                 memoryContext = await contextProvider.read({ message: currentMessage,
                     recentUserMessages: currentRecentUserMessages });
@@ -1012,10 +1015,14 @@ ${memoryToPrompt(memory)}
                     requestId: activeDiagnosticRequestId, iteration, mode: effectiveMemoryMode,
                     backend: selectedBackend.backend, readStatus: 'success', assertionCount, relationCount,
                     matchCount: assertionCount + relationCount, contextDelivered: Boolean(memoryContext?.items?.length) });
+                diagnostic('memory_retrieval_completed', { iteration, durationMs: performance.now() - memoryStartedAt,
+                    contextItemCount: Array.isArray(memoryContext?.items) ? memoryContext.items.length : 0 });
             } catch (error) {
                 operationalDiagnostics?.recordMemoryRetrieval?.({ operationId: randomUUID(),
                     requestId: activeDiagnosticRequestId, iteration, mode: effectiveMemoryMode,
                     backend: selectedBackend.backend, readStatus: 'error', errorCode: error?.code });
+                diagnostic('memory_retrieval_failed', { iteration, durationMs: performance.now() - memoryStartedAt,
+                    errorCode: typeof error?.code === 'string' ? error.code : null });
                 throw error;
             }
         }
@@ -1041,6 +1048,9 @@ ${memoryToPrompt(memory)}
                 .includes(tool.name)),
             spotifyStateToolAvailable: tools.some(tool => tool.name === 'spotify_get_current_track'),
             historyFactsProvided: Boolean(historicalFacts) });
+        const modelStartedAt = performance.now();
+        let streamedText = '';
+        let firstTextDeltaReported = false;
         diagnostic('model_request_started', { iteration, finalOnly });
         const response = await ask({
             instructions: getInstructions() + (historicalFacts ? MEMORY_HISTORY_POLICY : ''),
@@ -1050,19 +1060,59 @@ ${memoryToPrompt(memory)}
                 ? (memory2ReadOnlyAllowExternalTools ? tools.filter(tool => !memoryToolNames.has(tool.name)) : [])
                 : memory2 ? tools.filter(tool => !memoryToolNames.has(tool.name)) : tools,
             ...(historicalFacts ? { toolChoice: 'required' } : {}),
+            ...(typeof onTextDelta === 'function' && !historicalFacts ? { onTextDelta: delta => {
+                if (typeof delta !== 'string' || delta.length === 0) return;
+                streamedText += delta;
+                if (!firstTextDeltaReported) {
+                    firstTextDeltaReported = true;
+                    diagnostic('model_first_text_delta', { iteration, durationMs: performance.now() - modelStartedAt });
+                }
+                onTextDelta(delta);
+            } } : {}),
             ...(signal ? { signal } : {}),
         });
+        const modelDurationMs = performance.now() - modelStartedAt;
         throwIfAborted(signal);
         if (response?.status !== 'completed') lastRunAssessmentEligible = false;
-        conversation.push(...(response.output ?? []));
         const toolCalls = (response.output ?? []).filter(item => item.type === 'function_call');
+        let finalResponse = response;
+        // Some completed streaming responses contain the emitted text deltas but
+        // expose an empty output_text. Preserve the actual generated answer as the
+        // authoritative final result and in conversation history; never infer text
+        // when the stream itself produced no useful content, or override tool turns.
+        if (toolCalls.length === 0 && (typeof response?.output_text !== 'string'
+            || response.output_text.trim() === '') && streamedText.trim() !== '') {
+            const output = Array.isArray(response.output) ? [...response.output] : [];
+            const assistantIndex = output.findLastIndex(item => item?.type === 'message' && item.role === 'assistant');
+            const assistantMessage = assistantIndex >= 0 ? output[assistantIndex] : null;
+            const content = Array.isArray(assistantMessage?.content) ? [...assistantMessage.content] : [];
+            const textIndex = content.findIndex(part => part?.type === 'output_text');
+            if (textIndex >= 0) content[textIndex] = { ...content[textIndex], text: streamedText };
+            else content.push({ type: 'output_text', text: streamedText });
+            const normalizedMessage = assistantMessage
+                ? { ...assistantMessage, content }
+                : { type: 'message', role: 'assistant', content };
+            if (assistantIndex >= 0) output[assistantIndex] = normalizedMessage;
+            else output.push(normalizedMessage);
+            finalResponse = { ...response, output_text: streamedText, output };
+        }
+        conversation.push(...(finalResponse.output ?? []));
+        if (typeof onTextDelta === 'function' && !historicalFacts) {
+            if (toolCalls.length > 0) {
+                if (streamedText) onTextReset?.();
+            } else if (typeof finalResponse.output_text === 'string' && finalResponse.output_text !== streamedText) {
+                if (streamedText) onTextReset?.();
+                if (finalResponse.output_text) onTextDelta(finalResponse.output_text);
+            }
+        }
         diagnostic('model_response', {
             iteration,
             finalOnly,
+            durationMs: modelDurationMs,
             type: toolCalls.length ? 'tool_calls' : 'final',
             toolCallCount: toolCalls.length,
         });
-        return { response, toolCalls };
+        return { response: finalResponse, toolCalls };
     }
 
     function desktopNowPlayingAnswer(response, spotifyNowPlayingCardDelivered) {
@@ -1073,9 +1123,10 @@ ${memoryToPrompt(memory)}
         return text;
     }
 
-    async function finalAnswer(spotifyMessages, iteration, reason, signal, spotifyNowPlayingCardDelivered = false) {
+    async function finalAnswer(spotifyMessages, iteration, reason, signal, spotifyNowPlayingCardDelivered = false,
+        onTextDelta = null, onTextReset = null) {
         diagnostic('final_turn', { iteration, reason, toolsDisabled: true });
-        const { response, toolCalls } = await getModelResponse([], iteration, true, signal);
+        const { response, toolCalls } = await getModelResponse([], iteration, true, signal, null, onTextDelta, onTextReset);
         if (toolCalls.length > 0) {
             diagnostic('tool_loop_prevented', { iteration, reason: 'tools_returned_when_disabled', count: toolCalls.length });
             return [...spotifyMessages, 'El ciclo de herramientas terminó, pero no pude generar una respuesta final segura.'].filter(Boolean).join('\n\n');
@@ -1088,6 +1139,8 @@ ${memoryToPrompt(memory)}
     async function run(userMessage, source = 'untrusted', options = {}) {
         if (typeof userMessage !== 'string') throw new TypeError('user_message_must_be_text');
         const signal = options?.signal;
+        const onTextDelta = typeof options?.onTextDelta === 'function' ? options.onTextDelta : null;
+        const onTextReset = typeof options?.onTextReset === 'function' ? options.onTextReset : null;
         if (signal !== undefined && !(signal instanceof AbortSignal)) throw new TypeError('request_signal_invalid');
         activeDiagnosticRequestId = typeof options?.requestId === 'string' ? options.requestId : null;
         const conversationLength = conversation.length;
@@ -1472,7 +1525,8 @@ ${memoryToPrompt(memory)}
                 && isTrustedDirectInput && source !== 'untrusted'
                 && !memoryCommand && !parseMemoryConfirmation(userMessage) && !hasExplicitMemoryWriteIntent(userMessage);
             const availableTools = [...baseTools, ...(organicToolAvailable ? [ORGANIC_MEMORY_TOOL] : [])];
-            const { response, toolCalls } = await getModelResponse(availableTools, iteration, false, signal);
+            const { response, toolCalls } = await getModelResponse(availableTools, iteration, false, signal,
+                null, onTextDelta, onTextReset);
             if (toolCalls.length === 0) {
                 const assistantText = desktopNowPlayingAnswer(response, spotifyNowPlayingCardDelivered);
                 return [assistantText, ...spotifyMessages].filter(Boolean).join('\n\n');
@@ -1616,12 +1670,14 @@ ${memoryToPrompt(memory)}
             }
 
             if (repeatedSuccessfulCall) {
-                return finalAnswer(spotifyMessages, iteration, 'repeated_successful_tool_call', signal, spotifyNowPlayingCardDelivered);
+                return finalAnswer(spotifyMessages, iteration, 'repeated_successful_tool_call', signal,
+                    spotifyNowPlayingCardDelivered, onTextDelta, onTextReset);
             }
         }
 
         // Tool rounds are capped; give the model one response-only turn to summarize their outcomes.
-        return finalAnswer(spotifyMessages, maxToolIterations, 'max_tool_iterations', signal, spotifyNowPlayingCardDelivered);
+        return finalAnswer(spotifyMessages, maxToolIterations, 'max_tool_iterations', signal,
+            spotifyNowPlayingCardDelivered, onTextDelta, onTextReset);
         } catch (error) {
             // The Runtime emits a sanitized failure category. Do not pass arbitrary
             // exception fields into diagnostic sinks from this boundary.

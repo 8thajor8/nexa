@@ -22,13 +22,16 @@ const ERROR_MESSAGES = Object.freeze({
     conversation_commit_uncertain: 'The conversation write could not be confirmed.',
     conversation_id_collision: 'A unique conversation could not be created.',
 });
+const MESSAGE_VALIDATION_REASONS = new Set(['invalid_shape', 'invalid_role', 'content_not_string',
+    'content_too_large', 'disallowed_control_character', 'empty_content', 'invalid_status']);
 
 export class ConversationStoreError extends Error {
-    constructor(code, { cause } = {}) {
+    constructor(code, { cause, validationReason } = {}) {
         super(ERROR_MESSAGES[code] ?? ERROR_MESSAGES.conversation_store_unavailable,
             cause === undefined ? undefined : { cause });
         this.name = 'ConversationStoreError';
         this.code = Object.hasOwn(ERROR_MESSAGES, code) ? code : 'conversation_store_unavailable';
+        if (MESSAGE_VALIDATION_REASONS.has(validationReason)) this.validationReason = validationReason;
     }
 }
 
@@ -40,6 +43,20 @@ function validDate(value) {
 function exactRecord(value, keys) {
     return value !== null && typeof value === 'object' && !Array.isArray(value)
         && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+}
+
+function messageValidationReason(input) {
+    if (!exactRecord(input, Object.hasOwn(input ?? {}, 'status') ? ['role', 'content', 'status'] : ['role', 'content']))
+        return 'invalid_shape';
+    if (!['user', 'assistant'].includes(input.role)) return 'invalid_role';
+    if (typeof input.content !== 'string') return 'content_not_string';
+    if (Buffer.byteLength(input.content, 'utf8') > MAX_MESSAGE_BYTES) return 'content_too_large';
+    if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(input.content))
+        return 'disallowed_control_character';
+    if (input.content.trim().length === 0 && !(input.role === 'assistant' && input.status === 'interrupted'))
+        return 'empty_content';
+    if (input.status !== undefined && !['complete', 'interrupted'].includes(input.status)) return 'invalid_status';
+    return null;
 }
 
 function safeTitle(value) {
@@ -342,13 +359,8 @@ export function createConversationStore({ baseDirectory, fileSystem = {}, now = 
         await initialize();
         if (typeof conversationId !== 'string' || !UUID.test(conversationId))
             throw new ConversationStoreError('conversation_id_invalid');
-        if (!exactRecord(input, Object.hasOwn(input ?? {}, 'status') ? ['role', 'content', 'status'] : ['role', 'content'])
-            || !['user', 'assistant'].includes(input.role) || typeof input.content !== 'string'
-            || Buffer.byteLength(input.content, 'utf8') > MAX_MESSAGE_BYTES
-            || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(input.content)
-            || (input.content.trim().length === 0 && !(input.role === 'assistant' && input.status === 'interrupted'))
-            || (input.status !== undefined && !['complete', 'interrupted'].includes(input.status)))
-            throw new ConversationStoreError('conversation_message_invalid');
+        const validationReason = messageValidationReason(input);
+        if (validationReason) throw new ConversationStoreError('conversation_message_invalid', { validationReason });
         return serialize(conversationId, async () => {
             let manifest = await readManifest(conversationId);
             if (!manifest) throw new ConversationStoreError('conversation_not_found');

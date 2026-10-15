@@ -6,12 +6,14 @@ import {
 } from "../src/shared/ipc-contract.js";
 import { registerChatIpcHandlers, type ConversationRuntimeApi, type RuntimeMessageEvent, type RuntimeMessageResult } from "../src/main/chat-ipc.js";
 import { createConversationRuntime } from "../../../src/core/conversation-runtime.js";
+import { ConversationStoreError, createConversationStore } from "../../../src/core/conversation-store.js";
 // @ts-expect-error Synthetic regression exercises the existing Memory2 initializer.
 import { initializeEmptyMemoryStore } from "../../../src/memory/backend.js";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createAgent } from "../../../src/core/agent.js";
+import { askOpenAI } from "../../../src/brain/openai.js";
 import { executeTool, getToolsForModel } from "../../../src/tools/index.js";
 
 function id(value: string): string { return `00000000-0000-4000-8000-${value.padStart(12, "0")}`; }
@@ -247,10 +249,14 @@ describe("Main chat IPC to Conversation Runtime", () => {
 
   it("does not publish a final response if its assistant message cannot be persisted", async () => {
     let appendCount = 0;
+    const writeFailure = new ConversationStoreError("conversation_message_invalid", {
+      cause: Object.assign(new Error("C:\\private\\data"), { code: "EIO" }),
+      validationReason: "disallowed_control_character",
+    });
     const store = { createConversation: vi.fn(async () => ({ conversationId })),
       listConversations: vi.fn(async () => ({ conversations: [], nextCursor: null })),
       getConversation: vi.fn(async () => ({ conversationId })),
-      appendMessage: vi.fn(async () => { if (++appendCount === 2) throw new Error("storage failed"); }),
+      appendMessage: vi.fn(async () => { if (++appendCount === 2) throw writeFailure; }),
       listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, incompleteTail: false })) };
     const { runtime, listeners } = fakeRuntime();
     runtime.restoreConversation = vi.fn(() => true);
@@ -260,13 +266,19 @@ describe("Main chat IPC to Conversation Runtime", () => {
       for (const listener of listeners) listener(result);
       return result;
     });
-    const h = harness(runtime, undefined, undefined, store);
+    const diagnostics = vi.fn();
+    const h = harness(runtime, diagnostics, undefined, store);
     await h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
     await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, request);
     await vi.waitFor(() => expect(h.contents.send).toHaveBeenLastCalledWith(CHAT_EVENT_CHANNEL,
       expect.objectContaining({ conversationId, requestId: request.requestId, status: "error" })));
     expect(h.contents.send.mock.calls.some(call => (call[1] as ChatEventEnvelope).status === "completed")).toBe(false);
     expect(store.appendMessage).toHaveBeenCalledTimes(2);
+    expect(diagnostics).toHaveBeenCalledWith("conversation_persist_failed", expect.objectContaining({
+      stage: "assistant_message", errorName: "ConversationStoreError", errorCode: "conversation_message_invalid",
+      causeName: "Error", causeCode: "EIO", validationReason: "disallowed_control_character",
+    }));
+    expect(JSON.stringify(diagnostics.mock.calls)).not.toContain("private");
     h.service.dispose();
   });
 
@@ -348,6 +360,284 @@ describe("Main chat IPC to Conversation Runtime", () => {
     }]);
     expect(JSON.stringify(diagnostics)).not.toContain("private path");
     h.service.dispose();
+  });
+
+  it("records request, persistence, Runtime, and Renderer dispatch timings without message content", async () => {
+    const diagnostics: Array<[string, Readonly<Record<string, string | number | boolean | null>>]> = [];
+    const { runtime } = fakeRuntime();
+    const store = { createConversation: vi.fn(async (requestedId?: string) => ({ conversationId: requestedId ?? conversationId })),
+      listConversations: vi.fn(async () => ({ conversations: [], nextCursor: null })),
+      getConversation: vi.fn(async () => ({ conversationId })),
+      appendMessage: vi.fn(async () => undefined),
+      listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, incompleteTail: false })) };
+    const h = harness(runtime, (event, details) => diagnostics.push([event, details]), undefined, store);
+    h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+    const privateText = "contenido sintético que no debe entrar en diagnósticos";
+    const result = await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, text: privateText });
+    expect(result).toMatchObject({ ok: true, accepted: true });
+    await vi.waitFor(() => expect(diagnostics.some(([event]) => event === "response_ipc_dispatched")).toBe(true));
+
+    const events = diagnostics.map(([event]) => event);
+    expect(events).toEqual(expect.arrayContaining([
+      "main_ipc_received", "conversation_created_persisted", "user_message_persisted",
+      "runtime_dispatch_started", "assistant_message_persisted", "response_ipc_dispatched",
+    ]));
+    for (const [event, details] of diagnostics) {
+      if (["conversation_created_persisted", "user_message_persisted", "runtime_dispatch_started",
+        "assistant_message_persisted", "response_ipc_dispatched"].includes(event)) {
+        expect(typeof details.durationMs).toBe("number");
+        expect(details.durationMs as number).toBeGreaterThanOrEqual(0);
+      }
+    }
+    expect(JSON.stringify(diagnostics)).not.toContain(privateText);
+    expect(JSON.stringify(diagnostics)).not.toContain("Respuesta");
+    h.service.dispose();
+  });
+
+  it("forwards correlated partials but persists only one final assistant response", async () => {
+    const { runtime, listeners } = fakeRuntime();
+    runtime.sendMessage = vi.fn(async (input) => {
+      for (const listener of listeners) listener({ conversationId: input.conversationId, requestId: input.requestId, status: "processing" });
+      for (const delta of ["Respuesta ", "progresiva."]) for (const listener of listeners)
+        listener({ conversationId: input.conversationId, requestId: input.requestId, status: "text_delta", delta });
+      const result = { conversationId: input.conversationId, requestId: input.requestId, status: "completed" as const,
+        text: "Respuesta progresiva." };
+      for (const listener of listeners) listener(result);
+      return result;
+    });
+    const saved: Array<{ role: string; content: string }> = [];
+    const store = { createConversation: vi.fn(async (requestedId?: string) => ({ conversationId: requestedId ?? conversationId })),
+      listConversations: vi.fn(async () => ({ conversations: [], nextCursor: null })),
+      getConversation: vi.fn(async () => ({ conversationId })),
+      appendMessage: vi.fn(async (_id: string, message: { role: string; content: string }) => { saved.push(message); }),
+      listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, incompleteTail: false })) };
+    const h = harness(runtime, undefined, undefined, store);
+    h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+    await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, text: "consulta sin persistir en trazas" });
+    await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) =>
+      (call[1] as ChatEventEnvelope).status === "completed")).toBe(true));
+
+    const delivered = h.contents.send.mock.calls.map((call) => call[1] as ChatEventEnvelope);
+    expect(delivered.map(({ status }) => status)).toEqual(["processing", "text_delta", "text_delta", "completed"]);
+    expect(delivered.filter((event) => event.status === "text_delta").map((event) =>
+      event.status === "text_delta" ? event.delta : "")).toEqual(["Respuesta ", "progresiva."]);
+    expect(saved.map(({ role }) => role)).toEqual(["user", "assistant"]);
+    expect(saved[1].content).toBe("Respuesta progresiva.");
+    expect(saved.some(({ content }) => content === "Respuesta ")).toBe(false);
+    h.service.dispose();
+  });
+
+  it("persists one final assistant message after streamed deltas in the real temporary Conversation Store", async () => {
+    const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "nexa-streaming-conversation-"));
+    const store = createConversationStore({ baseDirectory: path.join(temporaryRoot, "conversations") });
+    const { runtime, listeners } = fakeRuntime();
+    runtime.sendMessage = vi.fn(async (input) => {
+      for (const listener of listeners) listener({ conversationId: input.conversationId,
+        requestId: input.requestId, status: "processing" });
+      for (const delta of ["Respuesta ", "final."]) for (const listener of listeners)
+        listener({ conversationId: input.conversationId, requestId: input.requestId, status: "text_delta", delta });
+      const result = { conversationId: input.conversationId, requestId: input.requestId,
+        status: "completed" as const, text: "Respuesta final." };
+      for (const listener of listeners) listener(result);
+      return result;
+    });
+    const h = harness(runtime, undefined, undefined, store);
+    try {
+      await h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+      await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, text: "Pregunta sintética" });
+      await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) =>
+        (call[1] as ChatEventEnvelope).status === "completed")).toBe(true));
+      const history = await store.listMessages(conversationId);
+      expect(history.messages.map(({ role, content }) => ({ role, content }))).toEqual([
+        { role: "user", content: "Pregunta sintética" }, { role: "assistant", content: "Respuesta final." },
+      ]);
+      expect(history.messages.filter(({ role }) => role === "assistant")).toHaveLength(1);
+      expect(h.contents.send.mock.calls.map((call) => (call[1] as ChatEventEnvelope).status))
+        .toEqual(["processing", "text_delta", "text_delta", "completed"]);
+    } finally {
+      h.service.dispose();
+      const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(temporaryRoot));
+      expect(relative && !relative.startsWith("..") && !path.isAbsolute(relative)).toBeTruthy();
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it.each(["typed", "voice"] as const)(
+    "persists the exact streamed Unicode answer when the completed OpenAI response has empty output_text (%s)", async (source) => {
+      const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "nexa-stream-empty-final-"));
+      const store = createConversationStore({ baseDirectory: path.join(temporaryRoot, "conversations") });
+      const finalText = "La mañana empieza con café. ☕";
+      const deltas = ["La mañana ", "empieza con ", "café. ☕"];
+      const response = { status: "completed", output_text: "", output: [
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "" }] },
+      ] };
+      const runtime = createConversationRuntime({
+        streamResponses: true,
+        memoryMode: "memory1",
+        agentFactory: async ({ agentOptions, initialConversationHistory }: {
+          agentOptions: Record<string, unknown>; initialConversationHistory: unknown[];
+        }) => createAgent({
+          ...agentOptions,
+          memoryBackend: "memory1",
+          memoryRetrievalEnabled: false,
+          initialConversationHistory,
+          ask: async (request: Record<string, unknown> & { onTextDelta?: (delta: string) => void }) => {
+            const client = { responses: { create: async (body: { stream?: boolean }) => body.stream
+              ? (async function* () {
+                for (const delta of deltas) yield { type: "response.output_text.delta", delta };
+                yield { type: "response.completed", response };
+              })()
+              : response } };
+            return askOpenAI({ ...request, client } as Parameters<typeof askOpenAI>[0]);
+          },
+          load: async () => ({ user: {}, preferences: {}, facts: [] }),
+          save: async () => undefined,
+          getTools: () => [],
+          execute: async () => ({ success: true }),
+          logger: () => undefined,
+        }),
+      });
+      const h = harness(runtime as unknown as ConversationRuntimeApi, undefined, undefined, store);
+
+      try {
+        const created = h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL) as { ok: true; conversationId: string };
+        const requestId = id(source === "typed" ? "906" : "907");
+        await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, conversationId: created.conversationId,
+          requestId, source, text: "Pregunta sintética" });
+        await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) => {
+          const event = call[1] as ChatEventEnvelope;
+          return event.requestId === requestId && (event.status === "completed" || event.status === "error");
+        })).toBe(true));
+
+        const events = h.contents.send.mock.calls.map((call) => call[1] as ChatEventEnvelope)
+          .filter((event) => event.requestId === requestId);
+        const history = await store.listMessages(created.conversationId);
+        expect(events.filter((event) => event.status === "text_delta").map((event) =>
+          event.status === "text_delta" ? event.delta : "")).toEqual(deltas);
+        expect(events.filter((event) => event.status === "text_reset")).toHaveLength(0);
+        expect(events.at(-1)).toMatchObject({ status: "completed", response: finalText });
+        expect(history.messages.map(({ role, content }) => ({ role, content }))).toEqual([
+          { role: "user", content: "Pregunta sintética" },
+          { role: "assistant", content: finalText },
+        ]);
+        expect(history.messages.filter(({ role }) => role === "assistant")).toHaveLength(1);
+      } finally {
+        h.service.dispose();
+        await runtime.close();
+        const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(temporaryRoot));
+        expect(relative && !relative.startsWith("..") && !path.isAbsolute(relative)).toBeTruthy();
+        await rm(temporaryRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("does not fabricate a final answer when streaming completes legitimately without text", async () => {
+    const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "nexa-stream-legit-empty-"));
+    const store = createConversationStore({ baseDirectory: path.join(temporaryRoot, "conversations") });
+    const response = { status: "completed", output_text: "", output: [] };
+    const runtime = createConversationRuntime({
+      streamResponses: true,
+      memoryMode: "memory1",
+      agentFactory: async ({ agentOptions, initialConversationHistory }: {
+        agentOptions: Record<string, unknown>; initialConversationHistory: unknown[];
+      }) => createAgent({
+        ...agentOptions,
+        memoryBackend: "memory1",
+        memoryRetrievalEnabled: false,
+        initialConversationHistory,
+        ask: async (request: Record<string, unknown> & { onTextDelta?: (delta: string) => void }) => {
+          const client = { responses: { create: async (body: { stream?: boolean }) => body.stream
+            ? (async function* () { yield { type: "response.completed", response }; })()
+            : response } };
+          return askOpenAI({ ...request, client } as Parameters<typeof askOpenAI>[0]);
+        },
+        load: async () => ({ user: {}, preferences: {}, facts: [] }),
+        save: async () => undefined,
+        getTools: () => [],
+        execute: async () => ({ success: true }),
+        logger: () => undefined,
+      }),
+    });
+    const h = harness(runtime as unknown as ConversationRuntimeApi, undefined, undefined, store);
+    try {
+      const created = h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL) as { ok: true; conversationId: string };
+      await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, conversationId: created.conversationId,
+        requestId: id("908"), text: "Pregunta sintética" });
+      await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) =>
+        (call[1] as ChatEventEnvelope).status === "error")).toBe(true));
+      const history = await store.listMessages(created.conversationId);
+      expect(history.messages.map(({ role }) => role)).toEqual(["user"]);
+      expect(h.contents.send.mock.calls.some((call) => (call[1] as ChatEventEnvelope).status === "completed")).toBe(false);
+    } finally {
+      h.service.dispose();
+      await runtime.close();
+      const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(temporaryRoot));
+      expect(relative && !relative.startsWith("..") && !path.isAbsolute(relative)).toBeTruthy();
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("traces safe final-text validation metadata across real Agent, Runtime, IPC, and Store contracts", async () => {
+    const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "nexa-stream-validation-"));
+    const store = createConversationStore({ baseDirectory: path.join(temporaryRoot, "conversations") });
+    const finalText = "respuesta-sintetica\u0085";
+    const runtime = createConversationRuntime({
+      streamResponses: true,
+      memoryMode: "memory1",
+      agentFactory: async ({ agentOptions, initialConversationHistory }: {
+        agentOptions: Record<string, unknown>; initialConversationHistory: unknown[];
+      }) => createAgent({
+        ...agentOptions,
+        memoryBackend: "memory1",
+        memoryRetrievalEnabled: false,
+        initialConversationHistory,
+        ask: async (request: Record<string, unknown> & { onTextDelta?: (delta: string) => void }) => {
+          const response = { status: "completed", output_text: finalText,
+            output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: finalText }] }] };
+          const client = { responses: { create: async (body: { stream?: boolean }) => body.stream
+            ? (async function* () {
+              yield { type: "response.output_text.delta", delta: finalText };
+              yield { type: "response.completed", response };
+            })()
+            : response } };
+          return askOpenAI({ ...request, client } as Parameters<typeof askOpenAI>[0]);
+        },
+        load: async () => ({ user: {}, preferences: {}, facts: [] }),
+        save: async () => undefined,
+        getTools: () => [],
+        execute: async () => ({ success: true }),
+        logger: () => undefined,
+      }),
+    });
+    const diagnostics = vi.fn();
+    const h = harness(runtime as unknown as ConversationRuntimeApi, diagnostics, undefined, store);
+
+    try {
+      const created = h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL) as { ok: true; conversationId: string };
+      await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, conversationId: created.conversationId,
+        requestId: id("905"), text: "Pregunta sintética" });
+      await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) =>
+        (call[1] as ChatEventEnvelope).status === "error")).toBe(true));
+
+      const persisted = await store.listMessages(created.conversationId);
+      expect(persisted.messages.map(({ role }) => role)).toEqual(["user"]);
+      expect(h.contents.send.mock.calls.some((call) => (call[1] as ChatEventEnvelope).status === "completed")).toBe(false);
+      expect(diagnostics).toHaveBeenCalledWith("conversation_persist_failed", expect.objectContaining({
+        stage: "assistant_message", validationReason: "disallowed_control_character",
+        resultTextType: "string", resultTextLength: finalText.length,
+        resultTextBytes: Buffer.byteLength(finalText, "utf8"), resultTextEmpty: false,
+        resultTextOverLimit: false, resultTextHasDisallowedControl: true,
+        streamedTextLength: finalText.length, streamedTextBytes: Buffer.byteLength(finalText, "utf8"),
+        streamedTextMatchesFinal: true,
+      }));
+      expect(JSON.stringify(diagnostics.mock.calls)).not.toContain("respuesta-sintetica");
+    } finally {
+      h.service.dispose();
+      await runtime.close();
+      const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(temporaryRoot));
+      expect(relative && !relative.startsWith("..") && !path.isAbsolute(relative)).toBeTruthy();
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
   });
 
   it("speaks only completed voice-origin responses and cancels speech when another chat interaction starts", async () => {

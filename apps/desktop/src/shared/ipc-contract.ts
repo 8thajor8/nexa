@@ -127,7 +127,7 @@ export interface ChatPresentationMetadata {
   kind: "diagnostic" | "tool_catalog";
   technicalDetail: string;
 }
-export type ChatEventStatus = "processing" | "completed" | "cancelled" | "error" | "authorization_required" | "spotify_now_playing";
+export type ChatEventStatus = "processing" | "text_delta" | "text_reset" | "completed" | "cancelled" | "error" | "authorization_required" | "spotify_now_playing";
 interface ChatEventBase {
   conversationId: string;
   requestId: string;
@@ -135,6 +135,8 @@ interface ChatEventBase {
 export type ChatEventEnvelope =
   | AuthorizationRequiredEvent
   | SpotifyNowPlayingEvent
+  | (ChatEventBase & { status: "text_delta"; delta: string })
+  | (ChatEventBase & { status: "text_reset" })
   | (ChatEventBase & { status: "processing" })
   | (ChatEventBase & { status: "cancelled" })
   | (ChatEventBase & { status: "completed"; response: string; presentation?: ChatPresentationMetadata })
@@ -363,7 +365,8 @@ export interface VoiceFollowupDiagnosticRequest {
 }
 export type VoiceChatTimingOrigin = "typed" | "voice";
 export type VoiceChatTimingPhase = "request_started" | "runtime_processing_started" | "response_final_received"
-  | "response_rendered" | "ack_timer_started" | "ack_timer_expired" | "ack_timer_cancelled_response"
+  | "first_text_delta_received" | "first_text_rendered" | "response_rendered"
+  | "ack_timer_started" | "ack_timer_expired" | "ack_timer_cancelled_response"
   | "ack_timer_cancelled_terminal" | "ack_timer_cancelled_superseded" | "stop_requested"
   | "response_arrived_during_ack" | "response_after_ack_timer" | "response_final_available_before_ack"
   | "ack_release_wait" | "runtime_to_final";

@@ -157,8 +157,48 @@ test('agent debug summary reports tool rounds and safe argument metadata', async
     assert.match(serialized, /tool_call/);
     assert.match(serialized, /tool_result/);
     assert.match(serialized, /model_response/);
+    const modelResponses = logs.filter(({ event }) => event === 'model_response');
+    assert.equal(modelResponses.length, 2);
+    assert.ok(modelResponses.every(({ details }) => Number.isFinite(details.durationMs) && details.durationMs >= 0));
     assert.match(serialized, /"length":13/);
     assert.equal(serialized.includes('secret phrase'), false);
+});
+
+test('agent streams text only and clears an intermediate tool-turn draft before final text', async () => {
+    const streamed = [];
+    const resets = [];
+    let round = 0;
+    const agent = await createAgent({
+        ask: async request => {
+            round += 1;
+            if (round === 1) {
+                request.onTextDelta('Estoy consultando.');
+                return { output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Estoy consultando.' }] },
+                    functionCall('test_tool', { secret: 'not text' })], output_text: 'Estoy consultando.' };
+            }
+            request.onTextDelta('Encontré la respuesta.');
+            return finalResponse('Encontré la respuesta.');
+        },
+        load: async () => ({ user: {}, preferences: {}, facts: [] }),
+        save: async () => {},
+        getTools: () => [{ type: 'function', name: 'test_tool' }],
+        execute: async () => ({ success: true }),
+    });
+    const answer = await agent.run('Buscá el dato.', 'typed', {
+        onTextDelta: delta => streamed.push(delta),
+        onTextReset: () => resets.push('reset'),
+    });
+    assert.equal(answer, 'Encontré la respuesta.');
+    assert.deepEqual(streamed, ['Estoy consultando.', 'Encontré la respuesta.']);
+    assert.deepEqual(resets, ['reset']);
+    assert.equal(streamed.some(text => text.includes('not text')), false);
+});
+
+test('agent compatibility path supplies one complete text update when a non-streaming ask is injected', async () => {
+    const { agent } = await makeAgent({ responses: [finalResponse('Respuesta completa sin deltas.')] });
+    const streamed = [];
+    assert.equal(await agent.run('Hola', 'typed', { onTextDelta: delta => streamed.push(delta) }), 'Respuesta completa sin deltas.');
+    assert.deepEqual(streamed, ['Respuesta completa sin deltas.']);
 });
 
 test('agent passes the exact current user message and a stable private session id to tools', async () => {

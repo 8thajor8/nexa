@@ -330,7 +330,7 @@ describe("App PTT DOM integration", () => {
     expect(controller.finish).not.toHaveBeenCalled();
   });
 
-  it("sends a typed message once and displays only its correlated Runtime event", async () => {
+  it("times typed text independently of voice when voice replies are disabled", async () => {
     await mountApp();
     fireEvent.change(screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" }), { target: { value: "Hola Nexa" } });
     fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
@@ -338,10 +338,74 @@ describe("App PTT DOM integration", () => {
     const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
     expect(request).toMatchObject({ text: "Hola Nexa", source: "typed" });
     expect(screen.getByText("Hola Nexa").closest("[data-message-source='typed']")).toBeTruthy();
+    act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+      requestId: request.requestId, status: "processing" })));
     act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId, requestId: request.requestId, status: "completed", response: "Respuesta real" })));
     expect((await screen.findByText("Respuesta real")).closest("[data-message-source='runtime']")).toBeTruthy();
     expect(bridge.chat.sendMessage).toHaveBeenCalledOnce();
     expect(bridge.voice.speech.playChatResponse).not.toHaveBeenCalled();
+    await waitFor(() => expect(bridge.voice.recordChatTiming).toHaveBeenCalledWith(expect.objectContaining({ requestId: request.requestId,
+      origin: "typed", phase: "response_rendered", durationMs: expect.any(Number) })));
+    expect(bridge.voice.recordChatTiming).toHaveBeenCalledWith(expect.objectContaining({ requestId: request.requestId,
+      origin: "typed", phase: "runtime_processing_started", durationMs: expect.any(Number) }));
+    expect(bridge.voice.recordChatTiming).toHaveBeenCalledWith(expect.objectContaining({ requestId: request.requestId,
+      origin: "typed", phase: "response_final_received", durationMs: expect.any(Number) }));
+    expect(JSON.stringify(vi.mocked(bridge.voice.recordChatTiming).mock.calls)).not.toContain("Respuesta real");
+  });
+
+  it("renders streamed text progressively, replaces it once with final text, and keeps TTS separate", async () => {
+    await mountApp();
+    fireEvent.click(screen.getByRole("switch", { name: /Respuestas por voz/ }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" }), { target: { value: "Consulta" } });
+    fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
+    await waitFor(() => expect(bridge.chat.sendMessage).toHaveBeenCalledOnce());
+    const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+    act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+      requestId: request.requestId, status: "processing" })));
+    act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+      requestId: request.requestId, status: "text_delta", delta: "Hola " })));
+    expect(await screen.findByText("Hola")).toBeTruthy();
+    const streamedBubble = document.querySelector(".message--runtime-response");
+    expect(streamedBubble).toBeTruthy();
+    act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+      requestId: request.requestId, status: "text_delta", delta: "Nexa" })));
+    expect(await screen.findByText("Hola Nexa")).toBeTruthy();
+    expect(document.querySelector(".message--runtime-response")).toBe(streamedBubble);
+    expect(bridge.voice.speech.playChatResponse).not.toHaveBeenCalled();
+    act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+      requestId: request.requestId, status: "completed", response: "Hola Nexa, ¿en qué te ayudo?" })));
+    expect(await screen.findByText("Hola Nexa, ¿en qué te ayudo?")).toBeTruthy();
+    expect(document.querySelector(".message--runtime-response")).toBe(streamedBubble);
+    expect(document.querySelectorAll(".message--runtime-response")).toHaveLength(1);
+    await waitFor(() => expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledOnce());
+    expect(bridge.voice.speech.playChatResponse).toHaveBeenCalledWith(request.requestId);
+    await waitFor(() => expect(bridge.voice.recordChatTiming).toHaveBeenCalledWith(expect.objectContaining({
+      requestId: request.requestId, phase: "first_text_delta_received", durationMs: expect.any(Number) })));
+    await waitFor(() => expect(bridge.voice.recordChatTiming).toHaveBeenCalledWith(expect.objectContaining({
+      requestId: request.requestId, phase: "first_text_rendered", durationMs: expect.any(Number) })));
+  });
+
+  it("discards provisional text on a tool-turn reset and on a terminal error", async () => {
+    await mountApp();
+    fireEvent.change(screen.getByRole("textbox", { name: "Escribir mensaje a Nexa" }), { target: { value: "Busca algo" } });
+    fireEvent.click(screen.getByRole("button", { name: "Enviar mensaje a Nexa" }));
+    await waitFor(() => expect(bridge.chat.sendMessage).toHaveBeenCalledOnce());
+    const request = vi.mocked(bridge.chat.sendMessage).mock.calls[0][0];
+    act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+      requestId: request.requestId, status: "text_delta", delta: "Buscando…" })));
+    expect(await screen.findByText("Buscando…")).toBeTruthy();
+    act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+      requestId: request.requestId, status: "text_reset" })));
+    await waitFor(() => expect(screen.queryByText("Buscando…")).toBeNull());
+    act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+      requestId: request.requestId, status: "text_delta", delta: "Texto provisional" })));
+    expect(await screen.findByText("Texto provisional")).toBeTruthy();
+    await waitFor(() => expect(bridge.voice.recordChatTiming).toHaveBeenCalledWith(expect.objectContaining({
+      requestId: request.requestId, phase: "first_text_rendered", durationMs: expect.any(Number) })));
+    act(() => chatListeners.forEach((listener) => listener({ conversationId: request.conversationId,
+      requestId: request.requestId, status: "error", error: { code: "operation_failed", message: "Falló." } })));
+    await waitFor(() => expect(screen.queryByText("Texto provisional")).toBeNull());
+    expect(screen.getAllByText("No se pudo completar la solicitud conversacional.").length).toBeGreaterThan(0);
   });
 
   it("speaks a new typed reply only when enabled, keeps visible text, and opens no follow-up", async () => {

@@ -1,5 +1,6 @@
 import { ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from "electron";
 import { performance } from "node:perf_hooks";
+import { createHash, type Hash } from "node:crypto";
 import { isChatCancelRequest, isChatConversationCreateRequest, isChatConversationListRequest, isChatConversationMessagesRequest, isChatConversationOpenRequest,
   isChatConversationResponse, isChatEventEnvelope, isChatSendMessageRequest } from "../shared/chat-ipc-validation.js";
 import {
@@ -38,6 +39,8 @@ export type RuntimeMessageResult =
   | { conversationId: string; requestId: string; status: "cancelled" }
   | { conversationId: string; requestId: string; status: "error"; error: { code: string; message: string; diagnostic?: { stage: string; code: string; durationMs: number } } };
 export type RuntimeMessageEvent = RuntimeMessageResult | { conversationId: string; requestId: string; status: "processing" }
+  | { conversationId: string; requestId: string; status: "text_delta"; delta: string }
+  | { conversationId: string; requestId: string; status: "text_reset" }
   | AuthorizationRequiredEvent | SpotifyNowPlayingEvent;
 
 interface ChatWindowContext {
@@ -74,6 +77,10 @@ interface ActiveRequest {
   completionPromise?: Promise<void>;
   persistencePending?: boolean;
   cancellationRequested?: boolean;
+  firstTextDeltaDispatched?: boolean;
+  streamedTextHash?: Hash;
+  streamedTextLength?: number;
+  streamedTextBytes?: number;
 }
 
 function failure(requestId: string, code: ChatIpcErrorCode, message: string, conversationId?: string) {
@@ -87,11 +94,44 @@ function runtimeErrorCode(code: string): ChatIpcErrorCode {
   if (code === "conversation_not_found") return "conversation_not_found";
   return "operation_failed";
 }
+function safeErrorIdentifier(value: unknown, key: "name" | "code"): string | null {
+  if (typeof value !== "object" || value === null) return null;
+  const candidate = (value as Record<string, unknown>)[key];
+  return typeof candidate === "string" && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/u.test(candidate) ? candidate : null;
+}
+function safeValidationReason(error: unknown): string | null {
+  if (typeof error !== "object" || error === null) return null;
+  const reason = (error as Record<string, unknown>).validationReason;
+  return typeof reason === "string" && ["invalid_shape", "invalid_role", "content_not_string", "content_too_large",
+    "disallowed_control_character", "empty_content", "invalid_status"].includes(reason) ? reason : null;
+}
+function safePersistenceFailureDetails(error: unknown, resultText: unknown, active: ActiveRequest) {
+  const cause = typeof error === "object" && error !== null
+    ? (error as { cause?: unknown }).cause : undefined;
+  const textType = typeof resultText;
+  const text = typeof resultText === "string" ? resultText : null;
+  const textBytes = text === null ? null : Buffer.byteLength(text, "utf8");
+  const streamedTextMatchesFinal = text !== null && active.streamedTextHash
+    ? active.streamedTextHash.copy().digest("hex") === createHash("sha256").update(text, "utf8").digest("hex")
+    : null;
+  return { stage: "assistant_message", errorName: safeErrorIdentifier(error, "name"),
+    errorCode: safeErrorIdentifier(error, "code"), causeName: safeErrorIdentifier(cause, "name"),
+    causeCode: safeErrorIdentifier(cause, "code"), validationReason: safeValidationReason(error),
+    resultTextType: textType, resultTextLength: text?.length ?? null, resultTextBytes: textBytes,
+    resultTextEmpty: text === null ? null : text.trim().length === 0,
+    resultTextOverLimit: textBytes === null ? null : textBytes > 1024 * 1024,
+    resultTextHasDisallowedControl: text === null ? null : /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(text),
+    streamedTextLength: active.streamedTextLength ?? null, streamedTextBytes: active.streamedTextBytes ?? null,
+    streamedTextMatchesFinal };
+}
 function isRuntimeEvent(value: unknown): value is RuntimeMessageEvent {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const event = value as Record<string, unknown>;
   if (typeof event.conversationId !== "string" || typeof event.requestId !== "string") return false;
   if (event.status === "processing" || event.status === "cancelled") return true;
+  if (event.status === "text_delta") return typeof event.delta === "string" && event.delta.length > 0
+    && event.delta.length <= 16_000 && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(event.delta);
+  if (event.status === "text_reset") return true;
   if (event.status === "authorization_required" || event.status === "spotify_now_playing") return isChatEventEnvelope(value);
   if (event.status === "completed") return typeof event.text === "string";
   return event.status === "error" && typeof event.error === "object" && event.error !== null
@@ -253,6 +293,7 @@ export class ChatIpcService {
     this.seenRequestIds.set(window as object, seen);
     const active: ActiveRequest = { window, request, terminal: false, cancelPending: false, startedAt: performance.now() };
     this.activeByRequest.set(request.requestId, active);
+    this.trace("main_ipc_received", { requestId: request.requestId, source: request.source });
     if (request.source === "typed" || request.source === "voice") {
       try { this.voiceHooks.onNewInteraction?.(request.requestId, request.source); } catch { /* Speech cancellation must not block chat. */ }
     }
@@ -260,6 +301,8 @@ export class ChatIpcService {
     const sendToRuntime = (): Promise<RuntimeMessageResult> => {
       if (active.cancellationRequested) return Promise.resolve({ conversationId: request.conversationId,
         requestId: request.requestId, status: "cancelled" });
+      this.trace("runtime_dispatch_started", { requestId: request.requestId, source: request.source,
+        durationMs: performance.now() - active.startedAt });
       try { return runtime.sendMessage(request); }
       catch { return Promise.reject(new Error("runtime_send_failed")); }
     };
@@ -267,11 +310,17 @@ export class ChatIpcService {
       active.persistencePending = true;
       operation = (async () => {
         if (!this.conversationPersisted) {
+          const persistenceStartedAt = performance.now();
           await this.conversationStore!.createConversation(request.conversationId);
           this.conversationPersisted = true;
+          this.trace("conversation_created_persisted", { requestId: request.requestId,
+            durationMs: performance.now() - persistenceStartedAt });
         }
+        const persistenceStartedAt = performance.now();
         await this.conversationStore!.appendMessage(request.conversationId, { role: "user", content: request.text });
         active.persistencePending = false;
+        this.trace("user_message_persisted", { requestId: request.requestId, source: request.source,
+          durationMs: performance.now() - persistenceStartedAt });
         return sendToRuntime();
       })().catch((error) => {
           active.persistencePending = false;
@@ -370,6 +419,26 @@ export class ChatIpcService {
       this.emit(active, { conversationId: event.conversationId, requestId: event.requestId, status: "processing" });
       return;
     }
+    if (event.status === "text_delta") {
+      active.streamedTextHash ??= createHash("sha256");
+      active.streamedTextHash.update(event.delta, "utf8");
+      active.streamedTextLength = (active.streamedTextLength ?? 0) + event.delta.length;
+      active.streamedTextBytes = (active.streamedTextBytes ?? 0) + Buffer.byteLength(event.delta, "utf8");
+      if (!active.firstTextDeltaDispatched) {
+        active.firstTextDeltaDispatched = true;
+        this.trace("first_text_delta_ipc_dispatched", { requestId: event.requestId, source: active.request.source,
+          durationMs: performance.now() - active.startedAt });
+      }
+      this.emit(active, event);
+      return;
+    }
+    if (event.status === "text_reset") {
+      active.streamedTextHash = createHash("sha256");
+      active.streamedTextLength = 0;
+      active.streamedTextBytes = 0;
+      this.emit(active, event);
+      return;
+    }
     if (event.status === "authorization_required" || event.status === "spotify_now_playing") {
       this.emit(active, event);
       return;
@@ -388,11 +457,14 @@ export class ChatIpcService {
     if (result.status === "completed") {
       if (this.conversationStore) {
         if (active.completionPromise) return;
+        const persistenceStartedAt = performance.now();
         active.completionPromise = this.conversationStore.appendMessage(result.conversationId,
           { role: "assistant", content: result.text }).then(() => {
+          this.trace("assistant_message_persisted", { requestId: active.request.requestId,
+            durationMs: performance.now() - persistenceStartedAt });
           this.dispatchCompletedResult(active, result);
-        }).catch(() => {
-          this.trace("conversation_persist_failed", { stage: "assistant_message" });
+        }).catch((error: unknown) => {
+          this.trace("conversation_persist_failed", safePersistenceFailureDetails(error, result.text, active));
           this.complete(active, { conversationId: active.request.conversationId,
             requestId: active.request.requestId, status: "error",
             error: { code: "operation_failed", message: "The response could not be saved to conversation history." } });
@@ -437,6 +509,8 @@ export class ChatIpcService {
       error: { code: "operation_failed" as const, message: "Runtime returned an invalid conversation result." },
     };
     this.emit(active, safeEvent);
+    if (safeEvent.status === "completed") this.trace("response_ipc_dispatched", { requestId: active.request.requestId,
+      source: active.request.source, durationMs: performance.now() - active.startedAt });
     this.activeByRequest.delete(active.request.requestId);
     if (active.request.source === "voice" && (safeEvent.status === "cancelled" || safeEvent.status === "error")) {
       try { this.voiceHooks.onVoiceRequestTerminal?.(active.request.requestId, safeEvent.status); }

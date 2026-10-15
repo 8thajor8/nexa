@@ -129,7 +129,8 @@ export function isVoiceChatTimingDiagnosticRequest(value: unknown): value is Voi
   if (!isPlainRecord(value)) return false;
   const keys = ["requestId", "origin", "phase", ...(Object.hasOwn(value, "durationMs") ? ["durationMs"] : [])];
   const origins = ["typed", "voice"];
-  const phases = ["request_started", "runtime_processing_started", "response_final_received", "response_rendered",
+  const phases = ["request_started", "runtime_processing_started", "first_text_delta_received", "first_text_rendered",
+    "response_final_received", "response_rendered",
     "ack_timer_started", "ack_timer_expired", "ack_timer_cancelled_response", "ack_timer_cancelled_terminal",
     "ack_timer_cancelled_superseded", "stop_requested", "response_arrived_during_ack", "response_after_ack_timer",
     "response_final_available_before_ack", "ack_release_wait", "runtime_to_final"];

@@ -7,11 +7,13 @@ interface PresencePanelProps {
   status: PttVoiceStatus;
   statusLabel: string;
   className?: string;
+  isHidden?: boolean;
 }
 
-export function PresencePanel({ status, statusLabel, className = "" }: PresencePanelProps) {
+export function PresencePanel({ status, statusLabel, className = "", isHidden = false }: PresencePanelProps) {
   return (
-    <aside className={`presence-panel surface-panel${className ? ` ${className}` : ""}`} aria-labelledby="presence-title" data-renderer-slot="presence" data-voice-state={status}>
+    <aside className={`presence-panel surface-panel${className ? ` ${className}` : ""}`} aria-labelledby="presence-title" data-renderer-slot="presence" data-voice-state={status}
+      aria-hidden={isHidden} inert={isHidden}>
       <HolographicFrame />
       <header className="panel-heading presence-heading">
         <h2 id="presence-title">Nexa Presence</h2>

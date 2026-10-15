@@ -126,7 +126,9 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const terminalChatRequests = useRef(new Set<string>());
   const acknowledgementTimers = useRef(new Map<string, number>());
   const chatTimingByRequest = useRef(new Map<string, { origin: VoiceChatTimingOrigin; startedAt: number;
-    acceptedAt?: number; finalAt?: number; acknowledgementAt?: number; acknowledgementTimerStartedAt?: number; rendered?: boolean }>());
+    runtimeStartedAt?: number; finalAt?: number; acknowledgementAt?: number; acknowledgementTimerStartedAt?: number;
+    firstTextDeltaAt?: number; firstTextRendered?: boolean; rendered?: boolean }>());
+  const pendingStreamDeltas = useRef(new Map<string, { delta: string; frameId: number }>());
   const voiceChatRequests = useRef(new Set<string>());
   const completedVoiceChatRequests = useRef(new Set<string>());
   const originalRequestTexts = useRef(new Map<string, string>());
@@ -143,6 +145,13 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     phase: VoiceChatTimingPhase, durationMs?: number) => {
     void window.nexaDesktop.voice.recordChatTiming({ requestId, origin, phase,
       ...(typeof durationMs === "number" ? { durationMs: Math.max(0, durationMs) } : {}) }).catch(() => undefined);
+  }, []);
+  const discardStreamUpdate = useCallback((requestId: string, removeMessage = true) => {
+    const pending = pendingStreamDeltas.current.get(requestId);
+    if (pending) window.cancelAnimationFrame(pending.frameId);
+    pendingStreamDeltas.current.delete(requestId);
+    if (removeMessage) setChatMessages((current) => current.filter((entry) =>
+      !(entry.role === "assistant" && entry.requestId === requestId)));
   }, []);
   const cancellingVoiceSpeechRequests = useRef(new Set<string>());
   const cancellationInFlight = useRef(false);
@@ -392,12 +401,9 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     activeChatRequest.current = requestId;
     const timingOrigin: VoiceChatTimingOrigin = source;
     const timingStartedAt = performance.now();
-    const timingEnabled = source === "voice" || voiceRepliesEnabledRef.current;
-    if (timingEnabled) {
-      chatTimingByRequest.current.set(requestId, { origin: timingOrigin, startedAt: timingStartedAt });
-      while (chatTimingByRequest.current.size > 24) chatTimingByRequest.current.delete(chatTimingByRequest.current.keys().next().value!);
-      reportChatTiming(requestId, timingOrigin, "request_started");
-    }
+    chatTimingByRequest.current.set(requestId, { origin: timingOrigin, startedAt: timingStartedAt });
+    while (chatTimingByRequest.current.size > 24) chatTimingByRequest.current.delete(chatTimingByRequest.current.keys().next().value!);
+    reportChatTiming(requestId, timingOrigin, "request_started");
     setChatMessages((current) => [...current, message].slice(-MAX_CHAT_HISTORY));
     setChatNotice(null);
     if (source === "voice") {
@@ -464,12 +470,6 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
           : entry));
         setChatNotice(CHAT_ERROR_MESSAGES[response.error.code] ?? "No se pudo enviar el mensaje.");
       } else {
-        const timing = chatTimingByRequest.current.get(requestId);
-        if (timing) {
-          timing.acceptedAt = performance.now();
-          reportChatTiming(requestId, timing.origin, "runtime_processing_started", timing.acceptedAt - timing.startedAt);
-          if (timing.finalAt !== undefined) reportChatTiming(requestId, timing.origin, "runtime_to_final", timing.finalAt - timing.acceptedAt);
-        }
         setChatMessages((current) => current.map((entry) => entry.requestId === requestId && entry.status === "sending"
           ? { ...entry, status: "processing" } : entry));
       }
@@ -500,7 +500,48 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const handleChatEvent = useCallback((event: ChatEventEnvelope) => {
     if (event.conversationId !== chatConversationIdRef.current || !knownChatRequests.current.has(event.requestId)
       || terminalChatRequests.current.has(event.requestId)) return;
+    if (event.status === "text_delta") {
+      const timing = chatTimingByRequest.current.get(event.requestId);
+      if (timing && timing.firstTextDeltaAt === undefined) {
+        timing.firstTextDeltaAt = performance.now();
+        reportChatTiming(event.requestId, timing.origin, "first_text_delta_received",
+          timing.firstTextDeltaAt - timing.startedAt);
+      }
+      const previous = pendingStreamDeltas.current.get(event.requestId);
+      if (previous) {
+        previous.delta += event.delta;
+      } else {
+        const pending = { delta: event.delta, frameId: 0 };
+        pending.frameId = window.requestAnimationFrame(() => {
+          if (pendingStreamDeltas.current.get(event.requestId) !== pending) return;
+          pendingStreamDeltas.current.delete(event.requestId);
+          if (event.conversationId !== chatConversationIdRef.current || terminalChatRequests.current.has(event.requestId)) return;
+          setChatMessages((current) => {
+            const existingIndex = current.findIndex((entry) => entry.role === "assistant"
+              && entry.requestId === event.requestId);
+            if (existingIndex >= 0) return current.map((entry, index) => index === existingIndex
+              ? { ...entry, text: entry.text + pending.delta, status: "processing" } : entry);
+            const streamedMessage: ConversationChatMessage = { id: `${event.requestId}:stream`, requestId: event.requestId,
+              conversationId: event.conversationId, role: "assistant", text: pending.delta,
+              source: voiceChatRequests.current.has(event.requestId) ? "voice" : "typed",
+              status: "processing", createdAt: Date.now(), streamed: true };
+            return [...current, streamedMessage].slice(-MAX_CHAT_HISTORY);
+          });
+        });
+        pendingStreamDeltas.current.set(event.requestId, pending);
+      }
+      return;
+    }
+    if (event.status === "text_reset") {
+      discardStreamUpdate(event.requestId);
+      return;
+    }
     if (event.status === "processing") {
+      const timing = chatTimingByRequest.current.get(event.requestId);
+      if (timing && timing.runtimeStartedAt === undefined) {
+        timing.runtimeStartedAt = performance.now();
+        reportChatTiming(event.requestId, timing.origin, "runtime_processing_started", timing.runtimeStartedAt - timing.startedAt);
+      }
       setChatMessages((current) => current.map((entry) => entry.requestId === event.requestId && entry.status === "sending"
         ? { ...entry, status: "processing" } : entry));
       return;
@@ -514,6 +555,16 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       return;
     }
     terminalChatRequests.current.add(event.requestId);
+    discardStreamUpdate(event.requestId, event.status !== "completed");
+    if (event.status === "completed") {
+      const timing = chatTimingByRequest.current.get(event.requestId);
+      if (timing && timing.finalAt === undefined) {
+        timing.finalAt = performance.now();
+        reportChatTiming(event.requestId, timing.origin, "response_final_received", timing.finalAt - timing.startedAt);
+        if (timing.runtimeStartedAt !== undefined) reportChatTiming(event.requestId, timing.origin, "runtime_to_final",
+          timing.finalAt - timing.runtimeStartedAt);
+      }
+    }
     const fromVoice = voiceChatRequests.current.has(event.requestId);
     const acknowledgementTimer = acknowledgementTimers.current.get(event.requestId);
     if (event.status === "completed" && voiceChatRequests.current.has(event.requestId)) {
@@ -535,13 +586,11 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       acknowledgementTimers.current.delete(event.requestId);
       const timing = chatTimingByRequest.current.get(event.requestId);
       if (timing) {
-        timing.finalAt = performance.now();
+        timing.finalAt ??= performance.now();
         if (timing.acknowledgementAt === undefined && timing.acknowledgementTimerStartedAt !== undefined) {
           reportChatTiming(event.requestId, timing.origin, "ack_timer_cancelled_response",
             timing.finalAt - timing.acknowledgementTimerStartedAt);
         }
-        reportChatTiming(event.requestId, timing.origin, "response_final_received", timing.finalAt - timing.startedAt);
-        if (timing.acceptedAt !== undefined) reportChatTiming(event.requestId, timing.origin, "runtime_to_final", timing.finalAt - timing.acceptedAt);
         if (timing.acknowledgementAt !== undefined) reportChatTiming(event.requestId, timing.origin, "response_after_ack_timer",
           timing.finalAt - timing.acknowledgementAt);
       }
@@ -566,23 +615,25 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       if (!typedVoiceReplyEligible && fromVoice) {
         const timing = chatTimingByRequest.current.get(event.requestId);
         if (timing) {
-          timing.finalAt = performance.now();
-          reportChatTiming(event.requestId, timing.origin, "response_final_received", timing.finalAt - timing.startedAt);
-          if (timing.acceptedAt !== undefined) reportChatTiming(event.requestId, timing.origin, "runtime_to_final", timing.finalAt - timing.acceptedAt);
+          timing.finalAt ??= performance.now();
           if (timing.acknowledgementAt !== undefined) reportChatTiming(event.requestId, timing.origin, "response_after_ack_timer",
             timing.finalAt - timing.acknowledgementAt);
         }
       }
-      const responseMessage: ConversationChatMessage = {
-        id: `${event.requestId}:response`, requestId: event.requestId, conversationId: event.conversationId,
-        role: "assistant", text: event.response, source: "typed", status: "completed", createdAt: Date.now(),
-        ...(event.presentation ? { presentation: event.presentation } : {}),
-        originalRequestText: originalRequestTexts.current.get(event.requestId),
-      };
-      setChatMessages((current) => [...current.map((entry) => entry.requestId === event.requestId
-        ? { ...entry, status: "completed" as const } : entry), {
-        ...responseMessage,
-      }].slice(-MAX_CHAT_HISTORY));
+      setChatMessages((current) => {
+        const provisional = current.find((entry) => entry.role === "assistant" && entry.requestId === event.requestId);
+        const responseMessage: ConversationChatMessage = {
+          id: provisional?.id ?? `${event.requestId}:response`, requestId: event.requestId,
+          conversationId: event.conversationId, role: "assistant", text: event.response,
+          source: provisional?.source ?? "typed", status: "completed", createdAt: provisional?.createdAt ?? Date.now(),
+          streamed: provisional?.streamed ?? false,
+          ...(event.presentation ? { presentation: event.presentation } : {}),
+          originalRequestText: originalRequestTexts.current.get(event.requestId),
+        };
+        return [...current.filter((entry) => !(entry.role === "assistant" && entry.requestId === event.requestId))
+          .map((entry) => entry.requestId === event.requestId
+            ? { ...entry, status: "completed" as const } : entry), responseMessage].slice(-MAX_CHAT_HISTORY);
+      });
       if (!fromVoice && typedVoiceReplyEligible && voiceRepliesEnabledRef.current) {
         typedVoiceFinalSpeechRequests.current.add(event.requestId);
         typedVoiceSpeechRequest.current = event.requestId;
@@ -610,16 +661,26 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         ? { ...entry, status: "error", error: message } : entry));
       setChatNotice(message);
     }
-  }, [refreshConversationList, reportChatTiming]);
+  }, [discardStreamUpdate, refreshConversationList, reportChatTiming]);
 
   useLayoutEffect(() => {
     for (const message of chatMessages) {
       if (message.role !== "assistant" || !message.requestId) continue;
       const timing = chatTimingByRequest.current.get(message.requestId);
-      if (!timing || timing.finalAt === undefined || timing.rendered) continue;
-      timing.rendered = true;
-      reportChatTiming(message.requestId, timing.origin, "response_rendered", performance.now() - timing.finalAt);
-      chatTimingByRequest.current.delete(message.requestId);
+      if (!timing) continue;
+      if (timing.firstTextDeltaAt !== undefined && !timing.firstTextRendered) {
+        timing.firstTextRendered = true;
+        window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+          reportChatTiming(message.requestId, timing.origin, "first_text_rendered", performance.now() - timing.startedAt);
+        }));
+      }
+      if (timing.finalAt !== undefined && !timing.rendered) {
+        timing.rendered = true;
+        window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+          reportChatTiming(message.requestId, timing.origin, "response_rendered", performance.now() - timing.finalAt!);
+          chatTimingByRequest.current.delete(message.requestId);
+        }));
+      }
     }
   }, [chatMessages, reportChatTiming]);
 
@@ -954,6 +1015,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
 
         <div className={`workspace-grid${activeView === "conversations" ? " workspace-grid--conversations" : ""}`}>
           <ConversationsPanel conversations={conversationItems} activeConversationId={chatConversationId}
+            isVisible={activeView === "conversations"}
             busy={conversationOpening || conversationListLoading || activeChatRequest.current !== null} loading={conversationListLoading}
             hasMore={conversationListCursor !== null} error={conversationListError}
             onNew={() => { void createNewConversation(); }}
@@ -970,6 +1032,8 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
             chatNotice={chatNotice}
             chatBusy={chatConversationId === null || activeChatRequest.current !== null || conversationOpening}
             welcomeMessage={activeConversationEmpty ? welcomeMessage : null}
+            showVoiceRepliesToggle={activeView === "conversations"} voiceRepliesEnabled={preferences.voiceRepliesEnabled}
+            onVoiceRepliesChange={changeVoiceReplies}
             hasOlderMessages={olderMessagesCursor !== null}
             olderMessagesLoading={olderMessagesLoading}
             onLoadOlderMessages={() => { void loadOlderMessages(); }}
@@ -993,11 +1057,12 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
             cancellationPending={cancellationPending}
           />
           <PresencePanel className={activeView === "conversations" ? "presence-panel--offscreen" : ""}
+            isHidden={activeView === "conversations"}
             status={voiceSnapshot.status} statusLabel={VOICE_STATUS_LABELS[voiceSnapshot.status]} />
         </div>
 
       </main>
-      <DashboardModules className={activeView === "conversations" ? "dashboard-modules--hidden" : ""}
+      <DashboardModules className={activeView === "conversations" ? "dashboard-modules--hidden" : ""} isHidden={activeView === "conversations"}
         assistantState={ASSISTANT_STATE_LABELS[assistantState]} spotifyStatus={spotifyLiveStatus}
         spotifyBusyAction={spotifyControlBusy} spotifyError={spotifyControlError}
         voiceRepliesEnabled={preferences.voiceRepliesEnabled} onVoiceRepliesChange={changeVoiceReplies}

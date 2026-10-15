@@ -172,6 +172,19 @@ describe("Command Center visual structure", () => {
     expect(conversation).toContain('tabindex="0"');
   });
 
+  it("keeps the expanded conversation voice switch synchronized and defines reduced-motion transitions", () => {
+    const markup = renderToStaticMarkup(createElement(ConversationPanel, {
+      snapshot: idleSnapshot, transcripts: [], transcriptNotice: null, onStart: noop, onFinish: noop,
+      onCancelInteraction: noop, onRecover: noop, showVoiceRepliesToggle: true, voiceRepliesEnabled: true,
+    }));
+    const styles = readFileSync(new URL("../src/renderer/styles.css", import.meta.url), "utf8");
+    expect(markup).toContain('role="switch" aria-label="Respuestas por voz" aria-checked="true"');
+    expect(markup).toContain('id="conversation-voice-replies-state">ACTIVADO</small>');
+    expect(styles).toMatch(/\.workspace-grid\s*\{[^}]*grid-template-columns 820ms/s);
+    expect(styles).toMatch(/\.conversations-history\s*\{[^}]*transform 820ms/s);
+    expect(styles).toMatch(/@media \(prefers-reduced-motion:\s*reduce\)[\s\S]*?transition-duration:\s*0\.01ms/s);
+  });
+
   it("renders accessible controls for frameless window operations", () => {
     const markup = renderToStaticMarkup(createElement(WindowChrome));
 

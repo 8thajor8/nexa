@@ -10,7 +10,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 const MAX_TEXT_LENGTH = 16_000;
 const ERROR_CODES: readonly ChatIpcErrorCode[] = ["invalid_request", "busy", "conversation_not_found",
   "request_not_found", "runtime_unavailable", "cancel_not_accepted", "operation_failed"];
-const EVENT_STATUSES = ["processing", "completed", "cancelled", "error", "authorization_required"] as const;
+const EVENT_STATUSES = ["processing", "text_delta", "text_reset", "completed", "cancelled", "error", "authorization_required"] as const;
 const EXTERNAL_EVENT_STATUSES = [...EVENT_STATUSES, "spotify_now_playing"] as const;
 type RecordValue = Record<string, unknown>;
 
@@ -158,6 +158,10 @@ export function isChatEventEnvelope(value: unknown): value is ChatEventEnvelope 
     return requirement.state === expectedState && requirement.canConnect === !insufficient
       && (requirement.canConnect || !requirement.retrySafe);
   }
+  if (value.status === "text_delta") return exactKeys(value, ["conversationId", "requestId", "status", "delta"])
+    && typeof value.delta === "string" && value.delta.length > 0 && value.delta.length <= MAX_TEXT_LENGTH
+    && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value.delta);
+  if (value.status === "text_reset") return exactKeys(value, ["conversationId", "requestId", "status"]);
   if (value.status === "completed") {
     const baseKeys = ["conversationId", "requestId", "status", "response"];
     if (!exactKeys(value, value.presentation === undefined ? baseKeys : [...baseKeys, "presentation"])

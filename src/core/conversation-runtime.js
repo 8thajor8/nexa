@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { config, resolveCliMemoryMode } from '../config.js';
 import { createRuntimeAgent } from './runtime-agent.js';
 import { openMemoryBackend } from '../memory/backend.js';
@@ -122,6 +123,7 @@ export function createConversationRuntime({
     diagnostic = () => {},
     memoryMode = config.cliMemoryMode,
     storePath = config.memory2ReadOnlyStorePath,
+    streamResponses = false,
     maxRestoredHistoryMessages = 12,
     maxRestoredHistoryCharacters = 12_000,
     operationalDiagnostics = createOperationalDiagnostics({ memoryMode }),
@@ -244,7 +246,7 @@ export function createConversationRuntime({
         const systemDiagnosticKind = classifySystemDiagnosticRequest(text);
         let agent;
         let failureStage = 'agent_initialization';
-        const startedAt = Date.now();
+        const startedAt = performance.now();
         try {
             if (systemDiagnosticKind) {
                 const snapshot = getSystemDiagnosticsSnapshot(conversation);
@@ -274,23 +276,34 @@ export function createConversationRuntime({
                     requestId: entry.requestId, diagnostic: systemDiagnosticKind });
                 return result;
             }
+            const initializationStartedAt = performance.now();
             trace('agent_initialization_started', { conversationId: entry.conversationId, requestId: entry.requestId });
             agent = await getAgent(conversation);
-            trace('agent_started', { conversationId: entry.conversationId, requestId: entry.requestId });
+            trace('agent_started', { conversationId: entry.conversationId, requestId: entry.requestId,
+                durationMs: performance.now() - initializationStartedAt });
             if (entry.controller.signal.aborted) {
                 emit(entry, 'cancelled');
                 trace('request_cancelled', { conversationId: entry.conversationId, requestId: entry.requestId,
-                    durationMs: Date.now() - startedAt, origin: entry.cancelOrigin ?? 'unknown' });
+                    durationMs: performance.now() - startedAt, origin: entry.cancelOrigin ?? 'unknown' });
                 return { conversationId: entry.conversationId, requestId: entry.requestId, status: 'cancelled' };
             }
             failureStage = 'agent_run';
             // Runtime requests are admitted from the trusted Desktop Main IPC boundary.
             // Keep typed/voice as the modality, and separately mark the turn as direct user input
             // so action confirmations can be bound to the actual user message.
+            const agentRunStartedAt = performance.now();
+            trace('agent_run_started', { conversationId: entry.conversationId, requestId: entry.requestId });
             const response = await agent.run(text, source, {
                 signal: entry.controller.signal,
                 requestId: entry.requestId,
                 userMessageSource: 'direct_user',
+                ...(streamResponses ? {
+                    onTextDelta: delta => {
+                        if (entry.terminal || entry.controller.signal.aborted || typeof delta !== 'string' || delta.length === 0) return;
+                        emit(entry, 'text_delta', { delta });
+                    },
+                    onTextReset: () => { if (!entry.terminal && !entry.controller.signal.aborted) emit(entry, 'text_reset'); },
+                } : {}),
                 onAuthorizationRequired: requirement => {
                     if (!entry.terminal && requirement && typeof requirement === 'object') {
                         emit(entry, 'authorization_required', { requirement });
@@ -300,23 +313,25 @@ export function createConversationRuntime({
                     if (!entry.terminal && card && typeof card === 'object') emit(entry, 'spotify_now_playing', { card });
                 },
             });
+            trace('agent_run_completed', { conversationId: entry.conversationId, requestId: entry.requestId,
+                durationMs: performance.now() - agentRunStartedAt });
             if (entry.controller.signal.aborted) {
                 emit(entry, 'cancelled');
                 trace('request_cancelled', { conversationId: entry.conversationId, requestId: entry.requestId,
-                    durationMs: Date.now() - startedAt, origin: entry.cancelOrigin ?? 'unknown' });
+                    durationMs: performance.now() - startedAt, origin: entry.cancelOrigin ?? 'unknown' });
                 return { conversationId: entry.conversationId, requestId: entry.requestId, status: 'cancelled' };
             }
             const result = { conversationId: entry.conversationId, requestId: entry.requestId,
                 status: 'completed', text: typeof response === 'string' ? response : '' };
             emit(entry, 'completed', { text: result.text });
             trace('request_completed', { conversationId: entry.conversationId, requestId: entry.requestId,
-                durationMs: Date.now() - startedAt });
+                durationMs: performance.now() - startedAt });
             return result;
         } catch (caughtError) {
             if (entry.controller.signal.aborted) {
                 emit(entry, 'cancelled');
                 trace('request_cancelled', { conversationId: entry.conversationId, requestId: entry.requestId,
-                    durationMs: Date.now() - startedAt, origin: entry.cancelOrigin ?? 'unknown' });
+                    durationMs: performance.now() - startedAt, origin: entry.cancelOrigin ?? 'unknown' });
                 return { conversationId: entry.conversationId, requestId: entry.requestId, status: 'cancelled' };
             }
             if (failureStage === 'agent_initialization') {
@@ -333,7 +348,7 @@ export function createConversationRuntime({
             emit(entry, 'error', { error });
             const failure = classifyFailure(caughtError);
             trace('request_failed', { conversationId: entry.conversationId, requestId: entry.requestId,
-                durationMs: Date.now() - startedAt, stage: failureStage, outcome: failure.category,
+                durationMs: performance.now() - startedAt, stage: failureStage, outcome: failure.category,
                 providerStatus: failure.status, errorName: failure.errorName, errorCode: failure.providerCode });
             return { conversationId: entry.conversationId, requestId: entry.requestId,
                 status: 'error', error };

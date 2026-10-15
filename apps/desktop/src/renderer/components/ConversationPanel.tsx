@@ -22,6 +22,7 @@ export interface ConversationChatMessage {
   readonly source: "typed" | "voice" | "history";
   readonly status: "sending" | "processing" | "completed" | "cancelled" | "error";
   readonly createdAt: number;
+  readonly streamed?: boolean;
   readonly sessionId?: string;
   readonly turnId?: string;
   readonly error?: string;
@@ -38,6 +39,9 @@ interface ConversationPanelProps {
   authorizationAttempts?: Readonly<Record<string, { state: "connecting" | "connected" | "cancelled" | "error"; message?: string }>>;
   chatNotice?: string | null;
   welcomeMessage?: string | null;
+  showVoiceRepliesToggle?: boolean;
+  voiceRepliesEnabled?: boolean;
+  onVoiceRepliesChange?(enabled: boolean): void;
   hasOlderMessages?: boolean;
   olderMessagesLoading?: boolean;
   onLoadOlderMessages?(): void;
@@ -122,7 +126,8 @@ function resizeComposer(textarea: HTMLTextAreaElement): boolean {
 
 export function ConversationPanel({ snapshot, transcripts, chatMessages = [], authorizationRequirements = {}, spotifyNowPlayingCards = {},
   authorizationAttempts = {}, chatNotice, chatBusy = false, onSendMessage, onCancelInteraction,
-  welcomeMessage = null, hasOlderMessages = false, olderMessagesLoading = false, onLoadOlderMessages,
+  welcomeMessage = null, showVoiceRepliesToggle = false, voiceRepliesEnabled = false, onVoiceRepliesChange,
+  hasOlderMessages = false, olderMessagesLoading = false, onLoadOlderMessages,
   onConnectAuthorization, onCancelAuthorization, onRetryAuthorizedRequest, onOpenSpotifyTrack, transcriptNotice,
   voiceSpeechStatus = null, interactionCancelable = false, cancellationPending = false,
   followupStatus = "idle", followupError = null,
@@ -201,6 +206,12 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
       <HolographicFrame />
       <header className="panel-heading conversation-heading">
         <h2 id="conversation-title">Conversación</h2>
+        {showVoiceRepliesToggle && <button type="button" className="conversation-voice-toggle" role="switch"
+          aria-label="Respuestas por voz" aria-checked={voiceRepliesEnabled} aria-describedby="conversation-voice-replies-state"
+          onClick={() => onVoiceRepliesChange?.(!voiceRepliesEnabled)}>
+          <svg aria-hidden="true" viewBox="0 0 20 20" fill="none"><path d="M3 8v4h3l4 3V5L6 8H3Z"/><path d="M13 7a4 4 0 0 1 0 6m2-8a7 7 0 0 1 0 10"/></svg>
+          <span>Respuestas por voz</span><small id="conversation-voice-replies-state">{voiceRepliesEnabled ? "ACTIVADO" : "DESACTIVADO"}</small>
+        </button>}
       </header>
 
       <div ref={messageListRef} className="message-list" aria-label="Historial de conversación" tabIndex={0} onScroll={updateTailFollowing}>
@@ -240,7 +251,7 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
           <article className="message message--nexa message--runtime-response" data-message-source="runtime" key={entry.id}>
             <div className="message-meta"><span className="message-marker message-marker--nexa" aria-hidden="true">N</span><strong>Nexa</strong><time>{new Date(entry.createdAt).toLocaleTimeString()}</time></div>
             <div className="assistant-message-bubble">
-              <AssistantResponseText text={entry.text} presentation={entry.presentation} />
+              <AssistantResponseText text={entry.text} presentation={entry.presentation} streamed={entry.streamed === true} />
               {authorizationRequirements[entry.requestId] && (() => {
               const requirement = authorizationRequirements[entry.requestId];
               const attempt = authorizationAttempts[entry.requestId];
@@ -342,11 +353,17 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
 
 type ProcessingPhase = "hidden" | "visible" | "fading";
 
-function AssistantResponseText({ text, presentation }: { text: string; presentation?: ChatPresentationMetadata }) {
+function AssistantResponseText({ text, presentation, streamed = false }: {
+  text: string; presentation?: ChatPresentationMetadata; streamed?: boolean;
+}) {
   const [visibleCharacters, setVisibleCharacters] = useState(0);
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
 
   useEffect(() => {
+    if (streamed) {
+      setVisibleCharacters(text.length);
+      return;
+    }
     if (typeof window === "undefined" || !text) {
       setVisibleCharacters(text.length);
       return;
@@ -368,9 +385,9 @@ function AssistantResponseText({ text, presentation }: { text: string; presentat
     const timer = window.setInterval(reveal, 20);
     reveal();
     return () => window.clearInterval(timer);
-  }, [text]);
+  }, [text, streamed]);
 
-  const isTyping = visibleCharacters < text.length;
+  const isTyping = !streamed && visibleCharacters < text.length;
   async function copyTechnicalDetail() {
     if (!presentation?.technicalDetail) return;
     try {
@@ -383,7 +400,7 @@ function AssistantResponseText({ text, presentation }: { text: string; presentat
   return (
     <div className="assistant-response-content">
       <div className="assistant-response-visual" aria-live={isTyping ? "off" : "polite"}>
-        <SafeMarkdown text={`${text.slice(0, visibleCharacters)}${isTyping ? "▍" : ""}`} />
+        <SafeMarkdown text={`${streamed ? text : text.slice(0, visibleCharacters)}${isTyping ? "▍" : ""}`} />
       </div>
       {presentation?.technicalDetail && <div className="technical-detail-action">
         <button type="button" onClick={() => { void copyTechnicalDetail(); }} aria-label="Copiar detalle técnico">
