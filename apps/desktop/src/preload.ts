@@ -13,6 +13,9 @@ import {
   CHAT_CANCEL_REQUEST_CHANNEL,
   CHAT_CREATE_CONVERSATION_CHANNEL,
   CHAT_EVENT_CHANNEL,
+  CHAT_LIST_CONVERSATIONS_CHANNEL,
+  CHAT_LIST_MESSAGES_CHANNEL,
+  CHAT_OPEN_CONVERSATION_CHANNEL,
   CHAT_SEND_MESSAGE_CHANNEL,
   MEMORY_MODE_GET_CHANNEL,
   MEMORY_MODE_SET_CHANNEL,
@@ -71,6 +74,8 @@ import {
 } from "./shared/voice-ipc-validation";
 import {
   isChatCancelRequest, isChatCancelResponse, isChatConversationResponse, isChatEventEnvelope,
+  isChatConversationListRequest, isChatConversationListResponse,
+  isChatConversationMessagesRequest, isChatConversationMessagesResponse, isChatConversationOpenRequest,
   isChatSendMessageRequest, isChatSendResponse,
 } from "./shared/chat-ipc-validation";
 
@@ -239,6 +244,27 @@ const api: NexaDesktopApi = {
     async createConversation() {
       const response: unknown = await ipcRenderer.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
       if (!isChatConversationResponse(response)) throw new Error("invalid_chat_conversation_response");
+      return response;
+    },
+    async openConversation(conversationId) {
+      const request = { conversationId };
+      if (!isChatConversationOpenRequest(request)) throw new Error("invalid_chat_conversation_request");
+      const response: unknown = await ipcRenderer.invoke(CHAT_OPEN_CONVERSATION_CHANNEL, request);
+      if (!isChatConversationMessagesResponse(response)
+        || (response.ok && response.conversationId !== conversationId)) throw new Error("invalid_chat_conversation_response");
+      return response;
+    },
+    async listMessages(request) {
+      if (!isChatConversationMessagesRequest(request)) throw new Error("invalid_chat_messages_request");
+      const response: unknown = await ipcRenderer.invoke(CHAT_LIST_MESSAGES_CHANNEL, request);
+      if (!isChatConversationMessagesResponse(response)
+        || (response.ok && response.conversationId !== request.conversationId)) throw new Error("invalid_chat_messages_response");
+      return response;
+    },
+    async listConversations(request = {}) {
+      if (!isChatConversationListRequest(request)) throw new Error("invalid_chat_conversation_list_request");
+      const response: unknown = await ipcRenderer.invoke(CHAT_LIST_CONVERSATIONS_CHANNEL, request);
+      if (!isChatConversationListResponse(response)) throw new Error("invalid_chat_conversation_list_response");
       return response;
     },
     async sendMessage(request) {

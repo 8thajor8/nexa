@@ -45,6 +45,34 @@ test('creates UUID conversations and returns correlated typed completion events'
     await runtime.close();
 });
 
+test('restores only bounded visible conversation messages into the agent context', async () => {
+    const inputs = [];
+    const runtime = createConversationRuntime({ memoryMode: 'memory1', agentOptions: agentOptions({
+        ask: async request => { inputs.push(request.input); return final('Respuesta nueva.'); },
+    }) });
+    const conversationId = '00000000-0000-4000-8000-000000000099';
+    try {
+        assert.equal(runtime.restoreConversation(conversationId, [
+            { role: 'user', content: 'Estoy pensando en borrar mis copias.' },
+            { role: 'assistant', content: 'Te recomiendo conservar una copia independiente.' },
+        ]), true);
+        const result = await runtime.sendMessage({ conversationId, requestId: 'restore-context-1',
+            text: '¿Y por qué?', source: 'typed' });
+        assert.equal(result.status, 'completed');
+        assert.deepEqual(inputs[0].filter(item => item.role === 'user' || item.role === 'assistant')
+            .map(item => [item.role, item.content]), [
+            ['user', 'Estoy pensando en borrar mis copias.'],
+            ['assistant', 'Te recomiendo conservar una copia independiente.'],
+            ['user', '¿Y por qué?'],
+        ]);
+        assert.equal(runtime.restoreConversation(conversationId, []), false);
+        assert.throws(() => runtime.restoreConversation('../../invalid', []), /conversation_id_invalid/u);
+        assert.throws(() => runtime.restoreConversation('00000000-0000-4000-8000-000000000098', [
+            { type: 'function_call', name: 'tool', arguments: '{}' },
+        ]), /conversation_history_invalid/u);
+    } finally { await runtime.close(); }
+});
+
 test('preserves conversation context and isolates histories between conversation IDs', async () => {
     const requests = [];
     let answer = 0;

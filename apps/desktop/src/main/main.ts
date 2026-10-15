@@ -2,6 +2,8 @@ import { app, BrowserWindow, ipcMain, Menu, protocol, screen, session, shell } f
 import { lstat, mkdir, readFile } from "node:fs/promises";
 // @ts-expect-error The repository's JavaScript Runtime intentionally has no generated declaration file.
 import { createConversationRuntime } from "../../../../src/core/conversation-runtime.js";
+// @ts-expect-error The local Conversation Store is JavaScript and deliberately has no generated declaration file.
+import { createConversationStore } from "../../../../src/core/conversation-store.js";
 // @ts-expect-error The shared Runtime diagnostics intentionally has no generated declaration file.
 import { createOperationalDiagnostics } from "../../../../src/core/system-diagnostics.js";
 // @ts-expect-error The repository's JavaScript Runtime intentionally has no generated declaration file.
@@ -258,6 +260,7 @@ let closingRuntime = false;
 let runtimeClosed = false;
 const windowPreferencesStore = createWindowPreferencesStore(app.getPath("userData"));
 const memoryModePreferencesStore = createMemoryModePreferencesStore(app.getPath("userData"));
+const conversationStore = createConversationStore({ baseDirectory: resolve(app.getPath("userData"), "conversation-store") });
 
 function windowDisplays() {
   return describeDisplays(screen.getAllDisplays() as ScreenDisplayLike[], screen.getPrimaryDisplay().id);
@@ -790,7 +793,7 @@ function installWebContentsGuards(): void {
         desktopOperationalDiagnostics.recordVoiceOperation({ requestId, stage: "runtime", state: "success", durationMs,
           ...desktopVoiceConfiguration, durations: { runtimeMs: durationMs } });
       },
-    });
+    }, conversationStore);
     if (startupPolicy.registerMemoryMode) registerMemoryModeIpcHandlers({
       getWindow: () => mainWindow,
       getRuntime: () => conversationRuntime,

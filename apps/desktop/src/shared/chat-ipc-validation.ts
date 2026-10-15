@@ -1,5 +1,7 @@
 import type {
   ChatCancelRequest, ChatCancelResponse, ChatConversationResponse, ChatEventEnvelope, ChatIpcErrorCode,
+  ChatConversationListRequest, ChatConversationListResponse, ChatConversationMessagesRequest,
+  ChatConversationMessagesResponse, ChatConversationListCursor, ChatMessageCursor,
   ChatSendMessageRequest, ChatSendResponse,
 } from "./ipc-contract.js";
 import { isSpotifyTrackUrl } from "./spotify-link-validation.js";
@@ -49,6 +51,60 @@ export function isChatConversationResponse(value: unknown): value is ChatConvers
     && exactKeys(value.error, ["code", "message"])
     && (value.error.code === "runtime_unavailable" || value.error.code === "operation_failed")
     && typeof value.error.message === "string" && value.error.message.length <= 300;
+}
+export function isChatConversationOpenRequest(value: unknown): value is { conversationId: string } {
+  return isRecord(value) && exactKeys(value, ["conversationId"]) && isIdentifier(value.conversationId);
+}
+function isMessageCursor(value: unknown): value is ChatMessageCursor {
+  return isRecord(value) && exactKeys(value, ["offset", "beforeSequence"])
+    && Number.isSafeInteger(value.offset) && (value.offset as number) >= 0
+    && Number.isSafeInteger(value.beforeSequence) && (value.beforeSequence as number) > 0;
+}
+export function isChatConversationMessagesRequest(value: unknown): value is ChatConversationMessagesRequest {
+  return isRecord(value) && (exactKeys(value, ["conversationId"]) || exactKeys(value, ["conversationId", "cursor"]))
+    && isIdentifier(value.conversationId) && (value.cursor === undefined || value.cursor === null || isMessageCursor(value.cursor));
+}
+function isConversationListCursor(value: unknown): value is ChatConversationListCursor {
+  return isRecord(value) && exactKeys(value, ["updatedAt", "conversationId"])
+    && typeof value.updatedAt === "string" && Number.isFinite(Date.parse(value.updatedAt))
+    && isIdentifier(value.conversationId);
+}
+export function isChatConversationListRequest(value: unknown): value is ChatConversationListRequest {
+  if (!isRecord(value) || !Object.keys(value).every(key => ["limit", "cursor"].includes(key))) return false;
+  return (value.limit === undefined || (Number.isSafeInteger(value.limit) && (value.limit as number) >= 1 && (value.limit as number) <= 100))
+    && (value.cursor === undefined || value.cursor === null || isConversationListCursor(value.cursor));
+}
+export function isChatConversationListResponse(value: unknown): value is ChatConversationListResponse {
+  if (!isRecord(value)) return false;
+  if (value.ok === false) return exactKeys(value, ["ok", "error"]) && isRecord(value.error)
+    && exactKeys(value.error, ["code", "message"])
+    && ["runtime_unavailable", "operation_failed"].includes(String(value.error.code))
+    && typeof value.error.message === "string" && value.error.message.length <= 300;
+  if (value.ok !== true || !exactKeys(value, ["ok", "conversations", "nextCursor"])
+    || !Array.isArray(value.conversations) || value.conversations.length > 100
+    || !(value.nextCursor === null || isConversationListCursor(value.nextCursor))) return false;
+  return value.conversations.every(item => isRecord(item)
+    && exactKeys(item, ["conversationId", "title", "createdAt", "updatedAt", "messageCount"])
+    && isIdentifier(item.conversationId) && typeof item.title === "string" && item.title.length <= 120
+    && typeof item.createdAt === "string" && Number.isFinite(Date.parse(item.createdAt))
+    && typeof item.updatedAt === "string" && Number.isFinite(Date.parse(item.updatedAt))
+    && Number.isSafeInteger(item.messageCount) && (item.messageCount as number) >= 0);
+}
+export function isChatConversationMessagesResponse(value: unknown): value is ChatConversationMessagesResponse {
+  if (!isRecord(value)) return false;
+  if (value.ok === false) return exactKeys(value, ["ok", "error"]) && isRecord(value.error)
+    && exactKeys(value.error, ["code", "message"])
+    && ["conversation_not_found", "runtime_unavailable", "operation_failed"].includes(String(value.error.code))
+    && typeof value.error.message === "string" && value.error.message.length <= 300;
+  if (value.ok !== true || !exactKeys(value, ["ok", "conversationId", "messages", "nextCursor", "incompleteTail"])
+    || !isIdentifier(value.conversationId) || !Array.isArray(value.messages) || value.messages.length > 100
+    || !(value.nextCursor === null || isMessageCursor(value.nextCursor)) || typeof value.incompleteTail !== "boolean") return false;
+  return value.messages.every(message => isRecord(message)
+    && exactKeys(message, ["id", "role", "content", "createdAt", "status"])
+    && isIdentifier(message.id) && (message.role === "user" || message.role === "assistant")
+    && typeof message.content === "string" && message.content.length <= 1_048_576
+    && typeof message.createdAt === "string" && Number.isFinite(Date.parse(message.createdAt))
+    && (message.status === "complete" || message.status === "interrupted"));
 }
 export function isChatSendResponse(value: unknown): value is ChatSendResponse {
   if (!isRecord(value)) return false;

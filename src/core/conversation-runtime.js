@@ -87,6 +87,25 @@ function validIdentifier(value) {
         && value.trim() === value && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
 }
 
+const CONVERSATION_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+function restoredHistory(messages, maxMessages, maxCharacters) {
+    if (!Array.isArray(messages) || messages.length > 100)
+        throw new TypeError('conversation_history_invalid');
+    const normalized = messages.map(message => {
+        if (!message || typeof message !== 'object' || Array.isArray(message)
+            || !['user', 'assistant'].includes(message.role) || typeof message.content !== 'string'
+            || message.content.trim() === '' || message.content.length > 1_000_000
+            || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(message.content))
+            throw new TypeError('conversation_history_invalid');
+        return Object.freeze({ role: message.role, content: message.content });
+    });
+    let selected = maxMessages === 0 ? [] : normalized.slice(-maxMessages);
+    let characters = selected.reduce((total, message) => total + message.content.length, 0);
+    while (selected.length && characters > maxCharacters)
+        characters -= selected.shift().content.length;
+    return Object.freeze(selected);
+}
+
 function resultError(conversationId, requestId, code, message) {
     return { conversationId, requestId, status: 'error', error: { code, message } };
 }
@@ -102,9 +121,14 @@ export function createConversationRuntime({
     diagnostic = () => {},
     memoryMode = config.cliMemoryMode,
     storePath = config.memory2ReadOnlyStorePath,
+    maxRestoredHistoryMessages = 12,
+    maxRestoredHistoryCharacters = 12_000,
     operationalDiagnostics = createOperationalDiagnostics({ memoryMode }),
 } = {}) {
     if (typeof agentFactory !== 'function') throw new TypeError('agent_factory_invalid');
+    if (!Number.isSafeInteger(maxRestoredHistoryMessages) || maxRestoredHistoryMessages < 0 || maxRestoredHistoryMessages > 100
+        || !Number.isSafeInteger(maxRestoredHistoryCharacters) || maxRestoredHistoryCharacters < 0
+        || maxRestoredHistoryCharacters > 100_000) throw new TypeError('conversation_history_budget_invalid');
 
     const conversations = new Map();
     const activeRequests = new Map();
@@ -165,6 +189,7 @@ export function createConversationRuntime({
         if (!conversation.agentPromise) {
             conversation.agentPromise = Promise.resolve().then(() => agentFactory({
                 memoryMode, storePath,
+                initialConversationHistory: conversation.initialConversationHistory,
                 agentOptions: { ...agentOptions, operationalDiagnostics, operationalMemoryMode: memoryMode },
             })).then(agent => {
                 if (!agent || typeof agent.run !== 'function' || typeof agent.close !== 'function')
@@ -289,8 +314,19 @@ export function createConversationRuntime({
     function createConversation() {
         if (closed) throw new Error('conversation_runtime_closed');
         const conversationId = randomUUID();
-        conversations.set(conversationId, { agent: null, agentPromise: null });
+        conversations.set(conversationId, { agent: null, agentPromise: null, initialConversationHistory: Object.freeze([]) });
         return conversationId;
+    }
+
+    function restoreConversation(conversationId, messages = []) {
+        if (closed) throw new Error('conversation_runtime_closed');
+        if (typeof conversationId !== 'string' || !CONVERSATION_UUID.test(conversationId))
+            throw new TypeError('conversation_id_invalid');
+        if (conversations.has(conversationId)) return false;
+        if (activeRequests.size > 0) throw new Error('conversation_runtime_busy');
+        conversations.set(conversationId, { agent: null, agentPromise: null,
+            initialConversationHistory: restoredHistory(messages, maxRestoredHistoryMessages, maxRestoredHistoryCharacters) });
+        return true;
     }
 
     function sendMessage(input = {}) {
@@ -372,6 +408,6 @@ export function createConversationRuntime({
         return closing;
     }
 
-    return Object.freeze({ createConversation, sendMessage, cancelRequest, onEvent,
+    return Object.freeze({ createConversation, restoreConversation, sendMessage, cancelRequest, onEvent,
         getMemoryMode: () => memoryMode === 'memory2-confirmed-write' ? memoryMode : resolveCliMemoryMode(memoryMode), close });
 }

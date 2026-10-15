@@ -25,6 +25,7 @@ export async function createRuntimeAgent({
     memoryMode = config.cliMemoryMode,
     storePath = config.memory2ReadOnlyStorePath,
     agentOptions = {},
+    initialConversationHistory = [],
     allowConfirmedMemoryWrites = agentOptions?.allowConfirmedMemoryWrites === true,
 } = {}) {
     const confirmedWriteMode = memoryMode === 'memory2-confirmed-write';
@@ -37,11 +38,12 @@ export async function createRuntimeAgent({
             automaticMemoryDetector: createAutomaticMemoryDetector(),
             enableAutomaticMemoryAssessment: false,
             ...agentOptions,
+            initialConversationHistory,
         });
     }
 
     if (memoryMode === 'memory2') {
-        return createAgent({ memoryBackend: 'memory2', ...agentOptions });
+        return createAgent({ memoryBackend: 'memory2', ...agentOptions, initialConversationHistory });
     }
 
     if (memoryMode === 'memory2-confirmed-write') {
@@ -49,7 +51,7 @@ export async function createRuntimeAgent({
             throw new Error('A dedicated absolute synthetic Memory 2 store is required for confirmed writes.');
         }
         const { allowConfirmedMemoryWrites: _hostGate, ...safeAgentOptions } = agentOptions;
-        return createAgent({ ...safeAgentOptions, memoryBackend: 'memory2', memory2StorePath: storePath,
+        return createAgent({ ...safeAgentOptions, memoryBackend: 'memory2', memory2StorePath: storePath, initialConversationHistory,
             enableConfirmedMemoryWrites: true, enableAutomaticMemoryAssessment: false });
     }
 
@@ -61,6 +63,7 @@ export async function createRuntimeAgent({
     try {
         return await createAgent({
             ...agentOptions,
+            initialConversationHistory,
             memory2ReadOnlyReader: reader,
             memoryRetrievalEnabled: true,
             memory2ReadOnlyAllowExternalTools: true,

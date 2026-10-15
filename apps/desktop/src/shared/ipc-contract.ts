@@ -23,6 +23,9 @@ export const VOICE_DUCKING_END_CHANNEL = "voice:ducking:end" as const;
 export const CHAT_SEND_MESSAGE_CHANNEL = "chat:send-message" as const;
 export const CHAT_CANCEL_REQUEST_CHANNEL = "chat:cancel-request" as const;
 export const CHAT_CREATE_CONVERSATION_CHANNEL = "chat:create-conversation" as const;
+export const CHAT_OPEN_CONVERSATION_CHANNEL = "chat:open-conversation" as const;
+export const CHAT_LIST_MESSAGES_CHANNEL = "chat:list-messages" as const;
+export const CHAT_LIST_CONVERSATIONS_CHANNEL = "chat:list-conversations" as const;
 export const CHAT_EVENT_CHANNEL = "chat:event" as const;
 export const MEMORY_MODE_GET_CHANNEL = "memory:mode:get" as const;
 export const MEMORY_MODE_SET_CHANNEL = "memory:mode:set" as const;
@@ -55,6 +58,31 @@ export type ChatIpcErrorCode = "invalid_request" | "busy" | "conversation_not_fo
 export type ChatConversationResponse =
   | { ok: true; conversationId: string }
   | { ok: false; error: { code: "runtime_unavailable" | "operation_failed"; message: string } };
+export interface ChatMessageCursor { offset: number; beforeSequence: number; }
+export interface ChatConversationMessage {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  createdAt: string;
+  status: "complete" | "interrupted";
+}
+export interface ChatConversationOpenRequest { conversationId: string; }
+export interface ChatConversationMessagesRequest { conversationId: string; cursor?: ChatMessageCursor | null; }
+export interface ChatConversationListCursor { updatedAt: string; conversationId: string; }
+export interface ChatConversationSummary {
+  conversationId: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  messageCount: number;
+}
+export interface ChatConversationListRequest { limit?: number; cursor?: ChatConversationListCursor | null; }
+export type ChatConversationListResponse =
+  | { ok: true; conversations: ChatConversationSummary[]; nextCursor: ChatConversationListCursor | null }
+  | { ok: false; error: { code: "runtime_unavailable" | "operation_failed"; message: string } };
+export type ChatConversationMessagesResponse =
+  | { ok: true; conversationId: string; messages: ChatConversationMessage[]; nextCursor: ChatMessageCursor | null; incompleteTail: boolean }
+  | { ok: false; error: { code: "conversation_not_found" | "runtime_unavailable" | "operation_failed"; message: string } };
 export interface ChatIpcFailure {
   ok: false;
   conversationId?: string;
@@ -112,6 +140,9 @@ export type ChatEventEnvelope =
   | (ChatEventBase & { status: "error"; error: { code: ChatIpcErrorCode; message: string } });
 export interface ChatDesktopApi {
   createConversation(): Promise<ChatConversationResponse>;
+  openConversation(conversationId: string): Promise<ChatConversationMessagesResponse>;
+  listMessages(request: ChatConversationMessagesRequest): Promise<ChatConversationMessagesResponse>;
+  listConversations(request?: ChatConversationListRequest): Promise<ChatConversationListResponse>;
   sendMessage(request: ChatSendMessageRequest): Promise<ChatSendResponse>;
   cancelRequest(requestId: string): Promise<ChatCancelResponse>;
   onEvent(listener: (event: ChatEventEnvelope) => void): () => void;

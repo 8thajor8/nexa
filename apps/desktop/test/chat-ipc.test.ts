@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  CHAT_CANCEL_REQUEST_CHANNEL, CHAT_CREATE_CONVERSATION_CHANNEL, CHAT_EVENT_CHANNEL, CHAT_SEND_MESSAGE_CHANNEL,
+  CHAT_CANCEL_REQUEST_CHANNEL, CHAT_CREATE_CONVERSATION_CHANNEL, CHAT_EVENT_CHANNEL, CHAT_LIST_CONVERSATIONS_CHANNEL, CHAT_LIST_MESSAGES_CHANNEL,
+  CHAT_OPEN_CONVERSATION_CHANNEL, CHAT_SEND_MESSAGE_CHANNEL,
   type ChatEventEnvelope,
 } from "../src/shared/ipc-contract.js";
 import { registerChatIpcHandlers, type ConversationRuntimeApi, type RuntimeMessageEvent, type RuntimeMessageResult } from "../src/main/chat-ipc.js";
@@ -35,7 +36,8 @@ function fakeRuntime(result: Promise<RuntimeMessageResult> = Promise.resolve({
 }
 function harness(runtime: ConversationRuntimeApi | null,
   diagnostic?: (event: string, details: Readonly<Record<string, string | number | boolean | null>>) => void,
-  voiceHooks?: Parameters<typeof registerChatIpcHandlers>[4]) {
+  voiceHooks?: Parameters<typeof registerChatIpcHandlers>[4],
+  conversationStore?: Parameters<typeof registerChatIpcHandlers>[5]) {
   const handlers = new Map<string, (event: never, payload?: unknown) => unknown>();
   const ipc = {
     handle: vi.fn((channel: string, listener: (event: never, payload?: unknown) => unknown) => handlers.set(channel, listener)),
@@ -44,7 +46,7 @@ function harness(runtime: ConversationRuntimeApi | null,
   const contents = { mainFrame: {}, send: vi.fn(), isDestroyed: vi.fn(() => false) };
   const window = { webContents: contents, isDestroyed: vi.fn(() => false) };
   const getWindow = () => window;
-  const service = registerChatIpcHandlers(getWindow as never, () => runtime, ipc as never, diagnostic, voiceHooks);
+  const service = registerChatIpcHandlers(getWindow as never, () => runtime, ipc as never, diagnostic, voiceHooks, conversationStore);
   const event = { sender: contents, senderFrame: contents.mainFrame } as never;
   const invoke = (channel: string, payload?: unknown, overrideEvent = event) => handlers.get(channel)!(overrideEvent, payload);
   return { handlers, ipc, contents, window, service, invoke, event };
@@ -87,6 +89,156 @@ describe("Main chat IPC to Conversation Runtime", () => {
     expect(runtime.sendMessage).toHaveBeenCalledWith(voiceRequest);
     await vi.waitFor(() => expect(h.contents.send).toHaveBeenLastCalledWith(CHAT_EVENT_CHANNEL,
       { conversationId, requestId: voiceRequest.requestId, status: "completed", response: "respuesta voz" }));
+  });
+
+  it("persists typed and PTT visible turns exactly once before exposing completion", async () => {
+    const calls: string[] = [];
+    const store = {
+      createConversation: vi.fn(async () => ({ conversationId })),
+      listConversations: vi.fn(async () => ({ conversations: [], nextCursor: null })),
+      getConversation: vi.fn(async () => ({ conversationId })),
+      appendMessage: vi.fn(async (_id: string, message: { role: string; content: string }) => { calls.push(`${message.role}:${message.content}`); }),
+      listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, incompleteTail: false })),
+    };
+    const { runtime, listeners } = fakeRuntime();
+    runtime.restoreConversation = vi.fn(() => true);
+    runtime.sendMessage = vi.fn(async (input) => {
+      calls.push(`runtime:${input.source}`);
+      const result = { conversationId: input.conversationId, requestId: input.requestId, status: "completed" as const,
+        text: `respuesta ${input.source}` };
+      for (const listener of listeners) listener(result);
+      return result;
+    });
+    const h = harness(runtime, undefined, undefined, store);
+    const created = await h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL) as { ok: true; conversationId: string };
+    expect(created).toEqual({ ok: true, conversationId });
+    expect(store.createConversation).toHaveBeenCalledOnce();
+    expect(runtime.restoreConversation).toHaveBeenCalledWith(conversationId, []);
+    for (const [requestId, source] of [[id("61"), "typed"], [id("62"), "voice"]] as const) {
+      await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, requestId, source });
+      await vi.waitFor(() => expect(h.contents.send.mock.calls.some(call => (call[1] as ChatEventEnvelope).requestId === requestId
+        && (call[1] as ChatEventEnvelope).status === "completed")).toBe(true));
+    }
+    expect(calls).toEqual([
+      "user:Hola", "runtime:typed", "assistant:respuesta typed",
+      "user:Hola", "runtime:voice", "assistant:respuesta voice",
+    ]);
+    expect(store.appendMessage).toHaveBeenCalledTimes(4);
+    h.service.dispose();
+  });
+
+  it("does not run Runtime or report completion when user persistence fails", async () => {
+    const store = { createConversation: vi.fn(async () => ({ conversationId })),
+      listConversations: vi.fn(async () => ({ conversations: [], nextCursor: null })),
+      getConversation: vi.fn(async () => ({ conversationId })),
+      appendMessage: vi.fn(async () => { throw new Error("storage failed"); }),
+      listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, incompleteTail: false })) };
+    const { runtime } = fakeRuntime();
+    runtime.restoreConversation = vi.fn(() => true);
+    const h = harness(runtime, undefined, undefined, store);
+    await h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+    await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, request);
+    await vi.waitFor(() => expect(h.contents.send).toHaveBeenLastCalledWith(CHAT_EVENT_CHANNEL,
+      expect.objectContaining({ conversationId, requestId: request.requestId, status: "error" })));
+    expect(runtime.sendMessage).not.toHaveBeenCalled();
+    h.service.dispose();
+  });
+
+  it("cancels a voice request while its user message is being persisted without starting Runtime", async () => {
+    const pendingWrite = deferred<void>();
+    const store = { createConversation: vi.fn(async () => ({ conversationId })),
+      listConversations: vi.fn(async () => ({ conversations: [], nextCursor: null })),
+      getConversation: vi.fn(async () => ({ conversationId })),
+      appendMessage: vi.fn(() => pendingWrite.promise),
+      listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, incompleteTail: false })) };
+    const { runtime } = fakeRuntime();
+    runtime.restoreConversation = vi.fn(() => true);
+    const h = harness(runtime, undefined, undefined, store);
+    await h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+    const voiceRequest = { ...request, requestId: id("63"), source: "voice" as const };
+    await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, voiceRequest);
+    expect(await h.invoke(CHAT_CANCEL_REQUEST_CHANNEL, { requestId: voiceRequest.requestId })).toMatchObject({ ok: true, accepted: true });
+    expect(runtime.cancelRequest).not.toHaveBeenCalled();
+    pendingWrite.resolve(undefined);
+    await vi.waitFor(() => expect(h.contents.send).toHaveBeenLastCalledWith(CHAT_EVENT_CHANNEL,
+      { conversationId, requestId: voiceRequest.requestId, status: "cancelled" }));
+    expect(runtime.sendMessage).not.toHaveBeenCalled();
+    h.service.dispose();
+  });
+
+  it("does not publish a final response if its assistant message cannot be persisted", async () => {
+    let appendCount = 0;
+    const store = { createConversation: vi.fn(async () => ({ conversationId })),
+      listConversations: vi.fn(async () => ({ conversations: [], nextCursor: null })),
+      getConversation: vi.fn(async () => ({ conversationId })),
+      appendMessage: vi.fn(async () => { if (++appendCount === 2) throw new Error("storage failed"); }),
+      listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, incompleteTail: false })) };
+    const { runtime, listeners } = fakeRuntime();
+    runtime.restoreConversation = vi.fn(() => true);
+    runtime.sendMessage = vi.fn(async (input) => {
+      const result = { conversationId: input.conversationId, requestId: input.requestId,
+        status: "completed" as const, text: "Respuesta no persistida" };
+      for (const listener of listeners) listener(result);
+      return result;
+    });
+    const h = harness(runtime, undefined, undefined, store);
+    await h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+    await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, request);
+    await vi.waitFor(() => expect(h.contents.send).toHaveBeenLastCalledWith(CHAT_EVENT_CHANNEL,
+      expect.objectContaining({ conversationId, requestId: request.requestId, status: "error" })));
+    expect(h.contents.send.mock.calls.some(call => (call[1] as ChatEventEnvelope).status === "completed")).toBe(false);
+    expect(store.appendMessage).toHaveBeenCalledTimes(2);
+    h.service.dispose();
+  });
+
+  it("opens only an explicitly requested saved UUID and restores visible context", async () => {
+    const savedMessages = [
+      { id: id("70"), conversationId, sequence: 1, version: 1, role: "user" as const,
+        content: "Estoy pensando en borrar mis copias.", createdAt: "2035-01-01T00:00:00.000Z", status: "complete" as const },
+      { id: id("71"), conversationId, sequence: 2, version: 1, role: "assistant" as const,
+        content: "Te recomiendo conservar una copia.", createdAt: "2035-01-01T00:00:01.000Z", status: "complete" as const },
+      { id: id("72"), conversationId, sequence: 3, version: 1, role: "assistant" as const,
+        content: "", createdAt: "2035-01-01T00:00:02.000Z", status: "interrupted" as const },
+    ];
+    const store = { createConversation: vi.fn(async () => ({ conversationId })),
+      listConversations: vi.fn(async () => ({ conversations: [], nextCursor: null })),
+      getConversation: vi.fn(async (requestedId: string) => requestedId === conversationId ? { conversationId } : null),
+      appendMessage: vi.fn(async () => undefined),
+      listMessages: vi.fn(async () => ({ messages: savedMessages, nextCursor: null, incompleteTail: false })) };
+    const { runtime } = fakeRuntime();
+    runtime.restoreConversation = vi.fn(() => true);
+    const h = harness(runtime, undefined, undefined, store);
+    expect([...h.handlers.keys()]).toEqual(expect.arrayContaining([CHAT_OPEN_CONVERSATION_CHANNEL, CHAT_LIST_MESSAGES_CHANNEL,
+      CHAT_LIST_CONVERSATIONS_CHANNEL]));
+    const response = await h.invoke(CHAT_OPEN_CONVERSATION_CHANNEL, { conversationId }) as { ok: boolean; messages: unknown[] };
+    expect(response).toMatchObject({ ok: true, conversationId, messages: [
+      { id: id("70"), role: "user", content: "Estoy pensando en borrar mis copias." },
+      { id: id("71"), role: "assistant", content: "Te recomiendo conservar una copia." },
+      { id: id("72"), role: "assistant", content: "", status: "interrupted" },
+    ] });
+    expect(runtime.restoreConversation).toHaveBeenCalledWith(conversationId, [
+      { role: "user", content: "Estoy pensando en borrar mis copias." },
+      { role: "assistant", content: "Te recomiendo conservar una copia." },
+    ]);
+    expect(store.createConversation).not.toHaveBeenCalled();
+    h.service.dispose();
+  });
+
+  it("lists only paged conversation metadata and does not open the most recent conversation automatically", async () => {
+    const summary = { conversationId, title: "Nueva conversación", createdAt: "2035-01-01T00:00:00.000Z",
+      updatedAt: "2035-01-01T00:00:00.000Z", messageCount: 0 };
+    const store = { createConversation: vi.fn(async () => ({ conversationId })),
+      listConversations: vi.fn(async () => ({ conversations: [summary], nextCursor: null })),
+      getConversation: vi.fn(async () => ({ conversationId })), appendMessage: vi.fn(async () => undefined),
+      listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, incompleteTail: false })) };
+    const { runtime } = fakeRuntime();
+    runtime.restoreConversation = vi.fn(() => true);
+    const h = harness(runtime, undefined, undefined, store);
+    const result = await h.invoke(CHAT_LIST_CONVERSATIONS_CHANNEL, { limit: 25 }) as { ok: boolean; conversations: unknown[] };
+    expect(result).toMatchObject({ ok: true, conversations: [summary], nextCursor: null });
+    expect(store.listConversations).toHaveBeenCalledWith({ limit: 25 });
+    expect(runtime.restoreConversation).not.toHaveBeenCalled();
+    h.service.dispose();
   });
 
   it("speaks only completed voice-origin responses and cancels speech when another chat interaction starts", async () => {

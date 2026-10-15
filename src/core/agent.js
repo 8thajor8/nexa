@@ -522,6 +522,7 @@ export async function createAgent({
     operationalDiagnostics = null,
     operationalMemoryMode = null,
     operationalMemoryStoreIdentity = 'unknown',
+    initialConversationHistory = [],
 } = {}) {
     if (typeof enableAutomaticMemoryAssessment !== 'boolean'
         || (automaticMemoryDetector !== null && typeof automaticMemoryDetector?.detect !== 'function')
@@ -558,6 +559,12 @@ export async function createAgent({
         || typeof organicEvidenceCapabilityFactory !== 'function')) {
         throw new Error('organic_memory_learning_requires_owner_authorized_writable_memory2');
     }
+    if (!Array.isArray(initialConversationHistory) || initialConversationHistory.length > 100
+        || initialConversationHistory.some(message => !message || typeof message !== 'object'
+            || !['user', 'assistant'].includes(message.role) || typeof message.content !== 'string'
+            || !message.content.trim() || message.content.length > 1_000_000
+            || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(message.content)))
+        throw new TypeError('conversation_history_invalid');
     let selectedBackend;
     const readOnlyMemory2 = memory2ReadOnlyReader !== null;
     if (memory2ReadOnlyAllowExternalTools && !readOnlyMemory2) {
@@ -634,7 +641,8 @@ export async function createAgent({
     let currentMessage = '', currentSource = 'untrusted', contextDigest = null;
     let memoryTopicRecordIds = new Set();
     let activeDiagnosticRequestId = null;
-    let recentUserTurns = [], currentRecentUserMessages = [];
+    let recentUserTurns = initialConversationHistory.filter(message => message.role === 'user')
+        .map(message => message.content.slice(0, 1000)).slice(-8), currentRecentUserMessages = [];
     let pendingAutomaticMemoryAssessment = null;
     let pendingConfirmedMemoryWrite = null;
     let automaticMemoryConsent = null, pendingConsentChallenge = null, pendingProposalConfirmation = null;
@@ -951,7 +959,7 @@ ${memoryToPrompt(memory)}
         return { success: true, outcome: 'evaluated', persistedCount, unchangedCount, rejectedCount };
     }
 
-    const conversation = [];
+    const conversation = initialConversationHistory.map(message => ({ role: message.role, content: message.content }));
 
     function getSystemDiagnostics() {
         const snapshot = operationalDiagnostics?.snapshot?.() ?? { runtime: null, operations: [], lastMemoryRetrieval: null };

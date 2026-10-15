@@ -17,6 +17,8 @@ type ChatApi = {
   isIsolated: boolean;
   chat: {
     createConversation(): Promise<unknown>;
+    openConversation(conversationId: string): Promise<unknown>;
+    listMessages(request: unknown): Promise<unknown>;
     sendMessage(request: unknown): Promise<unknown>;
     cancelRequest(requestId: string): Promise<unknown>;
     onEvent(listener: (event: unknown) => void): () => void;
@@ -62,13 +64,27 @@ describe("chat preload allowlist", () => {
   it("exposes only narrow chat operations and uses fixed correlated channels", async () => {
     const api = await loadPreload();
     expect(api.isIsolated).toBe(false);
-    expect(Object.keys(api.chat).sort()).toEqual(["cancelRequest", "createConversation", "onEvent", "sendMessage"]);
+    expect(Object.keys(api.chat).sort()).toEqual(["cancelRequest", "createConversation", "listConversations", "listMessages",
+      "onEvent", "openConversation", "sendMessage"]);
     expect(api).not.toHaveProperty("ipcRenderer");
     expect(api).not.toHaveProperty("invoke");
 
     mocks.invoke.mockResolvedValueOnce({ ok: true, conversationId });
     await expect(api.chat.createConversation()).resolves.toEqual({ ok: true, conversationId });
     expect(mocks.invoke).toHaveBeenLastCalledWith("chat:create-conversation");
+
+    const message = { id: "00000000-0000-4000-8000-000000000003", role: "user", content: "Hola",
+      createdAt: "2035-01-01T00:00:00.000Z", status: "complete" };
+    mocks.invoke.mockResolvedValueOnce({ ok: true, conversationId, messages: [message], nextCursor: null, incompleteTail: false });
+    await expect(api.chat.openConversation(conversationId)).resolves.toMatchObject({ ok: true, messages: [message] });
+    expect(mocks.invoke).toHaveBeenLastCalledWith("chat:open-conversation", { conversationId });
+    mocks.invoke.mockResolvedValueOnce({ ok: true, conversationId, messages: [message], nextCursor: null, incompleteTail: false });
+    await expect(api.chat.listMessages({ conversationId })).resolves.toMatchObject({ ok: true, messages: [message] });
+    expect(mocks.invoke).toHaveBeenLastCalledWith("chat:list-messages", { conversationId });
+    mocks.invoke.mockResolvedValueOnce({ ok: true, conversations: [{ conversationId, title: "Nueva conversación",
+      createdAt: "2035-01-01T00:00:00.000Z", updatedAt: "2035-01-01T00:00:00.000Z", messageCount: 1 }], nextCursor: null });
+    await expect(api.chat.listConversations({ limit: 10 })).resolves.toMatchObject({ ok: true, conversations: [expect.any(Object)] });
+    expect(mocks.invoke).toHaveBeenLastCalledWith("chat:list-conversations", { limit: 10 });
 
     mocks.invoke.mockResolvedValueOnce({ ok: true, accepted: true, conversationId, requestId });
     await expect(api.chat.sendMessage({ conversationId, requestId, text: "hola", source: "typed" }))
