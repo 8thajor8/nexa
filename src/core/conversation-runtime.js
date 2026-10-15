@@ -142,10 +142,13 @@ export function createConversationRuntime({
     maxRestoredHistoryCharacters,
     operationalDiagnostics = createOperationalDiagnostics({ memoryMode }),
     persistToolOutcome = null,
+    searchConversationHistory = null,
 } = {}) {
     if (typeof agentFactory !== 'function') throw new TypeError('agent_factory_invalid');
     if (persistToolOutcome !== null && typeof persistToolOutcome !== 'function')
         throw new TypeError('conversation_tool_persistence_invalid');
+    if (searchConversationHistory !== null && typeof searchConversationHistory !== 'function')
+        throw new TypeError('conversation_history_search_invalid');
     const contextPolicy = normalizeConversationContextPolicy(conversationContextPolicy ?? {
         maxMessages: maxRestoredHistoryMessages ?? DEFAULT_CONVERSATION_CONTEXT_POLICY.maxMessages,
         maxCharacters: maxRestoredHistoryCharacters ?? DEFAULT_CONVERSATION_CONTEXT_POLICY.maxCharacters,
@@ -229,7 +232,16 @@ export function createConversationRuntime({
         if (!conversation.agentPromise) {
             conversation.agentPromise = Promise.resolve().then(async () => {
                 const options = { ...agentOptions, conversationContextPolicy: contextPolicy,
-                    operationalDiagnostics, operationalMemoryMode: memoryMode };
+                    operationalDiagnostics, operationalMemoryMode: memoryMode,
+                    searchConversationHistory: searchConversationHistory ? ({ query, limit, signal } = {}) => {
+                        if (signal?.aborted) {
+                            const error = new Error('The request was cancelled.');
+                            error.name = 'AbortError';
+                            error.code = 'request_cancelled';
+                            throw error;
+                        }
+                        return searchConversationHistory(conversation.conversationId, { query, limit });
+                    } : null };
                 // A writable Memory2 repository owns an exclusive process lock. Keep
                 // one repository for this Runtime while retaining a separate agent
                 // and conversational history for every conversation.
@@ -372,7 +384,8 @@ export function createConversationRuntime({
     function createConversation() {
         if (closed) throw new Error('conversation_runtime_closed');
         const conversationId = randomUUID();
-        conversations.set(conversationId, { agent: null, agentPromise: null, initialConversationHistory: Object.freeze([]) });
+        conversations.set(conversationId, { conversationId, agent: null, agentPromise: null,
+            initialConversationHistory: Object.freeze([]) });
         return conversationId;
     }
 
@@ -382,7 +395,7 @@ export function createConversationRuntime({
             throw new TypeError('conversation_id_invalid');
         if (conversations.has(conversationId)) return false;
         if (activeRequests.size > 0) throw new Error('conversation_runtime_busy');
-        conversations.set(conversationId, { agent: null, agentPromise: null,
+        conversations.set(conversationId, { conversationId, agent: null, agentPromise: null,
             initialConversationHistory: restoredHistory(messages, toolRecords, conversationId, contextPolicy) });
         return true;
     }

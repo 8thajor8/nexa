@@ -278,6 +278,8 @@ function createDesktopConversationRuntime(memoryMode: "memory1" | "memory2-reado
   const runtime = createConversationRuntime({
     memoryMode,
     streamResponses: true,
+    searchConversationHistory: (conversationId: string, { query, limit }: { query: string; limit: number }) =>
+      conversationStore.searchMessages(conversationId, { query, limit }),
     persistToolOutcome: async ({ conversationId, turnId, toolName, callIdHash, status }: {
       conversationId: string; turnId: string; toolName: string; callIdHash: string;
       status: "succeeded" | "failed" | "unknown";
