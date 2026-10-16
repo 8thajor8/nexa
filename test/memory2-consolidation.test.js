@@ -16,7 +16,7 @@ function final(text = 'Respuesta sintética.') {
 
 function interpreted({ intent, sourceQuote, topic, newValue = '', oldValue = '', confidence = 'high' }) {
     return { status: 'completed', output: [{ type: 'function_call', name: 'interpret_memory_intent', call_id: 'memory-intent-test',
-        arguments: JSON.stringify({ intent, confidence, sourceQuote, topic: topic ?? (intent === 'update_preference'
+        arguments: JSON.stringify({ intent, confidence, sourceQuote, subjectReference: '', topic: topic ?? (intent === 'update_preference'
             || intent === 'update_editor_preference' || intent === 'correct_editor_preference' ? 'editor' : ''), newValue, oldValue }) }], output_text: '' };
 }
 

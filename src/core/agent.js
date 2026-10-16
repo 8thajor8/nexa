@@ -101,14 +101,15 @@ const MEMORY_INTENT_TOOL = Object.freeze({
             intent: { type: 'string', enum: ['remember', 'update_preference', 'update_editor_preference', 'correct_editor_preference', 'forget_editor_preference', 'permanent_delete_request', 'clarify', 'none'] },
             confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
             sourceQuote: { type: 'string' },
+            subjectReference: { type: 'string', description: 'For a subject-omitted relationship or predicate, return one person name explicitly present in prior user messages; otherwise empty. Never use assistant messages.' },
             topic: { type: 'string', description: 'For an update, the concise attribute or subject that identifies the same fact in current Memory2 records, such as “editor habitual” or “navegador”. Use the user’s words when present; do not name a product.' },
             newValue: { type: 'string', description: 'For an update, return only the new atomic preference value, copied from the user quote; do not return a sentence or explanation.' },
             oldValue: { type: 'string', description: 'For an update, return only the previous atomic preference value, copied from the user quote, or an empty string if absent.' },
-        }, required: ['intent', 'confidence', 'sourceQuote', 'topic', 'newValue', 'oldValue'] },
+        }, required: ['intent', 'confidence', 'sourceQuote', 'subjectReference', 'topic', 'newValue', 'oldValue'] },
 });
 
 const MEMORY_INTENT_POLICY = `\n\nINTERPRETACIÓN DE INTENCIÓN DE MEMORIA (solo esta solicitud):
- Clasifica una petición directa y clara de recordar un hecho o preferencia personal, o de actualizar, corregir u olvidar una preferencia de cualquier tema. Para remember, sourceQuote debe contener únicamente el hecho que se desea recordar, como subcadena literal exacta del mensaje actual; excluye saludos, la intención de recordar y cualquier instrucción como «acordate», «guardalo» o «tenelo presente». No resumas ni completes el hecho. Para update_preference, devuelve topic como el atributo o tema corto del recuerdo que cambia, y oldValue/newValue como valores atómicos citados por el usuario; si el tema o el valor anterior no están claros, elige clarify. No inventes el valor nuevo a partir del contexto. Usa contexto reciente solo para resolver referencias, nunca como evidencia para inventar hechos. Para olvidar, no selecciones identificadores ni valores; el Runtime resolverá el objetivo desde Memory2. Distingue olvido lógico de eliminación definitiva. Si hay duda, cita, intención tentativa o falta el hecho/valor nuevo, elige clarify o none. Esta herramienta solo comunica una interpretación; el Runtime valida la evidencia y siempre pide confirmación antes de persistir. Nunca digas que se guardó, corrigió o eliminó por haber llamado esta herramienta.`;
+ Clasifica una petición directa y clara de recordar un hecho o preferencia personal, o de actualizar, corregir u olvidar una preferencia de cualquier tema. Para remember, sourceQuote debe contener únicamente el hecho que se desea recordar, como subcadena literal exacta del mensaje actual o, solo cuando el mensaje actual pide explícitamente guardar una referencia como «eso», «lo anterior» o «tenelo en cuenta», de un mensaje anterior del usuario incluido en el contexto. En ese caso cita el antecedente textual del usuario, nunca una respuesta de Nexa, y elige clarify si hay más de un antecedente plausible o no hay uno claro. Excluye saludos, la intención de recordar y cualquier instrucción como «acordate», «guardalo» o «tenelo presente». Si el mensaje actual contiene una afirmación sin sujeto como «Es mi pareja» y un único sujeto personal está explícitamente identificado en mensajes anteriores del usuario, devuelve la cita literal incompleta en sourceQuote y ese nombre exacto en subjectReference; si hay más de una persona posible o ninguna, elige clarify. Nunca uses mensajes de Nexa como evidencia. No resumas ni inventes la cita; el Runtime completará únicamente el sujeto verificado. Para update_preference, devuelve topic como el atributo o tema corto del recuerdo que cambia, y oldValue/newValue como valores atómicos citados por el usuario; si el tema o el valor anterior no están claros, elige clarify. No inventes el valor nuevo a partir del contexto. Usa contexto reciente solo para resolver referencias, nunca como evidencia para inventar hechos. Para olvidar, no selecciones identificadores ni valores; el Runtime resolverá el objetivo desde Memory2. Distingue olvido lógico de eliminación definitiva. Si hay duda, cita, intención tentativa o falta el hecho/valor nuevo, elige clarify o none. Esta herramienta solo comunica una interpretación; el Runtime valida la evidencia; solo una orden explícita e inequívoca de persistencia autoriza omitir una segunda confirmación después de validar. Nunca digas que se guardó, corrigió o eliminó por haber llamado esta herramienta.`;
 
 const ORGANIC_MEMORY_TOOL = Object.freeze({ type: 'function', name: 'propose_organic_memory_facts', strict: true,
     description: 'Propose explicit current everyday facts stated by the owner in this turn. This tool does not authorize or perform persistence.',
@@ -285,6 +286,42 @@ function normalizedEvidence(value) {
 
 function normalizeMemoryIntentText(value) {
     return String(value ?? '').normalize('NFD').replace(/\p{M}/gu, '').toLocaleLowerCase('es');
+}
+
+const MEMORY_REFERENT_STOPWORDS = new Set(('quien quien es que cual mi mis el la los las un una en de del para por tambien hoy manana ayer nex a nexa spotify openai').split(/\s+/u));
+
+function verifiedUserPersonReferences(messages) {
+    const references = new Map();
+    const name = '[\\p{Lu}][\\p{L}\\p{M}-]{1,39}';
+    const add = value => {
+        const clean = value?.trim();
+        if (!clean || MEMORY_REFERENT_STOPWORDS.has(normalizeMemoryIntentText(clean))) return;
+        references.set(normalizeMemoryIntentText(clean), clean);
+    };
+    for (const item of messages) {
+        if (item?.role !== 'user' || typeof item.content !== 'string') continue;
+        const text = item.content;
+        for (const match of text.matchAll(new RegExp('(?:^|[.!?]\\s*)(' + name + ')\\s+(?:es|era|fue|sera|son|eran)\\b', 'gu'))) add(match[1]);
+        for (const match of text.matchAll(new RegExp('\\b(?:quien es|quién es|se llama|pareja de|amigo de|amiga de)\\s+(' + name + ')\\b', 'giu'))) add(match[1]);
+        for (const match of text.matchAll(new RegExp('\\b(' + name + ')\\s+(?:y|o)\\s+(' + name + ')\\b', 'gu'))) {
+            add(match[1]); add(match[2]);
+        }
+    }
+    return [...references.values()];
+}
+
+function normalizeSubjectOmittedClaim(quote, requestedSubject, priorUserMessages) {
+    const normalizedQuote = normalizeMemoryIntentText(quote).trim();
+    if (!/^(?:es|era|fue|sera|son|eran)\b/u.test(normalizedQuote))
+        return { status: 'complete', claim: quote };
+    const candidates = verifiedUserPersonReferences(priorUserMessages);
+    if (!candidates.length) return { status: 'missing' };
+    if (candidates.length !== 1) return { status: 'ambiguous' };
+    const subject = requestedSubject.trim();
+    if (!subject || normalizeMemoryIntentText(subject) !== normalizeMemoryIntentText(candidates[0]))
+        return { status: 'unverified' };
+    const claim = `${candidates[0]} ${quote.trim().replace(/^(\p{Lu})/u, letter => letter.toLocaleLowerCase('es'))}`;
+    return { status: 'resolved', claim, subject: candidates[0] };
 }
 function isMemoryHistoryQuestion(value) {
     const text = normalizeMemoryIntentText(value);
@@ -521,6 +558,20 @@ function findEvidenceSpan(text, candidate) {
         from = index + 1;
     }
     return null;
+}
+
+function isExplicitContextualMemoryReference(message) {
+    if (typeof message !== 'string') return false;
+    const text = message.normalize('NFD').replace(/\p{M}/gu, '').toLocaleLowerCase('es');
+    return /\b(?:guarda(?:lo|me)?|recorda(?:lo|me)?|acordate|tenelo en cuenta|tene en cuenta|tenerlo en cuenta|tenelo presente|tene presente)\b/u.test(text);
+}
+
+function hasExplicitDurableMemoryAuthorization(message) {
+    if (typeof message !== 'string' || message.length > 16000 || hasMemoryIntentUncertainty(message)) return false;
+    const text = message.normalize('NFD').replace(/\p{M}/gu, '').toLocaleLowerCase('es').trim();
+    if (/^(?:nexa,\s*)?no\b/u.test(text)) return false;
+    if (/^(?:nexa,\s*)?(?:guarda que|save that)\s+\S[\s\S]{2,}$/u.test(text)) return true;
+    return /(?:^|[.!?,;]\s*)(?:nexa,\s*)?(?:(?:guardalo|guardala|guardame(?: esto| eso)?|recordalo|recordala|recordame(?: esto| eso)?|acordate(?: de)?(?: esto| eso)?|tene(?:lo|la)? presente|tenelo en cuenta|recorda esto|recorda eso|guarda esto|guarda eso|save this|remember this)\s+(?:de forma permanente|permanentemente|para siempre))[.!?]*$/u.test(text);
 }
 
 function locateSafeMemoryReplacement(text, previousValue, nextValue) {
@@ -904,7 +955,7 @@ export async function createAgent({
 
     function getInstructions() {
         if (memory2 || readOnlyMemory2) return NEXA_INSTRUCTIONS + CONVERSATION_REFERENCE_POLICY + MEMORY_CONTEXT_POLICY + MEMORY_SOURCE_SELECTION_POLICY
-            + (enableConfirmedMemoryWrites ? `\n\nMEMORY2 — ESCRITURA CON CONFIRMACIÓN\nLas solicitudes directas de guardar o actualizar se interpretan en Runtime, que prepara una propuesta y pide confirmación antes de persistir. No afirmes que falta una herramienta de guardado ni que algo quedó guardado si no recibiste esa confirmación del sistema. Si la intención o el dato no se pueden validar, pide una aclaración concreta y no propongas una fórmula fija.` : '')
+            + (enableConfirmedMemoryWrites ? `\n\nMEMORY2 — ESCRITURA AUTORIZADA\nLas solicitudes explícitas e inequívocas de persistencia pueden autorizar el guardado directo únicamente después de que Runtime resuelva una evidencia única del usuario y Memory2 la valide. Las solicitudes menos claras preparan una propuesta y requieren confirmación antes de persistir. No afirmes que algo quedó guardado sin éxito real del servicio. Si la intención o el dato no se pueden validar, pide una aclaración concreta.` : '')
             + (enableSyntheticOrganicLearning ? ORGANIC_MEMORY_POLICY
                 : enableOrganicMemoryLearning ? PERSONAL_ORGANIC_MEMORY_POLICY : '');
         return `
@@ -919,11 +970,11 @@ ${memoryToPrompt(memory)}
         const rejected = validationCategory => ({ outcome: 'failed', semanticOutcome: 'structured_intent',
             validation: 'rejected', validationCategory, errorCode: 'memory_intent_validation_failed' });
         let response;
-        const recentTurns = conversation.filter(item => (item?.role === 'user' || item?.role === 'assistant')
+        const priorUserMessages = conversation.filter(item => item?.role === 'user'
             && typeof item.content === 'string').slice(-6);
         try {
             response = await ask({ instructions: getInstructions() + MEMORY_INTENT_POLICY,
-                input: [...recentTurns, { role: 'user', content: userMessage }], tools: [MEMORY_INTENT_TOOL], toolChoice: 'required',
+                input: [...priorUserMessages, { role: 'user', content: userMessage }], tools: [MEMORY_INTENT_TOOL], toolChoice: 'required',
                 ...(signal ? { signal } : {}) });
         } catch (error) {
             throwIfAborted(signal);
@@ -940,12 +991,12 @@ ${memoryToPrompt(memory)}
         catch { return { outcome: 'failed', semanticOutcome: 'failed', validation: 'not_run',
             validationCategory: 'interpreter_error', errorCode: 'memory_intent_interpretation_failed' }; }
         if (!args || typeof args !== 'object' || Array.isArray(args)) return rejected('invalid_structure');
-        if (['intent', 'confidence', 'sourceQuote', 'newValue', 'oldValue'].some(key => !Object.hasOwn(args, key)))
+        if (['intent', 'confidence', 'sourceQuote', 'subjectReference', 'newValue', 'oldValue'].some(key => !Object.hasOwn(args, key)))
             return rejected('required_field_missing');
         if (!['remember', 'update_preference', 'update_editor_preference', 'correct_editor_preference', 'forget_editor_preference',
             'permanent_delete_request', 'clarify', 'none'].includes(args.intent)
             || !['high', 'medium', 'low'].includes(args.confidence)
-            || typeof args.sourceQuote !== 'string' || typeof args.topic !== 'string'
+            || typeof args.sourceQuote !== 'string' || typeof args.subjectReference !== 'string' || typeof args.topic !== 'string'
             || typeof args.newValue !== 'string' || typeof args.oldValue !== 'string')
             return rejected('invalid_structure');
         if (args.intent === 'none') return { outcome: 'no_intent', semanticOutcome: 'no_intent', validation: 'not_run' };
@@ -954,12 +1005,33 @@ ${memoryToPrompt(memory)}
                 validationCategory: 'ambiguous_intent', errorCode: 'memory_intent_ambiguous' };
         const quoteText = args.sourceQuote.trim();
         if (!quoteText || quoteText.length > 1000 || /[\p{Cc}\p{Cf}]/u.test(quoteText)) return rejected('invalid_structure');
-        const quote = findEvidenceSpan(userMessage, quoteText);
-        if (!quote) return rejected('source_quote_not_validated');
+        let quote = findEvidenceSpan(userMessage, quoteText);
+        let evidenceSource = 'current_user_message';
+        if (!quote) {
+            if (args.intent !== 'remember' || !isExplicitContextualMemoryReference(userMessage))
+                return rejected('source_quote_not_validated');
+            const matches = priorUserMessages.map(item => findEvidenceSpan(item.content, quoteText))
+                .filter(Boolean);
+            if (matches.length > 1) return { outcome: 'clarify', semanticOutcome: 'clarification',
+                validation: 'not_run', validationCategory: 'context_reference_ambiguous',
+                errorCode: 'memory_intent_ambiguous' };
+            if (matches.length === 0) return rejected('source_quote_not_validated');
+            quote = matches[0];
+            evidenceSource = 'prior_user_message';
+            if (hasMemoryIntentUncertainty(quote)) return { outcome: 'clarify', semanticOutcome: 'clarification',
+                validation: 'not_run', validationCategory: 'context_source_uncertain',
+                errorCode: 'memory_intent_ambiguous' };
+        }
         if (args.intent === 'remember') {
             if (hasExplicitMemoryWriteIntent(quote)) return rejected('source_quote_contains_instruction');
-            const parsed = parseMemoryCommand(`Recordá que ${quote}`);
+            const normalized = normalizeSubjectOmittedClaim(quote, args.subjectReference, priorUserMessages);
+            if (normalized.status === 'missing' || normalized.status === 'ambiguous' || normalized.status === 'unverified')
+                return { outcome: 'clarify', semanticOutcome: 'clarification', validation: 'not_run',
+                    validationCategory: normalized.status === 'ambiguous' ? 'referent_ambiguous' : 'referent_unresolved',
+                    errorCode: 'memory_intent_ambiguous' };
+            const parsed = parseMemoryCommand(`Recordá que ${normalized.claim}`);
             return parsed?.operation === 'remember' ? { outcome: 'accepted', command: parsed, intent: args.intent,
+                sourceQuote: quote, normalizedClaim: normalized.claim, evidenceSource,
                 semanticOutcome: 'structured_intent', validation: 'accepted' }
                 : rejected('operation_incompatible');
         }
@@ -1336,7 +1408,8 @@ ${memoryToPrompt(memory)}
             serializedCharacters: 0, callIds: new Set() };
         streamedTurnText = false;
         const semanticDiagnostics = { semanticInterpreterAvailable: enableConfirmedMemoryWrites && selectedBackend.backend === 'memory2',
-            semanticInterpreterInvoked: false, semanticInterpretation: 'not_invoked', runtimeValidation: 'not_run' };
+            semanticInterpreterInvoked: false, semanticInterpretation: 'not_invoked', runtimeValidation: 'not_run',
+            evidenceSource: 'not_used' };
         const recordMemoryChange = event => operationalDiagnostics?.recordMemoryChange?.({
             ...semanticDiagnostics, ...event });
         const cancelPreparedMemoryOperation = pending => pending?.operation === 'update'
@@ -1372,7 +1445,8 @@ ${memoryToPrompt(memory)}
                 recordMemoryChange({ requestId: activeDiagnosticRequestId,
                     operation: pending.operation, candidateState: ['update', 'forget'].includes(pending.operation) ? 'found' : 'not_applicable',
                     intentDetected: true, proposalGenerated: true, confirmationRequested: true,
-                    interpretationMechanism: pending.interpretationMechanism ?? 'unknown', intentAccepted: true,
+                    interpretationMechanism: pending.interpretationMechanism ?? 'unknown',
+                    evidenceSource: pending.evidenceSource ?? 'not_recorded', intentAccepted: true,
                     clarificationRequested: false,
                     confirmation: 'expired', persisted: 'no', result: 'not_changed' });
                 if (affirmative) return pending.operation === 'forget'
@@ -1387,7 +1461,8 @@ ${memoryToPrompt(memory)}
                 recordMemoryChange({ requestId: activeDiagnosticRequestId,
                     operation: pending.operation, candidateState: ['update', 'forget'].includes(pending.operation) ? 'found' : 'not_applicable',
                     intentDetected: true, proposalGenerated: true, confirmationRequested: true,
-                    interpretationMechanism: pending.interpretationMechanism ?? 'unknown', intentAccepted: true,
+                    interpretationMechanism: pending.interpretationMechanism ?? 'unknown',
+                    evidenceSource: pending.evidenceSource ?? 'not_recorded', intentAccepted: true,
                     clarificationRequested: false,
                     confirmation: result.success ? 'confirmed' : 'failed',
                     persisted: result.success && result.outcome !== 'equivalent' ? 'yes' : result.success ? 'no' : 'unknown',
@@ -1508,9 +1583,10 @@ ${memoryToPrompt(memory)}
             return answer;
         }
         if (enableConfirmedMemoryWrites && isTrustedDirectInput && source !== 'untrusted'
-            && !memoryCommand && !parseMemoryConfirmation(userMessage)
+            && !memoryCommand && (!pendingConfirmedMemoryWrite || !parseMemoryConfirmation(userMessage))
             && (hasExplicitMemoryWriteIntent(userMessage) || hasMemoryTransitionIntent(userMessage)
-                || hasEditorCorrectionSignal(userMessage) || hasEditorForgetSignal(userMessage))) {
+                || hasEditorCorrectionSignal(userMessage) || hasEditorForgetSignal(userMessage)
+                || isExplicitContextualMemoryReference(userMessage))) {
             if (hasMemoryIntentUncertainty(userMessage)) {
                 recordMemoryChange({ requestId: activeDiagnosticRequestId,
                     operation: 'remember', intentDetected: true, proposalGenerated: false,
@@ -1523,6 +1599,7 @@ ${memoryToPrompt(memory)}
             const interpreted = await interpretMemoryIntent(userMessage, signal);
             semanticDiagnostics.semanticInterpretation = interpreted.semanticOutcome ?? 'failed';
             semanticDiagnostics.runtimeValidation = interpreted.validation ?? 'not_run';
+            semanticDiagnostics.evidenceSource = interpreted.evidenceSource ?? 'not_verified';
             if (interpreted.outcome === 'accepted') {
                 memoryCommand = interpreted.command;
                 interpretationMechanism = 'semantic';
@@ -1543,7 +1620,11 @@ ${memoryToPrompt(memory)}
                 return interpreted.outcome === 'clarify'
                     ? interpreted.validationCategory === 'correction_value_missing'
                         ? 'Puedo corregir la preferencia, pero necesito que me indiques cuál es el valor correcto. No cambié ningún recuerdo.'
-                        : 'La intención o el dato todavía no están claros. ¿Qué querés que recuerde exactamente? No preparé ni guardé nada.'
+                        : interpreted.validationCategory === 'referent_ambiguous'
+                            ? 'Hay más de una persona posible. ¿De quién querés que recuerde esa relación? No guardé nada.'
+                            : interpreted.validationCategory === 'referent_unresolved'
+                                ? '¿A quién te referís? No guardé nada.'
+                                : 'La intención o el dato todavía no están claros. ¿Qué querés que recuerde exactamente? No preparé ni guardé nada.'
                     : interpreted.outcome === 'no_intent'
                         ? 'No detecté una solicitud clara para guardar o actualizar memoria. No preparé ni guardé nada.'
                         : 'No pude validar qué querés recordar. No preparé ni guardé nada.';
@@ -1682,6 +1763,8 @@ ${memoryToPrompt(memory)}
             return memoryUpdateConfirmation({ oldValue: confirmationOldValue, newValue: memoryCommand.newValue });
         }
         if (memoryCommand?.operation === 'remember') {
+            const directPersistenceAuthorized = isTrustedDirectInput && source !== 'untrusted'
+                && hasExplicitDurableMemoryAuthorization(userMessage);
             const prepared = memory2.prepareConfirmedRemember(memoryCommand.request);
             if (!prepared.success) {
                 recordMemoryChange({ requestId: activeDiagnosticRequestId, operation: 'remember',
@@ -1690,8 +1773,30 @@ ${memoryToPrompt(memory)}
                     confirmation: 'failed', persisted: 'no', result: 'failed', errorCode: 'memory_proposal_failed' });
                 return `No pude preparar ese recuerdo. ${prepared.error?.message ?? 'No se guardó nada.'}`;
             }
+            if (directPersistenceAuthorized) {
+                let result;
+                try { result = await memory2.confirmPreparedRemember(prepared.proposalId); }
+                catch { result = { success: false }; }
+                recordMemoryChange({ requestId: activeDiagnosticRequestId, operation: 'remember',
+                    candidateState: 'not_applicable', intentDetected: true, proposalGenerated: true,
+                    confirmationRequested: false, confirmation: 'not_required', persisted: result.success
+                        ? result.outcome === 'equivalent' ? 'no' : 'yes' : 'unknown',
+                    interpretationMechanism, evidenceSource: semanticDiagnostics.evidenceSource,
+                    intentAccepted: true, clarificationRequested: false,
+                    errorCode: result.success ? null : 'memory_persist_failed',
+                    result: result.success ? result.outcome === 'equivalent' ? 'not_changed' : 'saved' : 'failed' });
+                if (!result.success) return `No pude guardar el recuerdo. ${result.error?.message ?? 'La operación no se completó.'}`;
+                contextProvider?.invalidate?.();
+                conversation.length = 0;
+                contextDigest = null;
+                recentUserTurns = [];
+                currentRecentUserMessages = [];
+                memoryTopicRecordIds.clear();
+                return result.outcome === 'equivalent' ? 'Ese recuerdo ya estaba guardado.' : 'Listo, guardé el recuerdo.';
+            }
             pendingConfirmedMemoryWrite = { operation: 'remember', proposalId: prepared.proposalId,
-                expiresAt: Date.now() + 120_000, interpretationMechanism };
+                expiresAt: Date.now() + 120_000, interpretationMechanism,
+                evidenceSource: semanticDiagnostics.evidenceSource };
             recordMemoryChange({ requestId: activeDiagnosticRequestId, operation: 'remember',
                 candidateState: 'not_applicable', intentDetected: true, proposalGenerated: true,
                 confirmationRequested: true, confirmation: 'pending', persisted: 'no', result: 'unknown',

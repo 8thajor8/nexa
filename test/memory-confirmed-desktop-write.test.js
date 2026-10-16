@@ -4,6 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createConversationRuntime } from '../src/core/conversation-runtime.js';
+import { createRuntimeAgent } from '../src/core/runtime-agent.js';
+import { applyChanges, contentDigest, immutableSnapshot } from '../src/memory/repository.js';
 import { initializeEmptyMemoryStore } from '../src/memory/backend.js';
 import { parseMemoryConfirmation } from '../src/memory/commands.js';
 
@@ -15,9 +17,9 @@ function final(text = 'Respuesta sintética.') {
         content: [{ type: 'output_text', text }] }], output_text: text };
 }
 
-function semanticIntent({ intent = 'remember', confidence = 'high', sourceQuote, topic, newValue = '', oldValue = '' } = {}) {
+function semanticIntent({ intent = 'remember', confidence = 'high', sourceQuote, subjectReference = '', topic, newValue = '', oldValue = '' } = {}) {
     return { status: 'completed', output: [{ type: 'function_call', name: 'interpret_memory_intent', call_id: 'memory-intent-test',
-        arguments: JSON.stringify({ intent, confidence, sourceQuote, topic: topic ?? (intent === 'update_preference'
+        arguments: JSON.stringify({ intent, confidence, sourceQuote, subjectReference, topic: topic ?? (intent === 'update_preference'
             || intent === 'update_editor_preference' || intent === 'correct_editor_preference' ? 'editor' : ''), newValue, oldValue }) }], output_text: '' };
 }
 
@@ -42,9 +44,31 @@ async function send(runtime, conversationId, requestId, text) {
     return result.text;
 }
 
-function createWritableRuntime(storePath, ask = async () => final()) {
-    return createConversationRuntime({ memoryMode: 'memory2-confirmed-write', storePath,
-        agentOptions: { ...options(ask), allowConfirmedMemoryWrites: true } });
+function createWritableRuntime(storePath, ask = async () => final(), memory2Repository = null, diagnostic = () => {}) {
+    const agentOptions = { ...options(ask), allowConfirmedMemoryWrites: true };
+    if (!memory2Repository) return createConversationRuntime({ memoryMode: 'memory2-confirmed-write', storePath, agentOptions, diagnostic });
+    return createConversationRuntime({ memoryMode: 'memory2-confirmed-write', storePath, agentOptions, diagnostic,
+        agentFactory: runtimeOptions => createRuntimeAgent({ ...runtimeOptions,
+            agentOptions: { ...runtimeOptions.agentOptions, memory2Repository } }) });
+}
+
+async function createInMemoryMemoryRepository(storePath, { failCommit = false } = {}) {
+    let store = JSON.parse(await readFile(storePath, 'utf8'));
+    let revision = 0;
+    const digest = () => contentDigest(Buffer.from(JSON.stringify(store), 'utf8'));
+    return {
+        async open() { return immutableSnapshot(store, digest()); },
+        async readSnapshot() { return immutableSnapshot(store, digest()); },
+        async commit(request) {
+            if (failCommit) throw new Error('synthetic persistence failure');
+            store = applyChanges(store, request.changes, new Date().toISOString());
+            revision = store.revision;
+            return immutableSnapshot(store, digest());
+        },
+        async close() {},
+        getStore() { return structuredClone(store); },
+        getRevision() { return revision; },
+    };
 }
 
 function memoryContext(request) {
@@ -134,6 +158,258 @@ test('Desktop recognizes an explicit trailing “Recordalo” request and confir
         assert.equal(contents.assertions.length, 1);
         assert.equal(contents.assertions[0].object.value, 'mi editor de código favorito es Sublime Text');
         assert.equal(providerCalls, 1);
+        await runtime.close();
+    });
+});
+
+test('contextual remember quotes one recent user statement, previews it, and persists only after confirmation', async () => {
+    await withStore(async ({ storePath }) => {
+        let interpreterCalls = 0;
+        const runtime = createWritableRuntime(storePath, async request => {
+            if (!request.tools.some(tool => tool.name === 'interpret_memory_intent')) return final('Entendido.');
+            interpreterCalls++;
+            assert.ok(request.input.some(item => item.role === 'user' && item.content === 'Mi pareja se llama Alex.'));
+            return semanticIntent({ sourceQuote: 'Mi pareja se llama Alex.' });
+        });
+        const conversationId = runtime.createConversation();
+        await send(runtime, conversationId, 'context-save-source', 'Mi pareja se llama Alex.');
+        const preview = await send(runtime, conversationId, 'context-save-request', 'Guardalo.');
+        assert.match(preview, /¿Querés que recuerde esto/u);
+        assert.match(preview, /Mi pareja se llama Alex/u);
+        assert.equal(interpreterCalls, 1);
+        assert.equal(JSON.parse(await readFile(storePath, 'utf8')).revision, 0);
+        assert.equal(await send(runtime, conversationId, 'context-save-confirm', 'sí'), 'Listo, me acuerdo.');
+        const persisted = JSON.parse(await readFile(storePath, 'utf8'));
+        assert.equal(persisted.revision, 1);
+        assert.equal(persisted.assertions.length, 1);
+        assert.equal(persisted.assertions[0].object.value, 'Mi pareja se llama Alex.');
+        await runtime.close();
+    });
+});
+
+test('contextual save handles a persistent preference and a rejected preview without writing', async () => {
+    await withStore(async ({ storePath }) => {
+        const runtime = createWritableRuntime(storePath, async request => request.tools.some(tool => tool.name === 'interpret_memory_intent')
+            ? semanticIntent({ sourceQuote: 'Prefiero respuestas cortas.' }) : final('De acuerdo.'));
+        const conversationId = runtime.createConversation();
+        await send(runtime, conversationId, 'context-preference-source', 'Prefiero respuestas cortas.');
+        const preview = await send(runtime, conversationId, 'context-preference-save', 'Tenelo en cuenta para todo.');
+        assert.match(preview, /Prefiero respuestas cortas/u);
+        assert.match(await send(runtime, conversationId, 'context-preference-reject', 'Mejor no'), /no guardé/u);
+        const persisted = JSON.parse(await readFile(storePath, 'utf8'));
+        assert.equal(persisted.revision, 0);
+        assert.deepEqual(persisted.assertions, []);
+        await runtime.close();
+    });
+});
+
+test('three-turn contextual durable save uses only user evidence and persists once without a second confirmation', async () => {
+    await withStore(async ({ storePath }) => {
+        const source = 'En esta simulación, la pareja de Sam se llama Alex.';
+        const assistantParaphrase = 'Entiendo: Alex es la pareja de Sam en este escenario ficticio.';
+        let providerCalls = 0;
+        let interpretedQuote;
+        const runtime = createWritableRuntime(storePath, async request => {
+            providerCalls++;
+            if (!request.tools.some(tool => tool.name === 'interpret_memory_intent')) return final(assistantParaphrase);
+            const assistantTurn = request.input.find(item => item.role === 'assistant');
+            interpretedQuote = assistantTurn?.content ?? source;
+            return semanticIntent({ sourceQuote: interpretedQuote });
+        });
+        const conversationId = runtime.createConversation();
+        assert.equal(await send(runtime, conversationId, 'context-durable-source', source), assistantParaphrase);
+        const saved = await send(runtime, conversationId, 'context-durable-save', 'Guardalo permanentemente.');
+        assert.match(saved, /guardé el recuerdo/u);
+        assert.equal(interpretedQuote, source,
+            'if an assistant paraphrase is supplied, the simulated interpreter prefers it and the evidence validator would reject it');
+        let persisted = JSON.parse(await readFile(storePath, 'utf8'));
+        assert.equal(persisted.revision, 1);
+        assert.equal(persisted.assertions.length, 1);
+        assert.equal(persisted.assertions[0].object.value, source);
+
+        await send(runtime, conversationId, 'context-durable-duplicate', `Guardá que ${source}`);
+        persisted = JSON.parse(await readFile(storePath, 'utf8'));
+        assert.equal(persisted.revision, 1, 'repeating the explicit save must not create a duplicate');
+        assert.equal(persisted.assertions.length, 1);
+        assert.equal(providerCalls, 2, 'the contextual request is interpreted once; deterministic explicit saves need no model call');
+        await runtime.close();
+    });
+});
+
+test('“Recordá esto para siempre” directly authorizes one verified contextual save', async () => {
+    await withStore(async ({ storePath }) => {
+        const source = 'Para este escenario ficticio, el equipo Lumen se reúne los jueves.';
+        const runtime = createWritableRuntime(storePath, async request => request.tools.some(tool => tool.name === 'interpret_memory_intent')
+            ? semanticIntent({ sourceQuote: source }) : final('Anotado para esta prueba.'));
+        const conversationId = runtime.createConversation();
+        await send(runtime, conversationId, 'context-forever-source', source);
+        const saved = await send(runtime, conversationId, 'context-forever-save', 'Recordá esto para siempre.');
+        assert.match(saved, /guardé el recuerdo/u);
+        const persisted = JSON.parse(await readFile(storePath, 'utf8'));
+        assert.equal(persisted.revision, 1);
+        assert.equal(persisted.assertions.length, 1);
+        assert.equal(persisted.assertions[0].object.value, source);
+        await runtime.close();
+    });
+});
+
+test('contextual relationship save normalizes only a uniquely user-verified person and accepts authorization after a comma', async () => {
+    await withStore(async ({ storePath }) => {
+        const memoryRepository = await createInMemoryMemoryRepository(storePath);
+        const runtime = createWritableRuntime(storePath, async request => {
+            if (!request.tools.some(tool => tool.name === 'interpret_memory_intent')) return final('Respuesta sintética.');
+            const current = request.input.filter(item => item.role === 'user').at(-1)?.content;
+            return current.includes('Alex') ? semanticIntent({ sourceQuote: 'Alex es mi pareja' })
+                : semanticIntent({ sourceQuote: 'Es mi pareja', subjectReference: 'Alex' });
+        }, memoryRepository);
+        const conversationId = runtime.createConversation();
+        await send(runtime, conversationId, 'relation-ref-question', '¿Quién es Alex?');
+        await send(runtime, conversationId, 'relation-ref-assistant', 'Alex parece ser alguien importante.');
+        const saved = await send(runtime, conversationId, 'relation-ref-save', 'Es mi pareja, guardalo permanentemente.');
+        assert.match(saved, /guardé el recuerdo/u);
+        let data = memoryRepository.getStore();
+        assert.equal(data.assertions[0].object.value, 'Alex es mi pareja');
+        assert.equal(data.revision, 1);
+        await send(runtime, conversationId, 'relation-ref-duplicate', 'Alex es mi pareja, guardalo permanentemente.');
+        data = memoryRepository.getStore();
+        assert.equal(data.revision, 1, 'equivalent normalized assertions must not create duplicates');
+        assert.equal(data.assertions.length, 1);
+
+        const secondConversation = runtime.createConversation();
+        await send(runtime, secondConversation, 'relation-important-source', 'Alex es importante para mí.');
+        await send(runtime, secondConversation, 'relation-important-assistant', 'Entiendo que Alex es importante.');
+        const secondSave = await send(runtime, secondConversation, 'relation-important-save',
+            'Es mi pareja, guardalo permanentemente.');
+        assert.match(secondSave, /ya estaba guardado/u);
+        assert.equal(memoryRepository.getStore().assertions[0].object.value, 'Alex es mi pareja');
+        await runtime.close();
+    });
+});
+
+test('subject-omitted relationship asks for clarification without a user-verified unique referent', async () => {
+    await withStore(async ({ storePath }) => {
+        const memoryRepository = await createInMemoryMemoryRepository(storePath);
+        const runtime = createWritableRuntime(storePath, async request => {
+            if (!request.tools.some(tool => tool.name === 'interpret_memory_intent')) return final('Respuesta sintética.');
+            return semanticIntent({ sourceQuote: 'Es mi pareja', subjectReference: 'Alex' });
+        }, memoryRepository);
+        const noContext = runtime.createConversation();
+        const absent = await send(runtime, noContext, 'relation-no-subject', 'Es mi pareja, guardalo permanentemente.');
+        assert.match(absent, /(?:a|de) qui[eé]n|qu[eé].*referente|qu[eé].*dato|qu[eé] quer[eé]s que recuerde|aclar/iu);
+        assert.equal(memoryRepository.getRevision(), 0);
+
+        const ambiguous = runtime.createConversation();
+        await send(runtime, ambiguous, 'relation-two-people', 'Alex y Sam son importantes en este ejemplo.');
+        const clarify = await send(runtime, ambiguous, 'relation-two-save', 'Es mi pareja, guardalo permanentemente.');
+        assert.match(clarify, /(?:a|de) qui[eé]n|qu[eé].*referente|qu[eé].*dato|qu[eé] quer[eé]s que recuerde|aclar/iu);
+        assert.equal(memoryRepository.getRevision(), 0);
+
+        const assistantOnly = runtime.createConversation();
+        await send(runtime, assistantOnly, 'relation-assistant-only-user', '¿Quién es esa persona?');
+        await send(runtime, assistantOnly, 'relation-assistant-only-assistant', 'Alex es esa persona.');
+        const noEvidence = await send(runtime, assistantOnly, 'relation-assistant-only-save', 'Es mi pareja, guardalo permanentemente.');
+        assert.match(noEvidence, /(?:a|de) qui[eé]n|qu[eé].*referente|qu[eé].*dato|qu[eé] quer[eé]s que recuerde|aclar/iu);
+        assert.equal(memoryRepository.getRevision(), 0);
+        await runtime.close();
+    });
+});
+
+test('contextual durable relationship does not claim success when Memory2 persistence fails', async () => {
+    await withStore(async ({ storePath }) => {
+        const memoryRepository = await createInMemoryMemoryRepository(storePath, { failCommit: true });
+        const runtime = createWritableRuntime(storePath, async request => request.tools.some(tool => tool.name === 'interpret_memory_intent')
+            ? semanticIntent({ sourceQuote: 'Alex es mi pareja' }) : final(), memoryRepository);
+        const conversationId = runtime.createConversation();
+        const result = await send(runtime, conversationId, 'relation-persist-failure',
+            'Alex es mi pareja, guardalo permanentemente.');
+        assert.match(result, /No pude guardar el recuerdo/u);
+        assert.equal(memoryRepository.getRevision(), 0);
+        await runtime.close();
+    });
+});
+
+test('durable save still clarifies ambiguity and never claims success when persistence fails', async () => {
+    await withStore(async ({ storePath }) => {
+        let interpreterCalls = 0;
+        const runtime = createWritableRuntime(storePath, async request => {
+            if (!request.tools.some(tool => tool.name === 'interpret_memory_intent')) return final('Respuesta sintética.');
+            interpreterCalls++;
+            if (interpreterCalls === 1)
+                return semanticIntent({ intent: 'clarify', sourceQuote: '' });
+            return semanticIntent({ sourceQuote: 'En esta simulación, la estación favorita de Sol es otoño.' });
+        });
+        const conversationId = runtime.createConversation();
+        await send(runtime, conversationId, 'context-durable-ambiguous-a', 'En esta simulación, Sol prefiere respuestas breves.');
+        await send(runtime, conversationId, 'context-durable-ambiguous-b', 'En este escenario, el color favorito de Sol es azul.');
+        const ambiguous = await send(runtime, conversationId, 'context-durable-ambiguous-save', 'Guardalo permanentemente.');
+        assert.match(ambiguous, /todavía no están claros|aclar/u);
+        assert.equal(JSON.parse(await readFile(storePath, 'utf8')).revision, 0);
+
+        const source = 'En esta simulación, la estación favorita de Sol es otoño.';
+        await send(runtime, conversationId, 'context-durable-failure-source', source);
+        await writeFile(storePath, '{invalid synthetic fixture}', 'utf8');
+        const failed = await send(runtime, conversationId, 'context-durable-failure-save', 'Guardalo permanentemente.');
+        assert.match(failed, /No pude guardar el recuerdo/u);
+        assert.doesNotMatch(failed, /guardé el recuerdo|Listo, me acuerdo/u);
+        await runtime.close();
+    });
+});
+
+test('a casual mention of remembering does not authorize a durable write', async () => {
+    await withStore(async ({ storePath }) => {
+        let providerCalls = 0;
+        const runtime = createWritableRuntime(storePath, async request => {
+            providerCalls++;
+            if (request.tools.some(tool => tool.name === 'interpret_memory_intent'))
+                return semanticIntent({ sourceQuote: 'En esta conversación ficticia, Sol prefiere respuestas breves.' });
+            return final('Claro.');
+        });
+        const conversationId = runtime.createConversation();
+        await send(runtime, conversationId, 'context-casual-source', 'En este ejemplo ficticio, el proyecto se llama Lumen.');
+        await send(runtime, conversationId, 'context-casual-mention', 'Algún día estaría bueno que lo recuerdes.');
+        const emptyConversationId = runtime.createConversation();
+        const ungrounded = await send(runtime, emptyConversationId, 'context-durable-no-source', 'Guardalo permanentemente.');
+        assert.match(ungrounded, /No pude validar/u);
+        assert.equal(JSON.parse(await readFile(storePath, 'utf8')).revision, 0);
+        assert.equal(providerCalls, 3);
+        await runtime.close();
+    });
+});
+
+test('contextual save asks on ambiguous references, missing antecedents, assistant-only evidence, and tentative source facts', async () => {
+    await withStore(async ({ storePath }) => {
+        const runtime = createWritableRuntime(storePath, async request => {
+            const userMessages = request.input.filter(item => item.role === 'user').map(item => item.content);
+            const current = userMessages.at(-1);
+            if (current === 'Guardá eso.') return semanticIntent({ intent: 'clarify', confidence: 'high', sourceQuote: '' });
+            if (current === 'Guardalo.' && userMessages.filter(message => message === 'Prefiero respuestas cortas.').length > 1)
+                return semanticIntent({ sourceQuote: 'Prefiero respuestas cortas.' });
+            if (current === 'Guardalo.' && userMessages.includes('Quizás compre una moto.'))
+                return semanticIntent({ sourceQuote: 'Quizás compre una moto.' });
+            if (current === 'Guardalo.' && userMessages.includes('Pedime consejo.'))
+                return semanticIntent({ sourceQuote: 'Tu color favorito es azul.' });
+            if (current === 'Pedime consejo.') return final('Tu color favorito es azul.');
+            return semanticIntent({ sourceQuote: 'Nexa dijo que mi dato es azul.' });
+        });
+        const conversationId = runtime.createConversation();
+        await send(runtime, conversationId, 'context-ambiguous-a', 'Prefiero respuestas cortas.');
+        await send(runtime, conversationId, 'context-ambiguous-b', 'Mi color favorito es verde.');
+        assert.match(await send(runtime, conversationId, 'context-ambiguous-save', 'Guardá eso.'), /no preparé ni guardé/iu);
+        const missing = await send(runtime, conversationId, 'context-missing-save', 'Recordalo para siempre.');
+        assert.match(missing, /No pude validar/u);
+        await send(runtime, conversationId, 'context-assistant-only', 'Pedime consejo.');
+        assert.match(await send(runtime, conversationId, 'context-assistant-only-save', 'Guardalo.'), /No pude validar/u);
+        await send(runtime, conversationId, 'context-tentative-source', 'Quizás compre una moto.');
+        assert.match(await send(runtime, conversationId, 'context-tentative-save', 'Guardalo.'), /todavía no están claros/u);
+        const persisted = JSON.parse(await readFile(storePath, 'utf8'));
+        assert.equal(persisted.revision, 0);
+        assert.deepEqual(persisted.assertions, []);
+        const duplicateSourceConversation = runtime.createConversation();
+        await send(runtime, duplicateSourceConversation, 'context-duplicate-source-a', 'Prefiero respuestas cortas.');
+        await send(runtime, duplicateSourceConversation, 'context-duplicate-source-b', 'Prefiero respuestas cortas.');
+        assert.match(await send(runtime, duplicateSourceConversation, 'context-duplicate-source-save', 'Guardalo.'), /todavía no están claros/u);
+        assert.equal(JSON.parse(await readFile(storePath, 'utf8')).revision, 0,
+            'the same quote in multiple prior user messages is ambiguous and must not prepare a write');
         await runtime.close();
     });
 });
@@ -459,23 +735,23 @@ test('semantic update accepts accent and case normalization only when quote and 
 test('semantic validation diagnostics identify missing or unsupported evidence without retaining user text', async () => {
     await withStore(async ({ storePath }) => {
         const cases = [
-            { name: 'quote', args: { intent: 'remember', confidence: 'high', sourceQuote: 'recordá una clave inventada', topic: '', newValue: '', oldValue: '' },
+            { name: 'quote', args: { intent: 'remember', confidence: 'high', sourceQuote: 'recordá una clave inventada', subjectReference: '', topic: '', newValue: '', oldValue: '' },
                 category: 'source_quote_not_validated' },
             { name: 'instruction-in-quote', args: { intent: 'remember', confidence: 'high',
-                sourceQuote: 'mi editor habitual es Windsurf. Acordate de eso', topic: '', newValue: '', oldValue: '' },
+                sourceQuote: 'mi editor habitual es Windsurf. Acordate de eso', subjectReference: '', topic: '', newValue: '', oldValue: '' },
             category: 'source_quote_contains_instruction',
             request: 'Che Nexa, mi editor habitual es Windsurf. Acordate de eso.' },
             { name: 'new-value', args: { intent: 'update_editor_preference', confidence: 'high', topic: 'editor',
-                sourceQuote: 'ya no uso VS Code, ahora prefiero Cursor', newValue: 'Inventado', oldValue: 'VS Code' },
+                sourceQuote: 'ya no uso VS Code, ahora prefiero Cursor', subjectReference: '', newValue: 'Inventado', oldValue: 'VS Code' },
             category: 'new_value_not_validated' },
             { name: 'old-value', args: { intent: 'update_editor_preference', confidence: 'high', topic: 'editor',
-                sourceQuote: 'ya no uso VS Code, ahora prefiero Cursor', newValue: 'Cursor', oldValue: 'Inventado' },
+                sourceQuote: 'ya no uso VS Code, ahora prefiero Cursor', subjectReference: '', newValue: 'Cursor', oldValue: 'Inventado' },
             category: 'old_value_not_validated' },
             { name: 'new-value-missing', args: { intent: 'update_editor_preference', confidence: 'high', topic: 'editor',
-                sourceQuote: 'ya no uso VS Code, ahora prefiero Cursor', newValue: '', oldValue: 'VS Code' },
+                sourceQuote: 'ya no uso VS Code, ahora prefiero Cursor', subjectReference: '', newValue: '', oldValue: 'VS Code' },
             category: 'new_value_missing' },
             { name: 'new-value-malformed', args: { intent: 'update_editor_preference', confidence: 'high', topic: 'editor',
-                sourceQuote: 'ya no uso VS Code, ahora prefiero Cursor', newValue: `Cursor\u0001`, oldValue: 'VS Code' },
+                sourceQuote: 'ya no uso VS Code, ahora prefiero Cursor', subjectReference: '', newValue: `Cursor\u0001`, oldValue: 'VS Code' },
             category: 'new_value_malformed' },
             { name: 'required-field', args: { intent: 'remember', confidence: 'high', sourceQuote: 'mi dato es azul' },
                 category: 'required_field_missing' },
