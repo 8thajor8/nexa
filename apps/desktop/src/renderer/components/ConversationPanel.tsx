@@ -3,6 +3,7 @@ import type { ReactNode, UIEvent } from "react";
 import type { PttVoiceSnapshot } from "../voice/ptt-voice-controller";
 import type { VoiceFollowupStatus } from "../voice/voice-followup-controller";
 import type { AuthorizationProvider, ChatAuthorizationRequirement, ChatPresentationMetadata, SpotifyNowPlayingCard } from "../../shared/ipc-contract";
+import { canonicalSpotifyTrackUrl } from "../../shared/spotify-link-validation";
 import { HolographicFrame } from "./HolographicFrame";
 
 export interface VoiceTranscriptItem {
@@ -263,7 +264,8 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
               <NexaCoreMark className="message-marker__core-mark" />
             </span><strong>Nexa</strong><time>{new Date(entry.createdAt).toLocaleTimeString()}</time></div>
             <div className="assistant-message-bubble">
-              <AssistantResponseText text={entry.text} presentation={entry.presentation} streamed={entry.streamed === true} />
+              <AssistantResponseText text={entry.text} presentation={entry.presentation} streamed={entry.streamed === true}
+                onOpenSpotifyTrack={onOpenSpotifyTrack} />
               {authorizationRequirements[entry.requestId] && (() => {
               const requirement = authorizationRequirements[entry.requestId];
               const attempt = authorizationAttempts[entry.requestId];
@@ -365,8 +367,8 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
 
 type ProcessingPhase = "hidden" | "visible" | "fading";
 
-function AssistantResponseText({ text, presentation, streamed = false }: {
-  text: string; presentation?: ChatPresentationMetadata; streamed?: boolean;
+function AssistantResponseText({ text, presentation, streamed = false, onOpenSpotifyTrack }: {
+  text: string; presentation?: ChatPresentationMetadata; streamed?: boolean; onOpenSpotifyTrack?: (url: string) => void;
 }) {
   const [visibleCharacters, setVisibleCharacters] = useState(0);
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
@@ -412,7 +414,8 @@ function AssistantResponseText({ text, presentation, streamed = false }: {
   return (
     <div className="assistant-response-content">
       <div className="assistant-response-visual" aria-live={isTyping ? "off" : "polite"}>
-        <SafeMarkdown text={`${streamed ? text : text.slice(0, visibleCharacters)}${isTyping ? "▍" : ""}`} />
+        <SafeMarkdown text={`${streamed ? text : text.slice(0, visibleCharacters)}${isTyping ? "▍" : ""}`}
+          onOpenSpotifyTrack={onOpenSpotifyTrack} />
       </div>
       {presentation?.technicalDetail && <div className="technical-detail-action">
         <button type="button" onClick={() => { void copyTechnicalDetail(); }} aria-label="Copiar detalle técnico">
@@ -424,14 +427,14 @@ function AssistantResponseText({ text, presentation, streamed = false }: {
   );
 }
 
-function SafeMarkdown({ text }: { text: string }) {
+function SafeMarkdown({ text, onOpenSpotifyTrack }: { text: string; onOpenSpotifyTrack?: (url: string) => void }) {
   const lines = text.split(/\r?\n/u);
   const blocks: React.ReactNode[] = [];
   let paragraph: string[] = [];
   let list: { ordered: boolean; items: string[] } | null = null;
   let code: string[] | null = null;
-  const flushParagraph = () => { if (paragraph.length) { blocks.push(<p key={`p-${blocks.length}`}>{renderInline(paragraph.join(" "))}</p>); paragraph = []; } };
-  const flushList = () => { if (list) { const Tag = list.ordered ? "ol" : "ul"; blocks.push(<Tag key={`l-${blocks.length}`}>{list.items.map((item, index) => <li key={index}>{renderInline(item)}</li>)}</Tag>); list = null; } };
+  const flushParagraph = () => { if (paragraph.length) { blocks.push(<p key={`p-${blocks.length}`}>{renderInline(paragraph.join(" "), onOpenSpotifyTrack)}</p>); paragraph = []; } };
+  const flushList = () => { if (list) { const Tag = list.ordered ? "ol" : "ul"; blocks.push(<Tag key={`l-${blocks.length}`}>{list.items.map((item, index) => <li key={index}>{renderInline(item, onOpenSpotifyTrack)}</li>)}</Tag>); list = null; } };
   for (const line of lines) {
     if (line.trim().startsWith("```")) {
       flushParagraph(); flushList();
@@ -441,7 +444,7 @@ function SafeMarkdown({ text }: { text: string }) {
     }
     if (code) { code.push(line); continue; }
     const heading = /^(#{1,3})\s+(.+)$/u.exec(line.trim());
-    if (heading) { flushParagraph(); flushList(); const Tag = `h${heading[1].length}` as "h1" | "h2" | "h3"; blocks.push(<Tag key={`h-${blocks.length}`}>{renderInline(heading[2])}</Tag>); continue; }
+    if (heading) { flushParagraph(); flushList(); const Tag = `h${heading[1].length}` as "h1" | "h2" | "h3"; blocks.push(<Tag key={`h-${blocks.length}`}>{renderInline(heading[2], onOpenSpotifyTrack)}</Tag>); continue; }
     const bullet = /^\s*[-*+]\s+(.+)$/u.exec(line);
     const numbered = /^\s*\d+[.)]\s+(.+)$/u.exec(line);
     if (bullet || numbered) {
@@ -457,7 +460,7 @@ function SafeMarkdown({ text }: { text: string }) {
   return <>{blocks}</>;
 }
 
-function renderInline(source: string): ReactNode[] {
+function renderInline(source: string, onOpenSpotifyTrack?: (url: string) => void): ReactNode[] {
   const parts: React.ReactNode[] = [];
   const token = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)]+\))/gu;
   let last = 0; let match: RegExpExecArray | null;
@@ -468,9 +471,16 @@ function renderInline(source: string): ReactNode[] {
     else if (value.startsWith("`")) parts.push(<code key={match.index}>{value.slice(1, -1)}</code>);
     else {
       const link = /^\[([^\]]+)\]\(([^)]+)\)$/u.exec(value)!;
-      let safeUrl: string | null = null;
-      try { const parsed = new URL(link[2]); if (["https:", "http:"].includes(parsed.protocol) && !parsed.username && !parsed.password) safeUrl = parsed.href; } catch { /* Render unsafe links as text. */ }
-      parts.push(safeUrl ? <a key={match.index} href={safeUrl} target="_blank" rel="noopener noreferrer">{link[1]}</a> : link[1]);
+      const spotifyUrl = canonicalSpotifyTrackUrl(link[2]);
+      if (spotifyUrl) {
+        parts.push(onOpenSpotifyTrack
+          ? <a key={match.index} href={spotifyUrl} onClick={(event) => { event.preventDefault(); onOpenSpotifyTrack(spotifyUrl); }}>{link[1]}</a>
+          : link[1]);
+      } else {
+        let safeUrl: string | null = null;
+        try { const parsed = new URL(link[2]); if (["https:", "http:"].includes(parsed.protocol) && !parsed.username && !parsed.password) safeUrl = parsed.href; } catch { /* Render unsafe links as text. */ }
+        parts.push(safeUrl ? <a key={match.index} href={safeUrl} target="_blank" rel="noopener noreferrer">{link[1]}</a> : link[1]);
+      }
     }
     last = match.index + value.length;
   }

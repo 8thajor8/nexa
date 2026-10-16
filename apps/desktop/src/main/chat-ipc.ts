@@ -86,10 +86,22 @@ interface ActiveRequest {
   streamedTextHash?: Hash;
   streamedTextLength?: number;
   streamedTextBytes?: number;
-  titleUserMessage?: string;
   queued?: boolean;
 }
-export type ConversationTitleGenerator = (input: { userMessage: string; assistantMessage: string }) => Promise<string | null>;
+
+const AUTOMATIC_TITLE_MAX_LENGTH = 60;
+const NON_DESCRIPTIVE_OPENERS = /^(?:hola(?:[,!.?]?\s+nexa)?|buenas?(?:\s+(?:tardes|noches))?(?:[,!.?]?\s+nexa)?|buen\s+d[ií]a(?:[,!.?]?\s+nexa)?|hey|hi|gracias|ok(?:ay)?)[.!?,\s]*$/iu;
+
+export function deriveAutomaticConversationTitle(message: string): string | null {
+  if (typeof message !== "string") return null;
+  const title = message.replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ").replace(/\s+/gu, " ").trim();
+  if (!title || NON_DESCRIPTIVE_OPENERS.test(title) || title.replace(/[^\p{L}\p{N}]/gu, "").length < 5) return null;
+  if (title.length <= AUTOMATIC_TITLE_MAX_LENGTH) return title;
+  const clipped = title.slice(0, AUTOMATIC_TITLE_MAX_LENGTH + 1);
+  const boundary = clipped.lastIndexOf(" ");
+  return (boundary > 24 ? clipped.slice(0, boundary) : clipped.slice(0, AUTOMATIC_TITLE_MAX_LENGTH))
+    .replace(/[\s,;:—-]+$/u, "").trim() || null;
+}
 
 function failure(requestId: string, code: ChatIpcErrorCode, message: string, conversationId?: string) {
   return { ok: false as const, requestId, ...(conversationId ? { conversationId } : {}), error: { code, message } };
@@ -164,7 +176,6 @@ export class ChatIpcService {
     private readonly diagnostic: ChatDiagnostic = () => undefined,
     private readonly voiceHooks: ChatVoiceHooks = {},
     private readonly conversationStore: ConversationStoreApi | null = null,
-    private readonly titleGenerator?: ConversationTitleGenerator,
   ) {
     const runtime = getRuntime();
     if (runtime) this.unsubscribeRuntime = runtime.onEvent((event) => this.handleRuntimeEvent(event));
@@ -375,11 +386,9 @@ export class ChatIpcService {
             durationMs: performance.now() - persistenceStartedAt });
         }
         const persistenceStartedAt = performance.now();
-        const savedUserMessage = await this.conversationStore.appendMessage(request.conversationId,
-          { role: "user", content: request.text });
-        const savedRecord = typeof savedUserMessage === "object" && savedUserMessage !== null
-          ? savedUserMessage as { message?: { sequence?: unknown } } : null;
-        if (savedRecord?.message?.sequence === 1) active.titleUserMessage = request.text;
+        await this.conversationStore.appendMessage(request.conversationId, { role: "user", content: request.text });
+        const automaticTitle = deriveAutomaticConversationTitle(request.text);
+        if (automaticTitle) this.startAutomaticTitle(active, automaticTitle);
         active.persistencePending = false;
         this.trace("user_message_persisted", { requestId: request.requestId, source: request.source,
           durationMs: performance.now() - persistenceStartedAt });
@@ -556,7 +565,6 @@ export class ChatIpcService {
           { role: "assistant", content: result.text }).then(() => {
           this.trace("assistant_message_persisted", { requestId: active.request.requestId,
             durationMs: performance.now() - persistenceStartedAt });
-          if (active.titleUserMessage) this.startAutomaticTitle(active, result.text);
           this.dispatchCompletedResult(active, result);
         }).catch((error: unknown) => {
           this.trace("conversation_persist_failed", safePersistenceFailureDetails(error, result.text, active));
@@ -579,14 +587,11 @@ export class ChatIpcService {
     }
   }
 
-  private startAutomaticTitle(active: ActiveRequest, assistantMessage: string): void {
+  private startAutomaticTitle(active: ActiveRequest, title: string): void {
     const store = this.conversationStore;
-    const generateTitle = this.titleGenerator;
-    if (!store?.updateTitle || !generateTitle || !active.titleUserMessage) return;
+    if (!store?.updateTitle) return;
     const { conversationId, requestId } = active.request;
-    void generateTitle({ userMessage: active.titleUserMessage, assistantMessage }).then(async (title) => {
-      if (!title) return;
-      const updated = await store.updateTitle!(conversationId, title, "automatic");
+    void store.updateTitle(conversationId, title, "automatic").then((updated) => {
       if (!updated || active.window.isDestroyed?.()) return;
       const event: ChatEventEnvelope = { conversationId, requestId, status: "conversation_title_updated", title, source: "automatic" };
       if (!isChatEventEnvelope(event)) return;
@@ -594,7 +599,7 @@ export class ChatIpcService {
         active.window.webContents.send(CHAT_EVENT_CHANNEL, event);
         this.trace("conversation_title_updated", { requestId });
       } catch { this.trace("conversation_title_event_failed", { requestId }); }
-    }).catch(() => { this.trace("conversation_title_generation_failed", { requestId }); });
+    }).catch(() => { this.trace("conversation_title_update_failed", { requestId }); });
   }
 
   private dispatchCompletedResult(active: ActiveRequest, result: Extract<RuntimeMessageResult, { status: "completed" }>): void {
@@ -662,10 +667,9 @@ export function registerChatIpcHandlers(
   diagnostic: ChatDiagnostic = () => undefined,
   voiceHooks: ChatVoiceHooks = {},
   conversationStore: ConversationStoreApi | null = null,
-  titleGenerator?: ConversationTitleGenerator,
 ): ChatIpcService {
   removeChatIpcHandlers(ipc);
-  service = new ChatIpcService(getWindow, getRuntime, diagnostic, voiceHooks, conversationStore, titleGenerator);
+  service = new ChatIpcService(getWindow, getRuntime, diagnostic, voiceHooks, conversationStore);
   ipc.handle(CHAT_CREATE_CONVERSATION_CHANNEL, (event, payload) => service!.createConversation(event, payload));
   if (conversationStore) {
     ipc.handle(CHAT_OPEN_CONVERSATION_CHANNEL, (event, payload) => service!.openConversation(event, payload));

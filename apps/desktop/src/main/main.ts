@@ -2,8 +2,6 @@ import { app, BrowserWindow, ipcMain, Menu, protocol, screen, session, shell } f
 import { lstat, mkdir, readFile } from "node:fs/promises";
 // @ts-expect-error The repository's JavaScript Runtime intentionally has no generated declaration file.
 import { createConversationRuntime } from "../../../../src/core/conversation-runtime.js";
-// @ts-expect-error The repository's JavaScript OpenAI client intentionally has no generated declaration file.
-import { generateConversationTitle } from "../../../../src/brain/openai.js";
 // @ts-expect-error The local Conversation Store is JavaScript and deliberately has no generated declaration file.
 import { createConversationStore } from "../../../../src/core/conversation-store.js";
 // @ts-expect-error The shared Runtime diagnostics intentionally has no generated declaration file.
@@ -508,6 +506,10 @@ function writeSafeTrace(area: string, event: string, details: Record<string, unk
     "httpStatus", "outcome", "stage", "reconciliation", "bodyKind", "bodyLength", "contentType",
     "verification", "providerResponse", "providerStatus", "stateConfirmed", "providerAccepted",
     "beforePlaying", "afterPlaying", "trackChanged", "requestedTargetMatched", "previousTrackRestartObserved",
+    "deviceFingerprint", "deviceType", "deviceActive", "recovered", "deviceCount", "usableDeviceCount",
+    "activeDeviceCount", "candidateSummary", "selectionKind", "known", "playing", "requestedTrackFingerprint",
+    "requestedContextFingerprint", "targetDeviceFingerprint", "deviceIdProvided", "trackFingerprint",
+    "contextFingerprint", "playbackState", "deviceObservation",
     "requestHost", "requestPath", "responseHost", "responsePath", "redirected", "responseType", "method", "initializationMessage",
     "targetDisplayId", "actualDisplayId", "beforeX", "beforeY", "beforeWidth", "beforeHeight", "requestedX",
     "requestedY", "requestedWidth", "requestedHeight", "finalX", "finalY", "finalWidth", "finalHeight",
@@ -816,7 +818,7 @@ function installWebContentsGuards(): void {
         desktopOperationalDiagnostics.recordVoiceOperation({ requestId, stage: "runtime", state: "success", durationMs,
           ...desktopVoiceConfiguration, durations: { runtimeMs: durationMs } });
       },
-    }, conversationStore, generateConversationTitle);
+    }, conversationStore);
     if (startupPolicy.registerMemoryMode) registerMemoryModeIpcHandlers({
       getWindow: () => mainWindow,
       getRuntime: () => conversationRuntime,

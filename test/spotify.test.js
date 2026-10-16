@@ -18,7 +18,7 @@ import {
 import { searchSpotify } from '../src/integrations/spotify/search.js';
 import { executeTool, getToolsForModel, localToolRegistry } from '../src/tools/index.js';
 import { defaultPermissionPolicy, toolPermissions } from '../src/tools/permissions.js';
-import { createSpotifyNowPlayingCard, formatSpotifyToolResult, spotifyModelSafeOutput } from '../src/tools/spotify.js';
+import { createSpotifyNowPlayingCard, formatSpotifyToolResult, spotifyModelSafeOutput, spotifyPlayTool } from '../src/tools/spotify.js';
 
 function response(status, payload = null, headers = {}) {
     return {
@@ -74,8 +74,9 @@ test('spotify_search validates queries, limits results, normalizes items and lin
     assert.equal((await searchSpotify('  ', 'track')).error.code, 'spotify_query_invalid');
 });
 
-test('spotify_play searches first, plays a real exact URI and reports API confirmation', async () => {
+test('spotify_play confirms an exact URI only after the requested track is observed playing', async () => {
     const calls = [];
+    let statusReads = 0;
     const result = await playSpotify({
         query: 'Hypnotized de Purple Disco Machine',
         type: 'track',
@@ -83,19 +84,325 @@ test('spotify_play searches first, plays a real exact URI and reports API confir
             calls.push(args);
             if (args[0] === '/search') return { tracks: { items: [track] } };
             if (args[0] === '/me/player/devices') return { devices: [{ ...recoveredDevice, is_active: true }] };
-            if (args[0] === '/me/player/currently-playing') return { is_playing: false, item: { id: 'track-before' } };
+            if (args[0] === '/me/player/currently-playing') {
+                statusReads++;
+                return statusReads === 1
+                    ? { is_playing: false, item: { id: 'track-before', uri: 'spotify:track:old' } }
+                    : { is_playing: true, item: { id: 'track-after', uri: 'spotify:track:abc123' } };
+            }
             return null;
         } },
         recoveryAdapters: recoveryAdapters(),
     });
     assert.equal(result.success, true);
-    assert.equal(result.confirmed, true);
+    assert.equal(result.accepted, true);
+    assert.equal(result.stateConfirmed, true);
+    assert.equal(result.outcome, 'state_confirmed');
+    assert.equal(result.verification, 'target_transition_observed');
     assert.equal(result.selected.name, 'Hypnotized');
     assert.deepEqual(calls.filter(([endpoint]) => !endpoint.endsWith('/currently-playing')).map(([endpoint, options]) => [endpoint, options?.method, options?.body]), [
         ['/search', undefined, undefined],
         ['/me/player/devices', undefined, undefined],
         ['/me/player/play', 'PUT', { uris: ['spotify:track:abc123'] }],
     ]);
+});
+
+test('spotify_play falls back once to the provider album context and exact track offset after an unconfirmed URI play', async () => {
+    const albumTrack = { ...track, album: { ...track.album, uri: 'spotify:album:album123' } };
+    const requests = [];
+    const events = [];
+    let statusReads = 0;
+    const result = await playSpotify({ query: 'Hypnotized de Purple Disco Machine', diagnostic: (event, details) => events.push({ event, details }),
+        client: { request: async (endpoint, options = {}) => {
+            requests.push([endpoint, options]);
+            if (endpoint === '/search') return { tracks: { items: [albumTrack] } };
+            if (endpoint === '/me/player/devices') return { devices: [{ ...recoveredDevice, is_active: true }] };
+            if (endpoint === '/me/player/currently-playing') {
+                statusReads++;
+                if (statusReads <= 4) return { is_playing: false, item: { id: 'old', uri: 'spotify:track:old' }, context: { uri: 'spotify:album:oldalbum' } };
+                return { is_playing: true, item: { id: 'abc123', uri: albumTrack.uri }, context: { uri: 'spotify:album:album123' } };
+            }
+            return null;
+        } }, recoveryAdapters: recoveryAdapters() });
+    assert.equal(result.success, true);
+    assert.equal(result.fallbackUsed, true);
+    assert.equal(result.selected.name, albumTrack.name);
+    assert.match(formatSpotifyToolResult('spotify_play', result), /puede continuar con las pistas siguientes/u);
+    const writes = requests.filter(([endpoint]) => endpoint === '/me/player/play');
+    assert.equal(writes.length, 2);
+    assert.deepEqual(writes.map(([, options]) => options.body), [
+        { uris: [albumTrack.uri] },
+        { context_uri: 'spotify:album:album123', offset: { uri: albumTrack.uri } },
+    ]);
+    assert.ok(writes.every(([, options]) => options.query.device_id === recoveredDevice.id));
+    assert.equal(events.filter(({ event, details }) => event === 'spotify_track_fallback' && details.stage === 'context_offset_attempt').length, 1);
+    assert.equal(events.at(-1).details.outcome, 'state_confirmed');
+});
+
+test('spotify_play does not fall back when Spotify search provides no album context', async () => {
+    const requests = [];
+    let statusReads = 0;
+    const result = await playSpotify({ query: 'Hypnotized de Purple Disco Machine',
+        client: { request: async (endpoint, options = {}) => {
+            requests.push([endpoint, options]);
+            if (endpoint === '/search') return { tracks: { items: [track] } };
+            if (endpoint === '/me/player/devices') return { devices: [{ ...recoveredDevice, is_active: true }] };
+            if (endpoint === '/me/player/currently-playing') {
+                statusReads++;
+                return { is_playing: false, item: { id: 'old', uri: 'spotify:track:old' } };
+            }
+            return null;
+        } }, recoveryAdapters: recoveryAdapters() });
+    assert.equal(result.success, false);
+    assert.equal(result.fallbackAttempted, false);
+    assert.equal(result.accepted, true);
+    assert.equal(requests.filter(([endpoint]) => endpoint === '/me/player/play').length, 1);
+});
+
+test('spotify_play reports an unconfirmed fallback rejection without claiming playback', async () => {
+    const albumTrack = { ...track, album: { ...track.album, uri: 'spotify:album:album123' } };
+    const requests = [];
+    let statusReads = 0;
+    const result = await playSpotify({ query: 'Hypnotized de Purple Disco Machine',
+        client: { request: async (endpoint, options = {}) => {
+            requests.push([endpoint, options]);
+            if (endpoint === '/search') return { tracks: { items: [albumTrack] } };
+            if (endpoint === '/me/player/devices') return { devices: [{ ...recoveredDevice, is_active: true }] };
+            if (endpoint === '/me/player/currently-playing') {
+                statusReads++;
+                return { is_playing: false, item: { id: 'old', uri: 'spotify:track:old' } };
+            }
+            if (endpoint === '/me/player/play' && options.body?.offset) {
+                throw Object.assign(new Error('synthetic provider rejection'), { code: 'spotify_forbidden', status: 403 });
+            }
+            return null;
+        } }, recoveryAdapters: recoveryAdapters() });
+    assert.equal(result.success, false);
+    assert.equal(result.fallbackAttempted, true);
+    assert.equal(result.outcome, 'rejected');
+    assert.equal(result.error.code, 'spotify_forbidden');
+    assert.equal(requests.filter(([endpoint]) => endpoint === '/me/player/play').length, 2);
+});
+
+test('spotify_play keeps an accepted but unobserved album fallback explicitly unconfirmed', async () => {
+    const albumTrack = { ...track, album: { ...track.album, uri: 'spotify:album:album123' } };
+    let statusReads = 0;
+    const result = await playSpotify({ query: 'Hypnotized de Purple Disco Machine',
+        client: { request: async endpoint => {
+            if (endpoint === '/search') return { tracks: { items: [albumTrack] } };
+            if (endpoint === '/me/player/devices') return { devices: [{ ...recoveredDevice, is_active: true }] };
+            if (endpoint === '/me/player/currently-playing') {
+                statusReads++;
+                return { is_playing: false, item: { id: 'old', uri: 'spotify:track:old' }, context: { uri: 'spotify:album:oldalbum' } };
+            }
+            return null;
+        } }, recoveryAdapters: recoveryAdapters() });
+    assert.equal(result.success, false);
+    assert.equal(result.accepted, true);
+    assert.equal(result.fallbackAttempted, true);
+    assert.equal(result.outcome, 'provider_accepted_unconfirmed');
+    const text = formatSpotifyToolResult('spotify_play', result);
+    assert.match(text, /no pude confirmar la reproducción/u);
+    assert.doesNotMatch(text, /Spotify está reproduciendo/u);
+    assert.match(text, /podría continuar con las pistas siguientes/u);
+});
+
+test('Spotify playback diagnostics correlate target, chosen device, and observations without exposing raw identifiers', async () => {
+    const events = [];
+    let statusReads = 0;
+    await playSpotify({
+        query: 'Hypnotized Purple Disco Machine',
+        diagnostic: (event, details) => events.push({ event, details }),
+        requestId: 'synthetic-request',
+        client: { request: async (endpoint, options) => {
+            if (endpoint === '/search') return { tracks: { items: [track] } };
+            if (endpoint === '/me/player/devices') return { devices: [{
+                ...recoveredDevice, is_active: true,
+            }] };
+            if (endpoint === '/me/player/currently-playing') {
+                statusReads++;
+                const current = statusReads === 1
+                    ? { id: 'previous-track', uri: 'spotify:track:previous' }
+                    : { id: track.uri.split(':').at(-1), uri: track.uri };
+                return {
+                    is_playing: statusReads > 1,
+                    item: current,
+                    device: { ...recoveredDevice, is_active: true },
+                };
+            }
+            assert.equal(endpoint, '/me/player/play');
+            assert.deepEqual(options.query, { device_id: recoveredDevice.id });
+            assert.deepEqual(options.body, { uris: [track.uri] });
+            return null;
+        } },
+    });
+    const inventory = events.find(entry => entry.event === 'spotify_device_inventory');
+    const selected = events.find(entry => entry.event === 'spotify_play_device_selected');
+    const request = events.find(entry => entry.event === 'spotify_play_request');
+    const after = events.filter(entry => entry.event === 'spotify_playback_observation')
+        .find(entry => entry.details.phase === 'after_action');
+    assert.equal(inventory.details.deviceCount, 1);
+    assert.equal(inventory.details.activeDeviceCount, 1);
+    assert.equal(JSON.parse(inventory.details.candidateSummary)[0].fingerprint,
+        createHash('sha256').update(recoveredDevice.id).digest('hex').slice(0, 12));
+    assert.equal(selected.details.deviceFingerprint, createHash('sha256').update(recoveredDevice.id).digest('hex').slice(0, 12));
+    assert.equal(selected.details.deviceActive, true);
+    assert.equal(request.details.selectionKind, 'track');
+    assert.equal(request.details.deviceIdProvided, true);
+    assert.equal(request.details.requestedTrackFingerprint,
+        createHash('sha256').update(track.uri).digest('hex').slice(0, 12));
+    assert.equal(after.details.trackFingerprint, request.details.requestedTrackFingerprint);
+    assert.equal(after.details.deviceFingerprint, selected.details.deviceFingerprint);
+    const serialized = JSON.stringify(events);
+    for (const privateValue of [track.uri, recoveredDevice.id, recoveredDevice.name, 'spotify:track:previous']) {
+        assert.equal(serialized.includes(privateValue), false);
+    }
+});
+
+test('Spotify search removes duplicate provider URIs without reordering distinct results', async () => {
+    const result = await searchSpotify('Parliament', 'track', {
+        client: { request: async () => ({ tracks: { items: [track, { ...track }, { ...track, uri: 'spotify:track:other' }] } }) },
+    });
+    assert.equal(result.success, true);
+    assert.deepEqual(result.results.map(item => item.uri), ['spotify:track:abc123', 'spotify:track:other']);
+});
+
+test('spotify_play keeps exact matching strict and selects one ranked distinct result for open requests', async () => {
+    const nearDuplicate = { ...track, uri: 'spotify:track:duplicate', album: { name: 'Compilation' } };
+    const second = { ...track, name: 'Funk Avenue', uri: 'spotify:track:second', artists: [{ name: 'Synthetic Band' }] };
+    const calls = [];
+    let statusReads = 0;
+    const result = await playSpotify({ query: 'funk', type: 'track', selection: 'best_match', client: { request: async (endpoint, options) => {
+        calls.push([endpoint, options]);
+        if (endpoint === '/search') return { tracks: { items: [track, { ...track }, nearDuplicate, second] } };
+        if (endpoint === '/me/player/devices') return { devices: [{ ...recoveredDevice, is_active: true }] };
+        if (endpoint === '/me/player/currently-playing') {
+            statusReads++;
+            return statusReads === 1 ? { is_playing: false, item: { id: 'old', uri: 'spotify:track:old' } }
+                : { is_playing: true, item: { id: 'chosen', uri: 'spotify:track:abc123' } };
+        }
+        return null;
+    } } });
+    assert.equal(spotifyPlayTool.parameters.properties.selection.enum.includes('best_match'), true);
+    assert.ok(spotifyPlayTool.parameters.required.includes('selection'));
+    assert.equal(result.success, true);
+    assert.equal(result.selected.name, 'Hypnotized');
+    assert.equal(result.verification, 'target_transition_observed');
+    assert.deepEqual(calls.filter(([endpoint]) => endpoint === '/me/player/play').map(([, options]) => options.body), [
+        { uris: ['spotify:track:abc123'] },
+    ]);
+});
+
+test('spotify_play matches a spoken exact title and primary artist, ignoring irrelevant search-ranked tracks', async () => {
+    const exact = { ...track, name: 'Blinding Lights', artists: [{ name: 'The Weeknd' }], uri: 'spotify:track:blinding123' };
+    const unrelated = { ...track, name: 'Blinding Lights Remix', artists: [{ name: 'Other Artist' }], uri: 'spotify:track:wrong123' };
+    let statusReads = 0;
+    const result = await playSpotify({ query: 'Poné Blinding Lights de The Weeknd', client: { request: async endpoint => {
+        if (endpoint === '/search') return { tracks: { items: [unrelated, exact] } };
+        if (endpoint === '/me/player/devices') return { devices: [{ ...recoveredDevice, is_active: true }] };
+        if (endpoint === '/me/player/currently-playing') return ++statusReads === 1
+            ? { is_playing: false, item: { id: 'old', uri: 'spotify:track:old' } }
+            : { is_playing: true, item: { id: 'blinding123', uri: exact.uri } };
+        return null;
+    } }, recoveryAdapters: recoveryAdapters() });
+    assert.equal(result.success, true);
+    assert.equal(result.selected.name, 'Blinding Lights');
+    assert.deepEqual(result.selected.artists, ['The Weeknd']);
+});
+
+test('spotify_play collapses equivalent remaster entries and prefers the unqualified exact title', async () => {
+    const remaster = { ...track, name: 'Blinding Lights - 2019 Remaster', artists: [{ name: 'The Weeknd' }], uri: 'spotify:track:remaster123' };
+    const exact = { ...track, name: 'Blinding Lights', artists: [{ name: 'The Weeknd' }], uri: 'spotify:track:standard123' };
+    let write;
+    const result = await playSpotify({ query: 'Blinding Lights de The Weeknd', client: { request: async (endpoint, options) => {
+        if (endpoint === '/search') return { tracks: { items: [remaster, exact] } };
+        if (endpoint === '/me/player/devices') return { devices: [{ ...recoveredDevice, is_active: true }] };
+        if (endpoint === '/me/player/currently-playing') return { is_playing: true, item: { id: 'standard123', uri: exact.uri } };
+        if (endpoint === '/me/player/play') write = options.body;
+        return null;
+    } }, recoveryAdapters: recoveryAdapters() });
+    assert.equal(result.success, true);
+    assert.equal(result.selected.name, 'Blinding Lights');
+    assert.deepEqual(write, { uris: [exact.uri] });
+});
+
+test('spotify_play asks for clarification when the exact title has genuinely different primary artists', async () => {
+    const first = { ...track, name: 'Halo', artists: [{ name: 'Beyoncé' }], uri: 'spotify:track:halo1' };
+    const second = { ...track, name: 'Halo', artists: [{ name: 'Other Artist' }], uri: 'spotify:track:halo2' };
+    let writes = 0;
+    const result = await playSpotify({ query: 'Halo', client: { request: async endpoint => {
+        if (endpoint === '/search') return { tracks: { items: [first, second] } };
+        if (endpoint === '/me/player/play') writes++;
+        return null;
+    } } });
+    assert.equal(result.success, false);
+    assert.equal(result.error.code, 'spotify_ambiguous_result');
+    assert.equal(result.candidates.length, 2);
+    assert.equal(writes, 0);
+});
+
+test('spotify_play reproduces accepted track request followed by HTTP 200 with no current item', async () => {
+    let statusReads = 0;
+    let playRequest;
+    const diagnostics = [];
+    const requestedTrack = { ...track, name: 'Weightless', artists: [{ name: 'Marconi Union' }],
+        uri: 'spotify:track:weightless' };
+    const result = await playSpotify({
+        query: 'Weightless Marconi Union',
+        diagnostic: (event, details) => diagnostics.push({ event, details }),
+        client: { request: async (endpoint, options) => {
+            if (endpoint === '/search') return { tracks: { items: [requestedTrack] } };
+            if (endpoint === '/me/player/devices') return { devices: [{ ...recoveredDevice, is_active: true }] };
+            if (endpoint === '/me/player/currently-playing') {
+                statusReads++;
+                return { is_playing: false, item: null, device: null };
+            }
+            if (endpoint === '/me/player/play') {
+                playRequest = options;
+                return null; // The Web API's documented 204 response.
+            }
+            return null;
+        } },
+    });
+    assert.equal(result.success, false);
+    assert.equal(result.accepted, true);
+    assert.equal(result.stateConfirmed, false);
+    assert.equal(result.verification, 'target_not_observed');
+    assert.equal(playRequest.query.device_id, recoveredDevice.id);
+    assert.deepEqual(playRequest.body, { uris: [requestedTrack.uri] });
+    assert.equal(statusReads, 4);
+    const after = diagnostics.filter(entry => entry.event === 'spotify_playback_observation'
+        && entry.details.phase === 'after_action');
+    assert.equal(after.length, 3);
+    assert.ok(after.every(entry => entry.details.playbackState === 'no_current_item'
+        && entry.details.deviceActive === false && entry.details.deviceFingerprint === null));
+});
+
+test('spotify_play reports provider acceptance without claiming playback when the requested track is not observed', async () => {
+    let statusReads = 0;
+    let writes = 0;
+    const result = await playSpotify({ query: 'Hypnotized Purple Disco Machine', type: 'track', client: { request: async endpoint => {
+        if (endpoint === '/search') return { tracks: { items: [track] } };
+        if (endpoint === '/me/player/devices') return { devices: [{ ...recoveredDevice, is_active: true }] };
+        if (endpoint === '/me/player/currently-playing') {
+            statusReads++;
+            return { is_playing: false, item: { id: 'other', uri: 'spotify:track:other' } };
+        }
+        writes++;
+        return null;
+    } } });
+    assert.equal(result.success, false);
+    assert.equal(result.accepted, true);
+    assert.equal(result.confirmed, false);
+    assert.equal(result.stateConfirmed, false);
+    assert.equal(result.outcome, 'provider_accepted_unconfirmed');
+    assert.equal(result.error.code, 'spotify_playback_unconfirmed');
+    assert.equal(writes, 1);
+    assert.ok(statusReads >= 2);
+    const message = formatSpotifyToolResult('spotify_play', result);
+    assert.match(message, /aceptó la solicitud/u);
+    assert.match(message, /no pude confirmar la reproducción/u);
+    assert.doesNotMatch(message, /Spotify está reproduciendo/u);
 });
 
 test('spotify_play refuses ambiguous or absent matches without sending a playback request', async () => {
@@ -115,13 +422,22 @@ test('spotify_play refuses ambiguous or absent matches without sending a playbac
     assert.equal(noResults.error.code, 'spotify_no_results');
 });
 
-test('spotify_play with an empty query resumes without fabricating a URI', async () => {
+test('spotify_play resumes an existing paused Spotify session and confirms the resulting state', async () => {
     let call;
+    let statusReads = 0;
     const result = await playSpotify({ query: '', type: 'track', client: { request: async (...args) => {
         if (args[0] === '/me/player/devices') return { devices: [{ ...recoveredDevice, is_active: true }] };
+        if (args[0] === '/me/player/currently-playing') {
+            statusReads++;
+            return statusReads === 1
+                ? { is_playing: false, item: { id: 'existing', uri: 'spotify:track:existing' } }
+                : { is_playing: true, item: { id: 'existing', uri: 'spotify:track:existing' } };
+        }
         call = args;
     } }, recoveryAdapters: recoveryAdapters() });
     assert.equal(result.success, true);
+    assert.equal(result.stateConfirmed, true);
+    assert.equal(result.verification, 'target_transition_observed');
     assert.deepEqual(call, ['/me/player/play', { method: 'PUT', responseContract: 'no-content', query: { device_id: 'desktop-123' } }]);
 });
 
@@ -152,6 +468,7 @@ test('playback resolves a device before one play command rather than retrying a 
                 deviceChecks += 1;
                 return { devices: deviceChecks === 1 ? [] : [recoveredDevice] };
             }
+            if (endpoint === '/me/player/currently-playing') return { is_playing: true, item: { id: 'target', uri: 'spotify:track:abc123' } };
             return null;
         } },
         recoveryAdapters: recoveryAdapters({
@@ -363,8 +680,12 @@ test('Spotify accepts documented 204 playback responses and treats other 2xx wri
 test('Spotify playback enforces no-content writes and never logs unexpected response bodies', async () => {
     const successfulClient = new SpotifyClient({
         getAccessToken: async () => 'test-token',
-        fetchImpl: async input => new URL(input).pathname.endsWith('/devices')
-            ? response(200, { devices: [{ ...recoveredDevice, is_active: true }] }) : response(204),
+        fetchImpl: async input => {
+            const path = new URL(input).pathname;
+            if (path.endsWith('/devices')) return response(200, { devices: [{ ...recoveredDevice, is_active: true }] });
+            if (path.endsWith('/currently-playing')) return response(200, { is_playing: true, item: track });
+            return response(204);
+        },
     });
     for (const [tool, args] of [
         ['spotify_play', { query: '', type: 'track' }], ['spotify_pause', {}],
@@ -372,7 +693,7 @@ test('Spotify playback enforces no-content writes and never logs unexpected resp
     ]) {
         const result = await executeTool(tool, args, { client: successfulClient });
         assert.equal(result.success, true, tool);
-        assert.equal(result.outcome, 'provider_accepted', tool);
+        assert.equal(result.outcome, tool === 'spotify_play' ? 'state_confirmed' : 'provider_accepted', tool);
     }
 
     const events = [];
@@ -605,7 +926,7 @@ test('Spotify play of a selected track is state-confirmed when the observed trac
     assert.equal(result.verification, 'target_already_observed');
     assert.equal(result.verificationEvidence.requestedTargetMatched, true);
     assert.equal(statusReads, 2);
-    assert.equal(formatSpotifyToolResult('spotify_play', result), 'Spotify está reproduciendo');
+    assert.match(formatSpotifyToolResult('spotify_play', result), /Spotify está reproduciendo: \*\*Hypnotized\*\*/u);
 });
 
 test('Spotify reports observed playback without claiming causality when the before state is unknown', async () => {
@@ -706,24 +1027,41 @@ test('Spotify model output carries a safe state-confirmed message without assert
         postStateConfirmed: true, action: 'pause', confirmation: 'Spotify pausado' });
 });
 
+test('Spotify model output preserves acceptance separately from unconfirmed playback', () => {
+    assert.deepEqual(spotifyModelSafeOutput('spotify_play', { success: false, accepted: true,
+        stateConfirmed: false, outcome: 'provider_accepted_unconfirmed', error: { code: 'spotify_playback_unconfirmed' } }), {
+        success: false, accepted: true, stateConfirmed: false, outcome: 'provider_accepted_unconfirmed',
+        error: { code: 'spotify_playback_unconfirmed' },
+    });
+});
+
 test('Runtime dispatcher preserves accepted empty Spotify playback responses for every control', async () => {
     const calls = [];
+    let statusReads = 0;
     const client = { request: async (endpoint, options) => { calls.push({ endpoint, options });
-        return endpoint === '/me/player/devices' ? { devices: [{ ...recoveredDevice, is_active: true }] } : null; } };
+        if (endpoint === '/me/player/devices') return { devices: [{ ...recoveredDevice, is_active: true }] };
+        if (endpoint === '/me/player/currently-playing') {
+            statusReads++;
+            return statusReads <= 2
+                ? { is_playing: false, item: { id: 'existing', uri: 'spotify:track:existing' } }
+                : { is_playing: true, item: { id: 'existing', uri: 'spotify:track:existing' } };
+        }
+        return null;
+    } };
     for (const [name, args] of [
         ['spotify_next', {}], ['spotify_previous', {}], ['spotify_pause', {}], ['spotify_play', { query: '', type: 'track' }],
     ]) {
         const result = await executeTool(name, args, { client });
         assert.equal(result.success, true, name);
         assert.equal(result.accepted, true, name);
-        assert.equal(result.outcome, 'provider_accepted', name);
-        assert.equal(result.postStateConfirmed, false, name);
+        assert.equal(result.outcome, name === 'spotify_play' ? 'state_confirmed' : 'provider_accepted', name);
+        assert.equal(result.postStateConfirmed, name === 'spotify_play', name);
     }
     assert.deepEqual(calls.map(call => call.endpoint), [
         '/me/player/currently-playing', '/me/player/next', '/me/player/currently-playing',
         '/me/player/previous', '/me/player/currently-playing',
         '/me/player/pause',
-        '/me/player/devices', '/me/player/currently-playing', '/me/player/play',
+        '/me/player/devices', '/me/player/currently-playing', '/me/player/play', '/me/player/currently-playing',
     ]);
 });
 

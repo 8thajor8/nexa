@@ -51,10 +51,11 @@ export const spotifySearchTool = functionTool(
 );
 export const spotifyPlayTool = functionTool(
     'spotify_play',
-    'Reanuda Spotify si query está vacío; si no, busca y reproduce solo un resultado exacto y no ambiguo de Spotify.',
+    'Reanuda Spotify si query está vacío. Para una canción nombrada, selection=exact exige una coincidencia única. Para género, ambiente o música abierta, selection=best_match reproduce la opción mejor posicionada y distinta del catálogo.',
     {
-        query: { ...queryProperty, minLength: 0, description: 'Búsqueda exacta; cadena vacía para reanudar la reproducción actual.' },
+        query: { ...queryProperty, minLength: 0, description: 'Nombre/artista exactos o términos de género, ambiente o actividad; cadena vacía para reanudar.' },
         type: typeProperty,
+        selection: { type: 'string', enum: ['exact', 'best_match'], description: 'exact para una canción concreta; best_match para una selección abierta solicitada por la persona.' },
     }
 );
 export const spotifyPauseTool = functionTool('spotify_pause', 'Pausa la reproducción actual de Spotify.');
@@ -79,7 +80,8 @@ export function isSpotifyTool(name) {
 // These compact outputs contain control state only; content is formatted locally.
 export function spotifyModelSafeOutput(name, result) {
     if (!result?.success) {
-        return { success: false, outcome: result?.outcome ?? 'rejected', error: { code: result?.error?.code ?? 'spotify_error' } };
+        return { success: false, accepted: result?.accepted === true, stateConfirmed: result?.stateConfirmed === true,
+            outcome: result?.outcome ?? 'rejected', error: { code: result?.error?.code ?? 'spotify_error' } };
     }
     if (name === 'spotify_search') return { success: true, resultsReady: true };
     if (name === 'spotify_get_current_track') {
@@ -154,6 +156,14 @@ function displayText(value) {
 export function formatSpotifyToolResult(name, result) {
     if (!result?.success) {
         const message = result?.error?.message ?? 'Spotify no pudo completar la solicitud.';
+        if (name === 'spotify_play' && result.accepted === true && result.selected) {
+            const artists = result.selected.artists?.length ? ` — ${result.selected.artists.map(displayText).join(', ')}` : '';
+            const link = result.selected.spotifyUrl ? ` ([Abrir en Spotify](${spotifyLink(result.selected.spotifyUrl)}))` : '';
+            const safeMessage = message.replace(/[\u0000-\u001f\u007f-\u009f]/gu, ' ').replace(/\s+/gu, ' ').trim();
+            const contextNote = result.fallbackAttempted
+                ? ' Se intentó iniciarla desde su álbum; Spotify podría continuar con las pistas siguientes.' : '';
+            return `Spotify aceptó la solicitud de reproducir **${displayText(result.selected.name)}**${artists}, pero no pude confirmar la reproducción. ${safeMessage}${contextNote}${link}`;
+        }
         const candidates = Array.isArray(result.candidates) ? result.candidates : [];
         if (candidates.length === 0) return /^Spotify\b/u.test(message) ? message : `Spotify: ${message}`;
         const lines = candidates.map((item, index) => {
@@ -191,12 +201,22 @@ export function formatSpotifyToolResult(name, result) {
     }
     if (result.outcome === 'state_confirmed') {
         const action = result.action ?? name.replace(/^spotify_/u, '');
-        return formatSpotifyActionOutcome(action, 'state_confirmed', result.verification)
+        const confirmation = formatSpotifyActionOutcome(action, 'state_confirmed', result.verification)
             ?? 'El estado solicitado de Spotify está confirmado.';
+        if (name === 'spotify_play' && result.selected) {
+            const artists = result.selected.artists?.length ? ` — ${result.selected.artists.map(displayText).join(', ')}` : '';
+            const link = result.selected.spotifyUrl ? ` ([Abrir en Spotify](${spotifyLink(result.selected.spotifyUrl)}))` : '';
+            const contextNote = result.fallbackUsed
+                ? ' La reproducción se inició desde su álbum; Spotify puede continuar con las pistas siguientes.' : '';
+            return `${confirmation}: **${displayText(result.selected.name)}**${artists}.${contextNote}${link}`;
+        }
+        return confirmation;
     }
     if (name === 'spotify_play' && result.selected) {
         const artists = result.selected.artists?.length ? ` — ${result.selected.artists.map(displayText).join(', ')}` : '';
-        return `Spotify aceptó la orden de reproducir **${displayText(result.selected.name)}**${artists}. ([Abrir en Spotify](${spotifyLink(result.selected.spotifyUrl)}))`;
+        const contextNote = result.fallbackAttempted
+            ? ' Se intentó iniciarla desde su álbum; Spotify podría continuar con las pistas siguientes, pero la reproducción no quedó confirmada.' : '';
+        return `Spotify aceptó la orden de reproducir **${displayText(result.selected.name)}**${artists}, pero no pude confirmar la reproducción.${contextNote} ([Abrir en Spotify](${spotifyLink(result.selected.spotifyUrl)}))`;
     }
     const messages = {
         spotify_play: 'Spotify aceptó la orden de reproducción.',

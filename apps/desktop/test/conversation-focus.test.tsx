@@ -5,6 +5,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConversationPanel, type ConversationChatMessage } from "../src/renderer/components/ConversationPanel";
 import type { PttVoiceSnapshot } from "../src/renderer/voice/ptt-voice-controller";
+import { canonicalSpotifyTrackUrl } from "../src/shared/spotify-link-validation";
 
 afterEach(cleanup);
 
@@ -142,6 +143,25 @@ describe("chat composer focus", () => {
 
     view.rerender(panel({ snapshot: { ...snapshot, status: "listening", canStart: false } }));
     expect(screen.getByRole("button", { name: "Finalizar grabación y transcribir" }).getAttribute("data-voice-state")).toBe("listening");
+  });
+
+  it("opens validated Spotify track links through the existing callback", () => {
+    const onOpenSpotifyTrack = vi.fn();
+    const message = { ...responseMessage, streamed: true, text: "[Abrir en Spotify](https://open.spotify.com/track/abc123)" };
+    render(panel({ chatMessages: [message], onOpenSpotifyTrack }));
+    fireEvent.click(screen.getByRole("link", { name: "Abrir en Spotify" }));
+    expect(onOpenSpotifyTrack).toHaveBeenCalledWith("https://open.spotify.com/track/abc123");
+    expect(canonicalSpotifyTrackUrl("https://open.spotify.com/track/abc123?si=synthetic")).toBe("https://open.spotify.com/track/abc123");
+    expect(canonicalSpotifyTrackUrl("https://open.spotify.com.evil/track/abc123")).toBeNull();
+    expect(canonicalSpotifyTrackUrl("javascript:alert(1)")).toBeNull();
+  });
+
+  it("does not route invalid Spotify links to the external-open callback", () => {
+    const onOpenSpotifyTrack = vi.fn();
+    const message = { ...responseMessage, streamed: true, text: "[Abrir](https://open.spotify.com.evil/track/abc123)" };
+    render(panel({ chatMessages: [message], onOpenSpotifyTrack }));
+    fireEvent.click(screen.getByRole("link", { name: "Abrir" }));
+    expect(onOpenSpotifyTrack).not.toHaveBeenCalled();
   });
 
   it("sends on Enter, preserves Shift+Enter and does not submit while an IME composition is active", () => {

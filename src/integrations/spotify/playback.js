@@ -1,11 +1,27 @@
+import { createHash } from 'node:crypto';
 import { SpotifyApiError, spotifyClient } from './client.js';
-import { chooseUnambiguousResult, searchSpotify, spotifyFailure } from './search.js';
+import { chooseBestMatchResult, chooseTrackResult, chooseUnambiguousResult, searchSpotify, spotifyFailure } from './search.js';
 import { openApp } from '../../tools/windows.js';
 import { mediaPlayPause } from '../../windows/audio.js';
 import { controlWindow, getActiveWindow, isAppRunning } from '../../windows/window-control.js';
 
 const recoveryDelaysMs = [500, 1000, 1500, 2000];
 const playbackReconciliationDelaysMs = [200, 400];
+
+function diagnosticFingerprint(value) {
+    if (typeof value !== 'string' || value.length === 0) return null;
+    return createHash('sha256').update(value).digest('hex').slice(0, 12);
+}
+
+function reportSelectedDevice(device, { diagnostic, requestId, recovered }) {
+    try { diagnostic?.('spotify_play_device_selected', {
+        requestId: requestId ?? null,
+        deviceFingerprint: diagnosticFingerprint(device?.id),
+        deviceType: typeof device?.type === 'string' ? device.type : null,
+        deviceActive: device?.is_active === true,
+        recovered: recovered === true,
+    }); } catch { /* Diagnostics are best effort. */ }
+}
 
 function wait(milliseconds) {
     return new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -41,7 +57,23 @@ async function getRawDevices(client, { diagnostic, requestId } = {}) {
             catch { /* Diagnostics are best effort. */ }
         },
     });
-    return Array.isArray(response?.devices) ? response.devices : [];
+    const devices = Array.isArray(response?.devices) ? response.devices : [];
+    try {
+        const usable = devices.filter(device => typeof device?.id === 'string' && device.id.length > 0 && device.is_restricted !== true);
+        diagnostic?.('spotify_device_inventory', {
+            requestId: requestId ?? null,
+            deviceCount: devices.length,
+            usableDeviceCount: usable.length,
+            activeDeviceCount: usable.filter(device => device.is_active === true).length,
+            candidateSummary: JSON.stringify(devices.slice(0, 20).map(device => ({
+                fingerprint: diagnosticFingerprint(device?.id),
+                type: typeof device?.type === 'string' ? device.type : null,
+                active: device?.is_active === true,
+                restricted: device?.is_restricted === true,
+            }))),
+        });
+    } catch { /* Diagnostics are best effort. */ }
+    return devices;
 }
 
 async function activateRunningSpotify({ adapters, client }) {
@@ -91,7 +123,10 @@ export async function ensureSpotifyDevice({
     }
 
     let selected = chooseSpotifyDevice(devices);
-    if (selected.status === 'found') return { success: true, device: selected.device, recovered: false };
+    if (selected.status === 'found') {
+        reportSelectedDevice(selected.device, { diagnostic, requestId, recovered: false });
+        return { success: true, device: selected.device, recovered: false };
+    }
     if (selected.status === 'ambiguous') {
         return recoveryError('ambiguous_device', 'Spotify informa varios dispositivos posibles y ninguno está activo.');
     }
@@ -136,7 +171,10 @@ export async function ensureSpotifyDevice({
             continue;
         }
         selected = chooseSpotifyDevice(devices);
-        if (selected.status === 'found') return { success: true, device: selected.device, recovered: true };
+        if (selected.status === 'found') {
+            reportSelectedDevice(selected.device, { diagnostic, requestId, recovered: true });
+            return { success: true, device: selected.device, recovered: true };
+        }
         if (selected.status === 'ambiguous') {
             return recoveryError('ambiguous_device', 'Spotify informa varios dispositivos posibles y ninguno está activo.');
         }
@@ -211,10 +249,25 @@ async function readPlaybackObservation(client, { diagnostic, requestId, phase } 
             trackId: typeof response.item?.id === 'string' && response.item.id.length > 0 ? response.item.id : null,
             trackUri: typeof response.item?.uri === 'string' ? response.item.uri : null,
             contextUri: typeof response.context?.uri === 'string' ? response.context.uri : null,
+            trackFingerprint: diagnosticFingerprint(response.item?.uri),
+            contextFingerprint: diagnosticFingerprint(response.context?.uri),
+            deviceFingerprint: diagnosticFingerprint(response.device?.id),
+            deviceType: typeof response.device?.type === 'string' ? response.device.type : null,
+            deviceActive: response.device?.is_active === true,
+            playbackState: !Object.prototype.hasOwnProperty.call(response, 'item') ? 'item_field_missing'
+                : response.item === null ? 'no_current_item'
+                    : response.item && typeof response.item === 'object'
+                        ? (response.is_playing ? 'playing_item' : 'paused_item') : 'item_field_invalid',
+            deviceObservation: !response.device || typeof response.device !== 'object' ? 'not_reported'
+                : typeof response.device.is_active !== 'boolean' ? 'reported_state_unknown'
+                    : response.device.is_active ? 'active' : 'inactive',
             progressMs: Number.isInteger(response.progress_ms) && response.progress_ms >= 0 ? response.progress_ms : null,
         };
         try { diagnostic?.('spotify_playback_observation', { requestId: requestId ?? null, phase: phase ?? 'reconciliation',
-            known: true, playing: observation.playing, httpStatus }); }
+            known: true, playing: observation.playing, httpStatus,
+            trackFingerprint: observation.trackFingerprint, contextFingerprint: observation.contextFingerprint,
+            deviceFingerprint: observation.deviceFingerprint, deviceType: observation.deviceType, deviceActive: observation.deviceActive,
+            playbackState: observation.playbackState, deviceObservation: observation.deviceObservation }); }
         catch { /* Diagnostics are best effort. */ }
         return observation;
     } catch (error) {
@@ -255,6 +308,16 @@ function classifyPlaybackObservation(action, before, after, intent = {}) {
     const target = action === 'play';
     if (action === 'play' && intent.trackUri && after.trackUri !== intent.trackUri) return 'target_not_observed';
     if (action === 'play' && intent.contextUri && after.contextUri !== intent.contextUri) return 'target_not_observed';
+    if (action === 'play' && after.playing) {
+        const beforeMatchesTarget = (!intent.trackUri || before.trackUri === intent.trackUri)
+            && (!intent.contextUri || before.contextUri === intent.contextUri);
+        if (before.playing === true && beforeMatchesTarget) return 'target_already_observed';
+        if (before.playing === false || (intent.trackUri && before.trackUri && before.trackUri !== intent.trackUri)
+            || (intent.contextUri && before.contextUri && before.contextUri !== intent.contextUri)) {
+            return 'target_transition_observed';
+        }
+        return 'target_state_observed';
+    }
     if (after.playing === target) {
         if (before.playing === target) return 'target_already_observed';
         return before.playing === !target ? 'target_transition_observed' : 'target_state_observed';
@@ -355,9 +418,19 @@ async function sendPlaybackCommand(client, action, { method = 'PUT', body, query
     const before = await readPlaybackObservation(client, { diagnostic, requestId, phase: 'before_action' });
     const intent = {
         ...(Array.isArray(body?.uris) && body.uris.length === 1 && typeof body.uris[0] === 'string' ? { trackUri: body.uris[0] } : {}),
+        ...(typeof body?.offset?.uri === 'string' ? { trackUri: body.offset.uri } : {}),
         ...(typeof body?.context_uri === 'string' ? { contextUri: body.context_uri } : {}),
     };
     try {
+        if (action === 'play') {
+            try { diagnostic?.('spotify_play_request', { requestId: requestId ?? null,
+                selectionKind: body?.offset?.uri ? 'context_offset' : intent.trackUri ? 'track' : intent.contextUri ? 'context' : 'resume',
+                requestedTrackFingerprint: diagnosticFingerprint(intent.trackUri),
+                requestedContextFingerprint: diagnosticFingerprint(intent.contextUri),
+                targetDeviceFingerprint: diagnosticFingerprint(query?.device_id),
+                deviceIdProvided: typeof query?.device_id === 'string' }); }
+            catch { /* Diagnostics are best effort. */ }
+        }
         const endpoint = {
             pause: '/me/player/pause',
             next: '/me/player/next',
@@ -380,6 +453,30 @@ async function sendPlaybackCommand(client, action, { method = 'PUT', body, query
                 } catch { /* Diagnostics are best effort. */ }
             } } : {}),
         });
+        if (action === 'play') {
+            const { verification, evidence } = await reconcilePlaybackObservation(client, action, before, intent, { diagnostic, requestId });
+            const stateConfirmed = ['target_transition_observed', 'target_already_observed', 'target_state_observed'].includes(verification);
+            if (stateConfirmed) {
+                const result = { success: true, action, accepted: true, confirmed: true, stateConfirmed: true,
+                    postStateConfirmed: true, outcome: 'state_confirmed', verification, verificationEvidence: evidence };
+                try { diagnostic?.('spotify_action_result', { tool: `spotify_${action}`, requestId: requestId ?? null,
+                    outcome: 'state_confirmed', stage: 'post_state_verification', verification,
+                    beforePlaying: evidence.before?.playing ?? null, afterPlaying: evidence.after?.playing ?? null,
+                    requestedTargetMatched: evidence.requestedTargetMatched }); } catch { /* Diagnostics are best effort. */ }
+                return result;
+            }
+            const message = verification === 'unavailable'
+                ? 'Spotify aceptó la solicitud, pero no pude consultar el estado de reproducción. No repetí la orden.'
+                : 'Spotify aceptó la solicitud, pero la lectura posterior no confirma que la selección solicitada esté reproduciéndose. No repetí la orden.';
+            const result = { success: false, action, accepted: true, confirmed: false, stateConfirmed: false,
+                postStateConfirmed: false, outcome: 'provider_accepted_unconfirmed', verification,
+                verificationEvidence: evidence, error: { code: 'spotify_playback_unconfirmed', message } };
+            try { diagnostic?.('spotify_action_result', { tool: `spotify_${action}`, requestId: requestId ?? null,
+                outcome: 'provider_accepted_unconfirmed', stage: 'post_state_verification', errorCode: result.error.code,
+                verification, beforePlaying: evidence.before?.playing ?? null, afterPlaying: evidence.after?.playing ?? null,
+                requestedTargetMatched: evidence.requestedTargetMatched }); } catch { /* Diagnostics are best effort. */ }
+            return result;
+        }
         const result = { success: true, action, accepted: true, outcome: 'provider_accepted', postStateConfirmed: false, confirmed: true,
             verification: 'not_required' };
         try { diagnostic?.('spotify_action_result', { tool: `spotify_${action}`, requestId: requestId ?? null,
@@ -431,24 +528,30 @@ async function sendPlaybackCommand(client, action, { method = 'PUT', body, query
     }
 }
 
-export async function playSpotify({ query = '', type = 'track', client = spotifyClient, recoveryAdapters, diagnostic, requestId } = {}) {
-    if (typeof query !== 'string' || query.length > 200 || !['track', 'artist', 'album'].includes(type)) {
-        return { success: false, error: { code: 'spotify_query_invalid', message: 'La búsqueda o el tipo de contenido no es válido.' } };
+export async function playSpotify({ query = '', type = 'track', selection: selectionMode = 'exact', client = spotifyClient,
+    recoveryAdapters, diagnostic, requestId } = {}) {
+    if (typeof query !== 'string' || query.length > 200 || !['track', 'artist', 'album'].includes(type)
+        || !['exact', 'best_match'].includes(selectionMode)) {
+        return { success: false, error: { code: 'spotify_query_invalid', message: 'La búsqueda, el tipo o el modo de selección no es válido.' } };
     }
     if (!query.trim()) return playWithDeviceRecovery(client, {}, recoveryAdapters, { diagnostic, requestId });
 
-    const search = await searchSpotify(query, type, { client });
+    const search = await searchSpotify(query, type, { client, includePlaybackMetadata: type === 'track' });
     if (!search.success) return search;
     if (search.results.length === 0) {
         return { success: false, error: { code: 'spotify_no_results', message: 'Spotify no encontró resultados para esa búsqueda.' } };
     }
-    const selection = chooseUnambiguousResult(query, search.results);
+    const selection = selectionMode === 'best_match'
+        ? chooseBestMatchResult(query, search.results)
+        : type === 'track' ? chooseTrackResult(query, search.results) : chooseUnambiguousResult(query, search.results);
     if (selection.status !== 'found') {
         return {
             success: false,
             error: {
-                code: 'spotify_ambiguous_result',
-                message: 'Hay varios resultados posibles; elegí uno con el nombre y artista exactos.',
+                code: selectionMode === 'best_match' ? 'spotify_no_relevant_result' : 'spotify_ambiguous_result',
+                message: selectionMode === 'best_match'
+                    ? 'Spotify no devolvió una opción distinta y adecuada para esa búsqueda.'
+                    : 'Hay varios resultados posibles; elegí uno con el nombre y artista exactos.',
             },
             candidates: selection.items,
         };
@@ -457,12 +560,41 @@ export async function playSpotify({ query = '', type = 'track', client = spotify
     const body = item.type === 'track'
         ? { uris: [item.uri] }
         : { context_uri: item.uri };
+    const selected = { type: item.type, name: item.name, artists: item.artists, spotifyUrl: item.spotifyUrl };
     const result = await playWithDeviceRecovery(client, body, recoveryAdapters, { diagnostic, requestId });
-    return result.success
-        ? { ...result, selected: { type: item.type, name: item.name, artists: item.artists, spotifyUrl: item.spotifyUrl } }
-        : result;
-}
+    if (item.type !== 'track') return { ...result, selected };
+    try { diagnostic?.('spotify_track_fallback', { requestId: requestId ?? null, stage: 'direct_result',
+        outcome: result.success ? 'direct_confirmed' : result.accepted ? 'direct_unconfirmed' : 'direct_rejected',
+        errorCode: result.error?.code ?? null }); } catch { /* Diagnostics are best effort. */ }
+    if (result.success || result.accepted !== true || result.outcome !== 'provider_accepted_unconfirmed') {
+        return { ...result, selected };
+    }
+    if (!item.albumUri) {
+        try { diagnostic?.('spotify_track_fallback', { requestId: requestId ?? null,
+            stage: 'context_offset_skipped', reason: 'album_context_unavailable' }); }
+        catch { /* Diagnostics are best effort. */ }
+        return { ...result, selected, fallbackAttempted: false };
+    }
 
+    // Spotify Desktop has accepted direct track URIs without starting playback.
+    // Try one provider-backed album-context request, targeting the exact track
+    // URI. The search response supplies both URIs; no position is inferred.
+    try { diagnostic?.('spotify_track_fallback', { requestId: requestId ?? null,
+        stage: 'context_offset_attempt', reason: 'direct_track_unconfirmed',
+        albumFingerprint: diagnosticFingerprint(item.albumUri), trackFingerprint: diagnosticFingerprint(item.uri) }); }
+    catch { /* Diagnostics are best effort. */ }
+    const fallback = await playWithDeviceRecovery(client, {
+        context_uri: item.albumUri,
+        offset: { uri: item.uri },
+    }, recoveryAdapters, { diagnostic, requestId });
+    try { diagnostic?.('spotify_track_fallback', { requestId: requestId ?? null,
+        stage: 'context_offset_result', outcome: fallback.success ? 'state_confirmed' : fallback.accepted ? 'accepted_unconfirmed' : 'rejected',
+        errorCode: fallback.error?.code ?? null }); }
+    catch { /* Diagnostics are best effort. */ }
+    return fallback.success
+        ? { ...fallback, selected, fallbackUsed: true }
+        : { ...fallback, selected, fallbackAttempted: true };
+}
 async function playWithDeviceRecovery(client, body, recoveryAdapters, trace = {}) {
     const recovery = await ensureSpotifyDevice({ client, activatePausedPlayback: false, ...trace,
         ...(recoveryAdapters ? { adapters: recoveryAdapters } : {}) });

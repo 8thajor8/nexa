@@ -4,7 +4,7 @@ import {
   CHAT_OPEN_CONVERSATION_CHANNEL, CHAT_RENAME_CONVERSATION_CHANNEL, CHAT_SEND_MESSAGE_CHANNEL,
   type ChatEventEnvelope,
 } from "../src/shared/ipc-contract.js";
-import { registerChatIpcHandlers, type ConversationRuntimeApi, type RuntimeMessageEvent, type RuntimeMessageResult } from "../src/main/chat-ipc.js";
+import { deriveAutomaticConversationTitle, registerChatIpcHandlers, type ConversationRuntimeApi, type RuntimeMessageEvent, type RuntimeMessageResult } from "../src/main/chat-ipc.js";
 import { createConversationRuntime } from "../../../src/core/conversation-runtime.js";
 import { ConversationStoreError, createConversationStore } from "../../../src/core/conversation-store.js";
 // @ts-expect-error Synthetic regression exercises the existing Memory2 initializer.
@@ -45,8 +45,7 @@ function fakeRuntime(result: Promise<RuntimeMessageResult> = Promise.resolve({
 function harness(runtime: ConversationRuntimeApi | null,
   diagnostic?: (event: string, details: Readonly<Record<string, string | number | boolean | null>>) => void,
   voiceHooks?: Parameters<typeof registerChatIpcHandlers>[4],
-  conversationStore?: Parameters<typeof registerChatIpcHandlers>[5],
-  titleGenerator?: Parameters<typeof registerChatIpcHandlers>[6]) {
+  conversationStore?: Parameters<typeof registerChatIpcHandlers>[5]) {
   const handlers = new Map<string, (event: never, payload?: unknown) => unknown>();
   const ipc = {
     handle: vi.fn((channel: string, listener: (event: never, payload?: unknown) => unknown) => handlers.set(channel, listener)),
@@ -55,7 +54,7 @@ function harness(runtime: ConversationRuntimeApi | null,
   const contents = { mainFrame: {}, send: vi.fn(), isDestroyed: vi.fn(() => false) };
   const window = { webContents: contents, isDestroyed: vi.fn(() => false) };
   const getWindow = () => window;
-  const service = registerChatIpcHandlers(getWindow as never, () => runtime, ipc as never, diagnostic, voiceHooks, conversationStore, titleGenerator);
+  const service = registerChatIpcHandlers(getWindow as never, () => runtime, ipc as never, diagnostic, voiceHooks, conversationStore);
   const event = { sender: contents, senderFrame: contents.mainFrame } as never;
   const invoke = (channel: string, payload?: unknown, overrideEvent = event) => handlers.get(channel)!(overrideEvent, payload);
   return { handlers, ipc, contents, window, service, invoke, event };
@@ -64,45 +63,37 @@ function harness(runtime: ConversationRuntimeApi | null,
 describe("Main chat IPC to Conversation Runtime", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("generates and publishes a title for a PTT-first exchange after persistence without delaying voice", async () => {
+  it("titles a PTT-first request from its persisted user message without waiting for the assistant", async () => {
     const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "nexa-conversation-title-"));
     const store = createConversationStore({ baseDirectory: path.join(temporaryRoot, "conversations") });
-    const title = deferred<string | null>();
-    const runtime = fakeRuntime(Promise.resolve({ conversationId, requestId: request.requestId,
-      status: "completed", text: "Te recomiendo opciones seguras para guardar tus copias." }));
+    const result = deferred<RuntimeMessageResult>();
+    const runtime = fakeRuntime(result.promise);
     runtime.runtime.restoreConversation = vi.fn(() => true);
-    const titleGenerator = vi.fn(() => title.promise);
     const onVoiceResponse = vi.fn();
-    const h = harness(runtime.runtime, undefined, { onVoiceResponse }, store, titleGenerator);
+    const h = harness(runtime.runtime, undefined, { onVoiceResponse }, store);
     try {
       h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
       await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, source: "voice", text: "¿Cómo organizo mis copias de seguridad?" });
+      await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) =>
+        (call[1] as ChatEventEnvelope).status === "conversation_title_updated")).toBe(true));
+      expect((await store.getConversation(conversationId))?.title).toBe("¿Cómo organizo mis copias de seguridad?");
+      expect(onVoiceResponse).not.toHaveBeenCalled();
+      result.resolve({ conversationId, requestId: request.requestId,
+        status: "completed", text: "Te recomiendo opciones seguras para guardar tus copias." });
       await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) =>
         (call[1] as ChatEventEnvelope).status === "completed")).toBe(true));
       const persisted = await store.listMessages(conversationId, { limit: 10 });
       expect(persisted.messages.map(({ role, sequence }) => ({ role, sequence }))).toEqual([
         { role: "user", sequence: 1 }, { role: "assistant", sequence: 2 },
       ]);
-      expect(titleGenerator).toHaveBeenCalledOnce();
-      expect(titleGenerator).toHaveBeenCalledWith({ userMessage: "¿Cómo organizo mis copias de seguridad?",
-        assistantMessage: "Te recomiendo opciones seguras para guardar tus copias." });
       expect(onVoiceResponse).toHaveBeenCalledOnce();
-      expect((await store.getConversation(conversationId))?.title).toBe("Nueva conversación");
-
       const otherConversation = await store.createConversation(id("8"));
       await expect(h.invoke(CHAT_OPEN_CONVERSATION_CHANNEL, { conversationId: otherConversation.conversationId }))
         .resolves.toMatchObject({ ok: true, conversationId: otherConversation.conversationId });
-
-      title.resolve("Copias de seguridad seguras");
-      await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) =>
-        (call[1] as ChatEventEnvelope).status === "conversation_title_updated")).toBe(true));
       expect(await store.getConversation(conversationId)).toMatchObject({
-        title: "Copias de seguridad seguras", titleSource: "automatic",
+        title: "¿Cómo organizo mis copias de seguridad?", titleSource: "automatic",
       });
       expect((await store.getConversation(otherConversation.conversationId))?.title).toBe("Nueva conversación");
-      expect(h.contents.send).toHaveBeenCalledWith(CHAT_EVENT_CHANNEL, {
-        conversationId, requestId: request.requestId, status: "conversation_title_updated", title: "Copias de seguridad seguras", source: "automatic",
-      });
     } finally {
       h.service.dispose();
       const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(temporaryRoot));
@@ -111,24 +102,54 @@ describe("Main chat IPC to Conversation Runtime", () => {
     }
   });
 
-  it("keeps the response successful when automatic title generation fails", async () => {
+  it("does not fail a tool-first request when deterministic title persistence fails", async () => {
     const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "nexa-conversation-title-failure-"));
-    const store = createConversationStore({ baseDirectory: path.join(temporaryRoot, "conversations") });
+    const baseStore = createConversationStore({ baseDirectory: path.join(temporaryRoot, "conversations") });
+    const store = { ...baseStore, updateTitle: vi.fn(async () => { throw new Error("synthetic title persistence failure"); }) };
     const runtime = fakeRuntime();
     runtime.runtime.sendMessage = vi.fn(async (input) => ({ conversationId: input.conversationId,
       requestId: input.requestId, status: "completed", text: "Respuesta disponible." }));
     const diagnostics = vi.fn();
-    const h = harness(runtime.runtime, diagnostics, undefined, store, vi.fn(async () => { throw new Error("title provider unavailable"); }));
+    const h = harness(runtime.runtime, diagnostics, undefined, store);
     try {
       h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
-      await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, request);
+      await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, text: "Poné Blinding Lights de The Weeknd" });
       await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) =>
         (call[1] as ChatEventEnvelope).status === "completed")).toBe(true));
-      await vi.waitFor(() => expect(diagnostics).toHaveBeenCalledWith("conversation_title_generation_failed",
+      await vi.waitFor(() => expect(diagnostics).toHaveBeenCalledWith("conversation_title_update_failed",
         { requestId: request.requestId }));
       expect((await store.getConversation(conversationId))?.title).toBe("Nueva conversación");
       expect(h.contents.send.mock.calls.some((call) =>
         (call[1] as ChatEventEnvelope).status === "conversation_title_updated")).toBe(false);
+    } finally {
+      h.service.dispose();
+      const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(temporaryRoot));
+      expect(relative && !relative.startsWith("..") && !path.isAbsolute(relative)).toBeTruthy();
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("derives a concise title from the first significant musical request and skips greetings", () => {
+    expect(deriveAutomaticConversationTitle("Hola, Nexa")).toBeNull();
+    expect(deriveAutomaticConversationTitle("Poné Blinding Lights de The Weeknd")).toBe("Poné Blinding Lights de The Weeknd");
+    expect(deriveAutomaticConversationTitle("x".repeat(100))).toHaveLength(60);
+  });
+
+  it("titles a Spotify tool-first conversation from the user request without waiting for tool output", async () => {
+    const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "nexa-spotify-conversation-title-"));
+    const store = createConversationStore({ baseDirectory: path.join(temporaryRoot, "conversations") });
+    const result = deferred<RuntimeMessageResult>();
+    const runtime = fakeRuntime(result.promise);
+    const h = harness(runtime.runtime, undefined, undefined, store);
+    try {
+      h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+      await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, { ...request, text: "Poné Blinding Lights de The Weeknd" });
+      await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) =>
+        (call[1] as ChatEventEnvelope).status === "conversation_title_updated")).toBe(true));
+      expect((await store.getConversation(conversationId))?.title).toBe("Poné Blinding Lights de The Weeknd");
+      result.resolve({ conversationId, requestId: request.requestId, status: "completed", text: "Spotify reprodujo la selección." });
+      await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) =>
+        (call[1] as ChatEventEnvelope).status === "completed")).toBe(true));
     } finally {
       h.service.dispose();
       const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(temporaryRoot));
@@ -585,8 +606,10 @@ describe("Main chat IPC to Conversation Runtime", () => {
         { role: "user", content: "Pregunta sintética" }, { role: "assistant", content: "Respuesta final." },
       ]);
       expect(history.messages.filter(({ role }) => role === "assistant")).toHaveLength(1);
-      expect(h.contents.send.mock.calls.map((call) => (call[1] as ChatEventEnvelope).status))
+      const statuses = h.contents.send.mock.calls.map((call) => (call[1] as ChatEventEnvelope).status);
+      expect(statuses.filter((status) => status !== "conversation_title_updated"))
         .toEqual(["processing", "text_delta", "text_delta", "completed"]);
+      expect(statuses).toContain("conversation_title_updated");
     } finally {
       h.service.dispose();
       const relative = path.relative(path.resolve(os.tmpdir()), path.resolve(temporaryRoot));
