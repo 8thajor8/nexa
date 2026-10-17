@@ -149,12 +149,12 @@ test('validates live range and step, then sends one fixed number.set_value servi
   assert.deepEqual(waits, []);
 });
 
-test('performs exactly one delayed confirmation read at 3000 ms without resending the action', async () => {
+test('confirms on the first adaptive retry without resending the action', async () => {
   const { client, serviceCalls, waits } = fixture({ updateOnSet: false });
   const result = await client.setEffectSpeed({ lightEntityId: lightId, value: 75 });
   assert.equal(result.outcome, 'confirmed');
   assert.deepEqual(serviceCalls, [{ entity_id: speedId, value: 75 }]);
-  assert.deepEqual(waits, [3000]);
+  assert.deepEqual(waits, [100]);
 });
 
 test('returns accepted_not_confirmed when the live value does not change', async () => {
@@ -163,7 +163,8 @@ test('returns accepted_not_confirmed when the live value does not change', async
   const result = await client.setEffectSpeed({ lightEntityId: lightId, value: 75 });
   assert.equal(result.outcome, 'accepted_not_confirmed');
   assert.deepEqual(serviceCalls, [{ entity_id: speedId, value: 75 }]);
-  assert.deepEqual(waits, [3000]);
+  assert.equal(waits.reduce((sum, delay) => sum + delay, 0), 3000);
+  assert.ok(waits.every(delay => delay > 0 && delay < 3000));
 });
 
 test('does not allow an arbitrary light or number entity to be controlled', async () => {

@@ -75,7 +75,7 @@ test('light effect uses only the fixed turn_on service and confirms after a dela
     const result = await client.applyLightEffect({ entityId: 'light.office', effect: 'Ocean' });
     assert.equal(result.outcome, 'confirmed');
     assert.equal(result.state.effect, 'Ocean');
-    assert.deepEqual(waits, [3000]);
+    assert.deepEqual(waits, [100]);
     assert.equal(calls.filter(call => call.method === 'POST').length, 1);
     assert.equal(calls.find(call => call.method === 'POST').url, 'http://127.0.0.1:8123/api/services/light/turn_on');
     assert.deepEqual(JSON.parse(calls.find(call => call.method === 'POST').body), { entity_id: 'light.office', effect: 'Ocean' });
@@ -98,7 +98,7 @@ test('effect is not applied unless the authorized entity reports it and the obse
         } });
     const result = await neverConfirms.applyLightEffect({ entityId: 'light.office', effect: 'Ocean' });
     assert.equal(result.outcome, 'accepted_not_confirmed');
-    assert.deepEqual(waits, [3000]);
+    assert.equal(waits.reduce((sum, delay) => sum + delay, 0), 3000);
 });
 
 test('conversational light control exposes an optional effect and reuses the existing effect operation', async () => {
@@ -255,9 +255,9 @@ test('conversational effect tool keeps acceptance distinct from delayed confirma
     assert.equal(delayed.success, false);
     assert.equal(delayed.accepted, true);
     assert.equal(delayed.outcome, 'accepted_not_confirmed');
-    assert.deepEqual(waits, [3000]);
+    assert.equal(waits.reduce((sum, delay) => sum + delay, 0), 3000);
     assert.equal(serviceCalls, 1);
-    assert.equal(reads, 3);
+    assert.ok(reads > 3);
 
     const failedClient = clientWith(async () => json({}, 401));
     const failed = await createHomeAssistantRegistrations(failedClient)[2].execute({ args: {
@@ -442,7 +442,7 @@ test('brightness and RGB are validated, sent and checked in the observed state',
     const client = clientWith(async (url, options) => {
         calls.push({ url: String(url), options });
         if (options.method === 'POST') return json([], 200);
-        return json(state('on', { brightness: 128, rgb_color: [10, 20, 30] }));
+        return json(state('on', { brightness: 128, rgb_color: [12, 19, 31] }));
     });
     const result = await client.controlLight({ entityId: 'light.office', action: 'turn_on', brightnessPct: 50,
         rgbColor: [10, 20, 30] });
@@ -451,7 +451,24 @@ test('brightness and RGB are validated, sent and checked in the observed state',
     assert.equal(result.success, true);
 });
 
-test('a stale first state is confirmed by one delayed read without repeating the action', async () => {
+test('a transient observation failure is retried but never treated as confirmation', async () => {
+    const waits = [];
+    let stateReads = 0;
+    const client = clientWith(async (_url, options) => {
+        if (options.method === 'POST') return json([], 200);
+        stateReads++;
+        if (stateReads === 2) throw new Error('synthetic transient read failure');
+        return json(state(stateReads > 3 ? 'on' : 'off'));
+    }, ENV, async ms => { waits.push(ms); });
+    const result = await client.controlLight({ entityId: 'light.office', action: 'turn_on' });
+    assert.equal(result.outcome, 'confirmed');
+    assert.equal(result.state.state, 'on');
+    assert.equal(stateReads, 4);
+    assert.equal(waits.length, 2);
+    assert.ok(waits.every(delay => delay < 3000));
+});
+
+test('a stale first state is confirmed by adaptive reads without repeating the action', async () => {
     const calls = [];
     const waits = [];
     let stateReads = 0;
@@ -464,12 +481,12 @@ test('a stale first state is confirmed by one delayed read without repeating the
     const result = await client.controlLight({ entityId: 'light.office', action: 'turn_on' });
     assert.equal(result.success, true);
     assert.equal(result.outcome, 'confirmed');
-    assert.deepEqual(waits, [3000]);
+    assert.deepEqual(waits, [100]);
     assert.equal(calls.filter(call => call.method === 'POST').length, 1);
     assert.equal(calls.filter(call => call.method !== 'POST').length, 3);
 });
 
-test('state that never updates remains accepted_not_confirmed after one retry', async () => {
+test('state that never updates remains accepted_not_confirmed within the bounded polling window', async () => {
     const calls = [];
     const waits = [];
     const client = clientWith(async (url, options) => {
@@ -479,9 +496,9 @@ test('state that never updates remains accepted_not_confirmed after one retry', 
     const result = await client.controlLight({ entityId: 'light.office', action: 'turn_on' });
     assert.equal(result.success, false);
     assert.equal(result.outcome, 'accepted_not_confirmed');
-    assert.deepEqual(waits, [3000]);
+    assert.equal(waits.reduce((sum, delay) => sum + delay, 0), 3000);
     assert.equal(calls.filter(call => call.method === 'POST').length, 1);
-    assert.equal(calls.filter(call => call.method !== 'POST').length, 3);
+    assert.ok(calls.filter(call => call.method !== 'POST').length > 3);
 });
 
 test('a failed delayed state read never reports confirmation', async () => {
@@ -490,7 +507,7 @@ test('a failed delayed state read never reports confirmation', async () => {
     const client = clientWith(async (url, options) => {
         calls.push({ url: String(url), method: options.method });
         if (options.method === 'POST') return json([], 200);
-        if (calls.filter(call => call.method !== 'POST').length === 3)
+        if (calls.filter(call => call.method !== 'POST').length >= 2)
             throw new Error('synthetic network failure');
         return json(state('off'));
     }, ENV, async ms => { waits.push(ms); });
@@ -498,8 +515,29 @@ test('a failed delayed state read never reports confirmation', async () => {
     assert.equal(result.success, false);
     assert.equal(result.outcome, 'accepted_not_confirmed');
     assert.equal(result.errorCode, 'home_assistant_unavailable');
-    assert.deepEqual(waits, [3000]);
+    assert.equal(waits.reduce((sum, delay) => sum + delay, 0), 3000);
     assert.equal(calls.filter(call => call.method === 'POST').length, 1);
+});
+
+test('an unresponsive post-action state endpoint is cut off by the remaining verification budget', async () => {
+    let stateReads = 0;
+    let serviceCalls = 0;
+    const startedAt = performance.now();
+    const client = createHomeAssistantClient({ environment: ENV, timeoutMs: 10_000,
+        fetchImpl: async (_url, options) => {
+            if (options.method === 'POST') { serviceCalls++; return json([], 200); }
+            stateReads++;
+            if (stateReads === 1) return json(state('off'));
+            return new Promise((_resolve, reject) => options.signal.addEventListener('abort',
+                () => reject(Object.assign(new Error('synthetic abort'), { name: 'AbortError' })), { once: true }));
+        } });
+    const result = await client.controlLight({ entityId: 'light.office', action: 'turn_on' });
+    const elapsedMs = performance.now() - startedAt;
+    assert.equal(result.outcome, 'accepted_not_confirmed');
+    assert.equal(result.errorCode, 'home_assistant_timeout');
+    assert.equal(serviceCalls, 1);
+    assert.equal(stateReads, 2);
+    assert.ok(elapsedMs >= 2800 && elapsedMs < 3800, `verification took ${elapsedMs} ms`);
 });
 
 test('unsupported features, unavailable device, timeout and auth errors are safe', async () => {

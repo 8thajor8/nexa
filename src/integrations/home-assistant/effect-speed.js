@@ -1,3 +1,5 @@
+import { pollForConfirmation } from './confirmation-poll.js';
+
 const LIGHT_ID = /^light\.[a-z0-9_]+$/u;
 const NUMBER_ID = /^number\.[a-z0-9_]+$/u;
 const DEFAULT_TIMEOUT_MS = 5_000;
@@ -43,10 +45,10 @@ function finiteAttribute(attributes, key) {
 /** Main-only WiZ effect-speed operations. Entity IDs are always resolved from the authorized-light Store. */
 export function createHomeAssistantEffectSpeedClient({ environment = process.env, fetchImpl = fetch,
     WebSocketImpl = globalThis.WebSocket, timeoutMs = DEFAULT_TIMEOUT_MS,
-    waitImpl = ms => new Promise(resolve => setTimeout(resolve, ms)), authorizedLightsProvider,
+    waitImpl = ms => new Promise(resolve => setTimeout(resolve, ms)), nowImpl = () => performance.now(), authorizedLightsProvider,
 } = {}) {
     if (typeof fetchImpl !== 'function' || typeof WebSocketImpl !== 'function'
-        || typeof authorizedLightsProvider !== 'function' || typeof waitImpl !== 'function')
+        || typeof authorizedLightsProvider !== 'function' || typeof waitImpl !== 'function' || typeof nowImpl !== 'function')
         throw new TypeError('home_assistant_speed_client_invalid');
 
     function configuration() {
@@ -80,10 +82,11 @@ export function createHomeAssistantEffectSpeedClient({ environment = process.env
         return light;
     }
 
-    async function request(path, { method = 'GET', body } = {}) {
+    async function request(path, { method = 'GET', body, timeoutMs: requestTimeoutMs = timeoutMs } = {}) {
         const config = configuration();
+        const effectiveTimeoutMs = Math.max(1, Math.min(timeoutMs, Math.floor(requestTimeoutMs)));
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
         try {
             const response = await fetchImpl(new URL(path, config.origin), {
                 method, redirect: 'error', signal: controller.signal,
@@ -270,17 +273,23 @@ export function createHomeAssistantEffectSpeedClient({ environment = process.env
         await request('/api/services/number/set_value', { method: 'POST', body: { entity_id: numberId, value } });
         const confirms = current => current.available && current.value !== null
             && Math.abs(current.value - value) <= Math.max(1e-8, (state.step ?? 0) * 1e-6);
-        let observed;
-        try { observed = await readLinkedState(getAuthorizedLight(lightEntityId), numberId); }
-        catch { observed = null; }
-        if (observed && confirms(observed)) return Object.freeze({ outcome: 'confirmed', state: observed });
-        await waitImpl(3000);
-        try { observed = await readLinkedState(getAuthorizedLight(lightEntityId), numberId); }
-        catch { observed = null; }
-        return Object.freeze({ outcome: observed && confirms(observed) ? 'confirmed' : 'accepted_not_confirmed',
-            state: observed });
+        const readObservedState = async requestTimeoutMs => {
+            const currentLight = getAuthorizedLight(lightEntityId);
+            if (currentLight.effectSpeedEntityId !== numberId)
+                throw new HomeAssistantEffectSpeedError('home_assistant_speed_link_stale');
+            const payload = await request(`/api/states/${numberId}`, { timeoutMs: requestTimeoutMs });
+            if (!validRecord(payload) || payload.entity_id !== numberId)
+                throw new HomeAssistantEffectSpeedError('home_assistant_response_invalid');
+            return toSpeedState(currentLight, payload);
+        };
+        const observation = await pollForConfirmation({ read: readObservedState, isConfirmed: confirms,
+            waitImpl, nowImpl, stopOnError: error => ['home_assistant_unauthorized', 'home_assistant_forbidden',
+                'home_assistant_request_rejected', 'home_assistant_speed_link_stale'].includes(error?.code) });
+        return Object.freeze({ outcome: observation.confirmed ? 'confirmed' : 'accepted_not_confirmed',
+            state: observation.state });
     }
 
     return Object.freeze({ discoverEffectSpeedCandidates, associationIsCurrent, getEffectSpeed,
         getAuthorizedEffectSpeeds, setEffectSpeed });
 }
+

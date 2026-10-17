@@ -1,3 +1,5 @@
+import { pollForConfirmation } from './confirmation-poll.js';
+
 const DEFAULT_TIMEOUT_MS = 5_000;
 const MAX_LIGHTS = 32;
 const ENTITY_ID_PATTERN = /^light\.[a-z0-9_]+$/u;
@@ -172,17 +174,19 @@ function apiError(status) {
 
 export function createHomeAssistantClient({ environment = process.env, fetchImpl = fetch,
     timeoutMs = DEFAULT_TIMEOUT_MS, waitImpl = ms => new Promise(resolve => setTimeout(resolve, ms)),
+    nowImpl = () => performance.now(),
     authorizedLightsProvider = null } = {}) {
     if (typeof fetchImpl !== 'function') throw new TypeError('home_assistant_fetch_invalid');
-    if (typeof waitImpl !== 'function') throw new TypeError('home_assistant_wait_invalid');
+    if (typeof waitImpl !== 'function' || typeof nowImpl !== 'function') throw new TypeError('home_assistant_wait_invalid');
     if (authorizedLightsProvider !== null && typeof authorizedLightsProvider !== 'function')
         throw new TypeError('home_assistant_authorization_provider_invalid');
     function configuration() { return parseConfiguration(environment, timeoutMs, authorizedLightsProvider); }
 
-    async function request(path, { method = 'GET', body, parseJson = true } = {}) {
+    async function request(path, { method = 'GET', body, parseJson = true, timeoutMs: requestTimeoutMs = timeoutMs } = {}) {
         const config = configuration();
+        const effectiveTimeoutMs = Math.max(1, Math.min(timeoutMs, Math.floor(requestTimeoutMs)));
         const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
         try {
             const response = await fetchImpl(new URL(`/api${path}`, config.origin), {
                 method, redirect: 'error', headers: { Authorization: `Bearer ${config.token}`, Accept: 'application/json',
@@ -200,10 +204,10 @@ export function createHomeAssistantClient({ environment = process.env, fetchImpl
         } finally { clearTimeout(timer); }
     }
 
-    async function getEntity(entityId) {
+    async function getEntity(entityId, { timeoutMs: requestTimeoutMs = timeoutMs } = {}) {
         const config = configuration();
         if (!config.entityIds.includes(entityId)) throw new HomeAssistantError('home_assistant_entity_not_authorized');
-        const payload = await request(`/states/${encodeURIComponent(entityId)}`);
+        const payload = await request(`/states/${encodeURIComponent(entityId)}`, { timeoutMs: requestTimeoutMs });
         const state = safeEntityState(payload, entityId);
         if (!state) throw new HomeAssistantError('home_assistant_response_invalid');
         return state;
@@ -279,34 +283,17 @@ export function createHomeAssistantClient({ environment = process.env, fetchImpl
                     && rgbColor.every((channel, index) => Math.abs(after.rgbColor[index] - channel) <= 3);
             return confirmed;
         };
-        const readAfterAction = async () => {
-            try { return { state: await getEntity(entityId) }; }
-            catch (error) { return { error }; }
-        };
-        let observation = await readAfterAction();
-        if (observation.error) {
-            const error = observation.error;
-            if (error?.code === 'home_assistant_entity_not_found' || error?.code === 'home_assistant_entity_unavailable')
-                return Object.freeze({ success: false, outcome: 'device_unavailable', state: null, service });
-            return Object.freeze({ success: false, outcome: 'accepted_not_confirmed', state: null, service,
-                errorCode: error?.code ?? 'home_assistant_request_failed' });
-        }
-        if (confirmsRequest(observation.state))
+        const observation = await pollForConfirmation({ read: requestTimeoutMs => getEntity(entityId, { timeoutMs: requestTimeoutMs }),
+            isConfirmed: confirmsRequest, waitImpl, nowImpl,
+            stopOnError: error => ['home_assistant_unauthorized', 'home_assistant_forbidden',
+                'home_assistant_request_rejected', 'home_assistant_entity_not_found'].includes(error?.code) });
+        if (observation.confirmed)
             return Object.freeze({ success: true, outcome: 'confirmed', state: observation.state, service });
-
-        // Home Assistant may accept a light service before its state endpoint reflects the change.
-        await waitImpl(3000);
-        observation = await readAfterAction();
-        if (observation.error) {
-            const error = observation.error;
-            if (error?.code === 'home_assistant_entity_not_found' || error?.code === 'home_assistant_entity_unavailable')
-                return Object.freeze({ success: false, outcome: 'device_unavailable', state: null, service });
-            return Object.freeze({ success: false, outcome: 'accepted_not_confirmed', state: null, service,
-                errorCode: error?.code ?? 'home_assistant_request_failed' });
-        }
-        const confirmed = confirmsRequest(observation.state);
-        return Object.freeze({ success: confirmed, outcome: confirmed ? 'confirmed' : 'accepted_not_confirmed',
-            state: observation.state, service });
+        const error = observation.error;
+        if (error?.code === 'home_assistant_entity_not_found' || error?.code === 'home_assistant_entity_unavailable')
+            return Object.freeze({ success: false, outcome: 'device_unavailable', state: null, service });
+        return Object.freeze({ success: false, outcome: 'accepted_not_confirmed', state: observation.state, service,
+            ...(error ? { errorCode: error?.code ?? 'home_assistant_request_failed' } : {}) });
     }
     async function applyLightEffect({ entityId, effect } = {}) {
         const config = configuration();
@@ -319,26 +306,18 @@ export function createHomeAssistantClient({ environment = process.env, fetchImpl
         if (!configuration().entityIds.includes(entityId))
             throw new HomeAssistantError('home_assistant_entity_not_authorized');
         await request('/services/light/turn_on', { method: 'POST', body: { entity_id: entityId, effect }, parseJson: false });
-        const readAfterAction = async () => {
-            try { return { state: await getEntity(entityId) }; }
-            catch (error) { return { error }; }
-        };
         const confirmed = state => state.available && state.effect === effect;
-        let observation = await readAfterAction();
-        if (!observation.error && confirmed(observation.state))
+        const observation = await pollForConfirmation({ read: requestTimeoutMs => getEntity(entityId, { timeoutMs: requestTimeoutMs }),
+            isConfirmed: confirmed, waitImpl, nowImpl,
+            stopOnError: error => ['home_assistant_unauthorized', 'home_assistant_forbidden',
+                'home_assistant_request_rejected', 'home_assistant_entity_not_found'].includes(error?.code) });
+        if (observation.confirmed)
             return Object.freeze({ success: true, outcome: 'confirmed', state: observation.state, service: 'turn_on' });
-        await waitImpl(3000);
-        observation = await readAfterAction();
-        if (observation.error) {
-            const error = observation.error;
-            if (error?.code === 'home_assistant_entity_not_found' || error?.code === 'home_assistant_entity_unavailable')
-                return Object.freeze({ success: false, outcome: 'device_unavailable', state: null, service: 'turn_on' });
-            return Object.freeze({ success: false, outcome: 'accepted_not_confirmed', state: null, service: 'turn_on',
-                errorCode: error?.code ?? 'home_assistant_request_failed' });
-        }
-        const isConfirmed = confirmed(observation.state);
-        return Object.freeze({ success: isConfirmed, outcome: isConfirmed ? 'confirmed' : 'accepted_not_confirmed',
-            state: observation.state, service: 'turn_on' });
+        const error = observation.error;
+        if (error?.code === 'home_assistant_entity_not_found' || error?.code === 'home_assistant_entity_unavailable')
+            return Object.freeze({ success: false, outcome: 'device_unavailable', state: null, service: 'turn_on' });
+        return Object.freeze({ success: false, outcome: 'accepted_not_confirmed', state: observation.state, service: 'turn_on',
+            ...(error ? { errorCode: error?.code ?? 'home_assistant_request_failed' } : {}) });
     }
     return Object.freeze({ configuration, listAuthorizedLights, getEntity, resolveLightReference, controlLight, applyLightEffect });
 }
@@ -398,3 +377,4 @@ export function createHomeAssistantDiscoveryClient({ environment = process.env, 
 }
 
 export const homeAssistantSafeMessages = SAFE_MESSAGES;
+
