@@ -190,3 +190,17 @@ La vista previa muestra el cuerpo y, debajo, `— Firma Nexa —` con el texto y
 El logo se extrae del DOCX y se integra con `Content-ID` como una única imagen JPEG inline. Microsoft Graph documenta el formato MIME para [sendMail](https://learn.microsoft.com/en-us/graph/api/user-sendmail?view=graph-rest-1.0), [reply](https://learn.microsoft.com/en-us/graph/api/message-reply?view=graph-rest-1.0) y las propiedades [contentId/isInline](https://learn.microsoft.com/en-us/graph/api/resources/fileattachment?view=graph-rest-1.0). Nexa serializa un MIME `multipart/related` localmente y lo envía por los endpoints oficiales; no usa rutas locales ni depende de que el destinatario pueda descargar una imagen externa. El endpoint `reply` conserva el hilo y admite MIME con adjuntos inline, por lo que no hace falta crear/modificar drafts ni pedir `Mail.ReadWrite`. La imagen CID es exclusivamente infraestructura interna de la firma; no se implementa una tool general de adjuntos.
 
 El correo generado continúa saliendo como Jor (o desde el mailbox compartido elegido) con la firma de Nexa. No se modifica Outlook ni se agregan avisos extra de “generado por IA”; la firma ya identifica a Nexa como asistente.
+
+## Home Assistant
+
+Nexa can expose Home Assistant light control through its existing Desktop Runtime tools. In the repository's local `.env` (never commit it), configure:
+
+```dotenv
+NEXA_HOME_ASSISTANT_URL=http://127.0.0.1:8123
+NEXA_HOME_ASSISTANT_TOKEN=your_home_assistant_long_lived_access_token
+NEXA_HOME_ASSISTANT_LIGHTS=light.your_bulb_entity
+# Optional descriptive metadata, restricted to entity IDs already present in the allowlist:
+NEXA_HOME_ASSISTANT_LIGHT_METADATA='[{"entityId":"light.your_bulb_entity","name":"Luz del escritorio","area":"Escritorio","aliases":["lámpara de trabajo"]}]'
+```
+
+Create the long-lived token in Home Assistant under your user profile. Set exact entity IDs in `NEXA_HOME_ASSISTANT_LIGHTS`; multiple explicitly authorized lights may be comma-separated. `NEXA_HOME_ASSISTANT_LIGHT_METADATA` is optional JSON metadata (`entityId`, optional `name`, `area` and `aliases`) for those allowlisted IDs only. Nexa resolves IDs and exact case/diacritic-insensitive names, rooms or aliases; repeated matches return authorized candidates for clarification. A room containing multiple lights never triggers a group action. Without metadata, HA's `friendly_name` remains available and existing one-light configuration works unchanged. Keep the token private and use HTTPS when the connection crosses an untrusted network. The integration uses Home Assistant's REST API and confirms each control request by reading the light state afterward. A successful HTTP service response alone is not reported as a confirmed action.

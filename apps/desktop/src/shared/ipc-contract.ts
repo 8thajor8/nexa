@@ -33,6 +33,18 @@ export const MEMORY_MODE_SET_CHANNEL = "memory:mode:set" as const;
 export const MEMORY_RELATIONSHIP_LEARNING_SET_CHANNEL = "memory:relationship-learning:set" as const;
 export const MEMORY_THIRD_PARTY_LEARNING_SET_CHANNEL = "memory:third-party-learning:set" as const;
 export const MEMORY_CLEAR_ALL_CHANNEL = "memory:clear-all" as const;
+export const HOME_ASSISTANT_LIGHTS_LIST_CHANNEL = "home-assistant:lights:list" as const;
+export const HOME_ASSISTANT_LIGHTS_STATE_CHANNEL = "home-assistant:lights:state" as const;
+export const HOME_ASSISTANT_LIGHT_CONTROL_CHANNEL = "home-assistant:light:control" as const;
+export const HOME_ASSISTANT_LIGHT_EFFECT_CHANNEL = "home-assistant:light:effect" as const;
+export const HOME_ASSISTANT_LIGHTS_DISCOVER_CHANNEL = "home-assistant:lights:discover" as const;
+export const HOME_ASSISTANT_LIGHT_AUTHORIZE_CHANNEL = "home-assistant:light:authorize" as const;
+export const HOME_ASSISTANT_LIGHT_METADATA_UPDATE_CHANNEL = "home-assistant:light:metadata-update" as const;
+export const HOME_ASSISTANT_LIGHT_REMOVE_CHANNEL = "home-assistant:light:remove" as const;
+export const HOME_ASSISTANT_SPEED_CANDIDATES_CHANNEL = "home-assistant:speed:candidates" as const;
+export const HOME_ASSISTANT_SPEED_LINK_CHANNEL = "home-assistant:speed:link" as const;
+export const HOME_ASSISTANT_SPEED_UNLINK_CHANNEL = "home-assistant:speed:unlink" as const;
+export const HOME_ASSISTANT_SPEED_CONTROL_CHANNEL = "home-assistant:speed:control" as const;
 export const AUTHORIZATION_CONNECT_CHANNEL = "authorization:connect" as const;
 export const AUTHORIZATION_CANCEL_CHANNEL = "authorization:cancel" as const;
 export const SPOTIFY_OPEN_TRACK_CHANNEL = "spotify:open-track" as const;
@@ -286,6 +298,110 @@ export interface WeatherDesktopApi {
   getCurrent(location: string): Promise<WeatherCurrentStatus>;
 }
 
+export interface AuthorizedHomeAssistantLight {
+  entityId: string;
+  name?: string;
+  area?: string;
+  aliases?: string[];
+  effectSpeedEntityId?: string;
+}
+export interface DiscoveredHomeAssistantLight {
+  entityId: string;
+  name: string;
+  state: "on" | "off" | "unavailable" | "unknown";
+  available: boolean;
+  capabilities: { brightness: boolean; color: boolean };
+  alreadyAuthorized: boolean;
+}
+export type HomeAssistantAdminError =
+  | "invalid_request" | "home_assistant_light_not_discovered" | "home_assistant_light_not_authorized"
+  | "home_assistant_device_store_invalid" | "home_assistant_device_store_io_error"
+  | "home_assistant_legacy_configuration_invalid" | "home_assistant_device_store_write_failed"
+  | "home_assistant_not_configured" | "home_assistant_configuration_invalid" | "home_assistant_timeout"
+  | "home_assistant_unavailable" | "home_assistant_unauthorized" | "home_assistant_forbidden"
+  | "home_assistant_request_rejected" | "home_assistant_request_failed" | "home_assistant_response_invalid"
+  | "home_assistant_effect_not_supported" | "home_assistant_speed_not_linked" | "home_assistant_speed_link_stale"
+  | "home_assistant_speed_unavailable" | "home_assistant_speed_value_invalid";
+export type HomeAssistantAdminResult<T> = { ok: true; value: T } | { ok: false; error: HomeAssistantAdminError };
+export type HomeAssistantLightState = "on" | "off" | "unavailable" | "unknown";
+export type HomeAssistantLightAction = "turn_on" | "turn_off";
+export interface HomeAssistantUiLight {
+  entityId: string;
+  name: string;
+  area: string | null;
+  aliases: string[];
+  state: HomeAssistantLightState;
+  available: boolean;
+  brightnessPct: number | null;
+  rgbColor: [number, number, number] | null;
+  rgbwColor: [number, number, number, number] | null;
+  colorTemperatureKelvin: number | null;
+  effect: string | null;
+  effectList: string[];
+  capabilities: { brightness: boolean; color: boolean };
+  effectSpeed?: HomeAssistantEffectSpeedState;
+}
+export interface HomeAssistantEffectSpeedState {
+  lightEntityId: string;
+  linked: boolean;
+  available: boolean;
+  stale: boolean;
+  value: number | null;
+  min: number | null;
+  max: number | null;
+  step: number | null;
+  entityName: string | null;
+  error: HomeAssistantAdminError | null;
+}
+export interface HomeAssistantEffectSpeedCandidate {
+  entityId: string;
+  name: string;
+  available: boolean;
+  sameDeviceVerified: true;
+}
+export interface HomeAssistantEffectSpeedInput { lightEntityId: string; value: number; }
+export type HomeAssistantEffectSpeedResult = HomeAssistantAdminResult<{
+  outcome: "confirmed" | "accepted_not_confirmed";
+  state: HomeAssistantEffectSpeedState | null;
+}>;
+export interface HomeAssistantLightControlInput {
+  entityId: string;
+  action: HomeAssistantLightAction;
+  brightnessPct?: number | null;
+  rgbColor?: [number, number, number] | null;
+}
+export type HomeAssistantLightStatesResult = HomeAssistantAdminResult<{ lights: HomeAssistantUiLight[] }>;
+export type HomeAssistantLightControlResult = HomeAssistantAdminResult<{
+  outcome: "confirmed" | "accepted_not_confirmed" | "device_unavailable";
+  light: HomeAssistantUiLight | null;
+}>;
+export interface HomeAssistantLightEffectInput { entityId: string; effect: string; }
+export type HomeAssistantLightEffectResult = HomeAssistantAdminResult<{
+  outcome: "confirmed" | "accepted_not_confirmed" | "device_unavailable";
+  light: HomeAssistantUiLight | null;
+}>;
+export interface HomeAssistantAdminDesktopApi {
+  getAuthorizedLightStates(): Promise<HomeAssistantLightStatesResult>;
+  controlLight(input: HomeAssistantLightControlInput): Promise<HomeAssistantLightControlResult>;
+  applyLightEffect(input: HomeAssistantLightEffectInput): Promise<HomeAssistantLightEffectResult>;
+  listAuthorizedLights(): Promise<HomeAssistantAdminResult<{ authorizedLights: AuthorizedHomeAssistantLight[] }>>;
+  discoverLights(): Promise<HomeAssistantAdminResult<{ lights: DiscoveredHomeAssistantLight[] }>>;
+  authorizeLight(input: { entityId: string; name?: string; area?: string; aliases?: string[] }):
+    Promise<HomeAssistantAdminResult<{ authorizedLights: AuthorizedHomeAssistantLight[]; changed: boolean }>>;
+  updateLightMetadata(input: { entityId: string; name?: string | null; area?: string | null; aliases?: string[] }):
+    Promise<HomeAssistantAdminResult<{ authorizedLights: AuthorizedHomeAssistantLight[] }>>;
+  removeAuthorizedLight(input: { entityId: string }):
+    Promise<HomeAssistantAdminResult<{ authorizedLights: AuthorizedHomeAssistantLight[] }>>;
+  discoverEffectSpeedCandidates(input: { lightEntityId: string }): Promise<HomeAssistantAdminResult<{
+    lightEntityId: string; candidates: HomeAssistantEffectSpeedCandidate[];
+  }>>;
+  linkEffectSpeed(input: { lightEntityId: string; entityId: string }):
+    Promise<HomeAssistantAdminResult<{ authorizedLights: AuthorizedHomeAssistantLight[] }>>;
+  unlinkEffectSpeed(input: { lightEntityId: string }):
+    Promise<HomeAssistantAdminResult<{ authorizedLights: AuthorizedHomeAssistantLight[] }>>;
+  setEffectSpeed(input: HomeAssistantEffectSpeedInput): Promise<HomeAssistantEffectSpeedResult>;
+}
+
 export interface MasterVolumeStatus {
   available: boolean;
   volume: number | null;
@@ -466,6 +582,7 @@ export interface NexaDesktopApi {
   spotify: SpotifyDesktopApi;
   masterVolume: MasterVolumeDesktopApi;
   weather: WeatherDesktopApi;
+  homeAssistant: HomeAssistantAdminDesktopApi;
 }
 
 export interface DesktopDisplayInfo {

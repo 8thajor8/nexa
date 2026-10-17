@@ -49,6 +49,18 @@ import {
   VOICE_PTT_FINISH_CHANNEL,
   VOICE_PTT_START_CHANNEL,
   WEATHER_CURRENT_CHANNEL,
+  HOME_ASSISTANT_LIGHTS_LIST_CHANNEL,
+  HOME_ASSISTANT_LIGHTS_STATE_CHANNEL,
+  HOME_ASSISTANT_LIGHT_CONTROL_CHANNEL,
+  HOME_ASSISTANT_LIGHT_EFFECT_CHANNEL,
+  HOME_ASSISTANT_LIGHTS_DISCOVER_CHANNEL,
+  HOME_ASSISTANT_LIGHT_AUTHORIZE_CHANNEL,
+  HOME_ASSISTANT_LIGHT_METADATA_UPDATE_CHANNEL,
+  HOME_ASSISTANT_LIGHT_REMOVE_CHANNEL,
+  HOME_ASSISTANT_SPEED_CANDIDATES_CHANNEL,
+  HOME_ASSISTANT_SPEED_LINK_CHANNEL,
+  HOME_ASSISTANT_SPEED_UNLINK_CHANNEL,
+  HOME_ASSISTANT_SPEED_CONTROL_CHANNEL,
   MASTER_VOLUME_GET_CHANNEL,
   MASTER_VOLUME_SET_CHANNEL,
   MASTER_VOLUME_EVENT_CHANNEL,
@@ -62,6 +74,15 @@ import {
 } from "./shared/authorization-ipc-validation";
 import { canonicalSpotifyTrackUrl } from "./shared/spotify-link-validation";
 import { isWeatherCurrentStatus, isWeatherLocation } from "./shared/weather-ipc-validation";
+import {
+  isHomeAssistantAuthorizeRequest, isHomeAssistantMetadataUpdateRequest, isHomeAssistantRemoveRequest,
+  isHomeAssistantAuthorizedLightsResult, isHomeAssistantDiscoveryResult, isHomeAssistantAuthorizationResult,
+  isHomeAssistantSpeedCandidatesRequest, isHomeAssistantSpeedCandidatesResult, isHomeAssistantSpeedLinkRequest,
+  isHomeAssistantSpeedUnlinkRequest,
+} from "./shared/home-assistant-ipc-validation";
+import { isHomeAssistantLightControlInput, isHomeAssistantLightControlResult, isHomeAssistantLightEffectInput,
+  isHomeAssistantLightEffectResult, isHomeAssistantLightStatesResult, isHomeAssistantEffectSpeedInput,
+  isHomeAssistantEffectSpeedResult } from "./shared/home-assistant-ui-validation";
 import { isMasterVolumePercent, isMasterVolumeStatus } from "./shared/master-volume-ipc-validation";
 import { isWindowPreferences, isWindowSettingsSnapshot } from "./shared/window-settings-validation";
 import {
@@ -408,6 +429,77 @@ const api: NexaDesktopApi = {
       if (!isWeatherLocation(location)) throw new Error("invalid_weather_location");
       const response: unknown = await ipcRenderer.invoke(WEATHER_CURRENT_CHANNEL, location.trim());
       if (!isWeatherCurrentStatus(response)) throw new Error("invalid_weather_status_response");
+      return response;
+    },
+  },
+  homeAssistant: {
+    async getAuthorizedLightStates() {
+      const response: unknown = await ipcRenderer.invoke(HOME_ASSISTANT_LIGHTS_STATE_CHANNEL);
+      if (!isHomeAssistantLightStatesResult(response)) throw new Error("invalid_home_assistant_light_states_response");
+      return response;
+    },
+    async controlLight(input) {
+      if (!isHomeAssistantLightControlInput(input)) throw new Error("invalid_home_assistant_light_control_request");
+      const response: unknown = await ipcRenderer.invoke(HOME_ASSISTANT_LIGHT_CONTROL_CHANNEL, input);
+      if (!isHomeAssistantLightControlResult(response)) throw new Error("invalid_home_assistant_light_control_response");
+      return response;
+    },
+    async applyLightEffect(input) {
+      if (!isHomeAssistantLightEffectInput(input)) throw new Error("invalid_home_assistant_light_effect_request");
+      const response: unknown = await ipcRenderer.invoke(HOME_ASSISTANT_LIGHT_EFFECT_CHANNEL, input);
+      if (!isHomeAssistantLightEffectResult(response)) throw new Error("invalid_home_assistant_light_effect_response");
+      return response;
+    },
+    async listAuthorizedLights() {
+      const response: unknown = await ipcRenderer.invoke(HOME_ASSISTANT_LIGHTS_LIST_CHANNEL);
+      if (!isHomeAssistantAuthorizedLightsResult(response)) throw new Error("invalid_home_assistant_lights_response");
+      return response;
+    },
+    async discoverLights() {
+      const response: unknown = await ipcRenderer.invoke(HOME_ASSISTANT_LIGHTS_DISCOVER_CHANNEL);
+      if (!isHomeAssistantDiscoveryResult(response)) throw new Error("invalid_home_assistant_discovery_response");
+      return response;
+    },
+    async authorizeLight(input) {
+      if (!isHomeAssistantAuthorizeRequest(input)) throw new Error("invalid_home_assistant_authorize_request");
+      const response: unknown = await ipcRenderer.invoke(HOME_ASSISTANT_LIGHT_AUTHORIZE_CHANNEL, input);
+      if (!isHomeAssistantAuthorizationResult(response)) throw new Error("invalid_home_assistant_authorize_response");
+      return response;
+    },
+    async updateLightMetadata(input) {
+      if (!isHomeAssistantMetadataUpdateRequest(input)) throw new Error("invalid_home_assistant_metadata_request");
+      const response: unknown = await ipcRenderer.invoke(HOME_ASSISTANT_LIGHT_METADATA_UPDATE_CHANNEL, input);
+      if (!isHomeAssistantAuthorizedLightsResult(response)) throw new Error("invalid_home_assistant_metadata_response");
+      return response;
+    },
+    async removeAuthorizedLight(input) {
+      if (!isHomeAssistantRemoveRequest(input)) throw new Error("invalid_home_assistant_remove_request");
+      const response: unknown = await ipcRenderer.invoke(HOME_ASSISTANT_LIGHT_REMOVE_CHANNEL, input);
+      if (!isHomeAssistantAuthorizedLightsResult(response)) throw new Error("invalid_home_assistant_remove_response");
+      return response;
+    },
+    async discoverEffectSpeedCandidates(input) {
+      if (!isHomeAssistantSpeedCandidatesRequest(input)) throw new Error("invalid_home_assistant_speed_candidates_request");
+      const response: unknown = await ipcRenderer.invoke(HOME_ASSISTANT_SPEED_CANDIDATES_CHANNEL, input);
+      if (!isHomeAssistantSpeedCandidatesResult(response)) throw new Error("invalid_home_assistant_speed_candidates_response");
+      return response;
+    },
+    async linkEffectSpeed(input) {
+      if (!isHomeAssistantSpeedLinkRequest(input)) throw new Error("invalid_home_assistant_speed_link_request");
+      const response: unknown = await ipcRenderer.invoke(HOME_ASSISTANT_SPEED_LINK_CHANNEL, input);
+      if (!isHomeAssistantAuthorizedLightsResult(response)) throw new Error("invalid_home_assistant_speed_link_response");
+      return response;
+    },
+    async unlinkEffectSpeed(input) {
+      if (!isHomeAssistantSpeedUnlinkRequest(input)) throw new Error("invalid_home_assistant_speed_unlink_request");
+      const response: unknown = await ipcRenderer.invoke(HOME_ASSISTANT_SPEED_UNLINK_CHANNEL, input);
+      if (!isHomeAssistantAuthorizedLightsResult(response)) throw new Error("invalid_home_assistant_speed_unlink_response");
+      return response;
+    },
+    async setEffectSpeed(input) {
+      if (!isHomeAssistantEffectSpeedInput(input)) throw new Error("invalid_home_assistant_speed_control_request");
+      const response: unknown = await ipcRenderer.invoke(HOME_ASSISTANT_SPEED_CONTROL_CHANNEL, input);
+      if (!isHomeAssistantEffectSpeedResult(response)) throw new Error("invalid_home_assistant_speed_control_response");
       return response;
     },
   },

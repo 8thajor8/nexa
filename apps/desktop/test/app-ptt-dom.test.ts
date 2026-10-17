@@ -3,7 +3,7 @@
 import { createElement, StrictMode } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { NexaDesktopApi, VoiceEventEnvelope } from "../src/shared/ipc-contract";
+import type { HomeAssistantUiLight, NexaDesktopApi, VoiceEventEnvelope } from "../src/shared/ipc-contract";
 import App from "../src/renderer/App";
 import type { PttVoiceController, PttVoiceSnapshot } from "../src/renderer/voice/ptt-voice-controller";
 import { MicrophoneDeviceStore } from "../src/renderer/audio/microphone-device-store";
@@ -161,6 +161,24 @@ afterEach(() => {
 });
 
 describe("App PTT DOM integration", () => {
+  it("keeps the same shared CommandHeader mounted through Command Center, Conversations, and Home", async () => {
+    vi.stubGlobal("matchMedia", () => ({ matches: true }));
+    await mountApp();
+    const header = screen.getByRole("banner", { name: "Nexa Command Center" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Home" }));
+    await screen.findByRole("heading", { name: "Luces autorizadas" });
+    expect(screen.getByRole("banner", { name: "Nexa Command Center" })).toBe(header);
+
+    fireEvent.click(screen.getByRole("button", { name: "Conversations" }));
+    await waitFor(() => expect(document.querySelector(".workspace-grid--conversations")).toBeTruthy());
+    expect(screen.getByRole("banner", { name: "Nexa Command Center" })).toBe(header);
+
+    fireEvent.click(screen.getByRole("button", { name: "Command Center" }));
+    await waitFor(() => expect(document.querySelector(".workspace-grid--conversations")).toBeNull());
+    expect(screen.getByRole("banner", { name: "Nexa Command Center" })).toBe(header);
+  });
+
   it("skips automatic Chat, Weather and Spotify IPC initialization in isolated mode", async () => {
     Object.defineProperty(bridge, "isIsolated", { value: true, configurable: true });
     await mountApp();
@@ -178,6 +196,34 @@ describe("App PTT DOM integration", () => {
     expect(bridge.weather.getCurrent).toHaveBeenCalled();
     expect(bridge.spotify.getLiveStatus).toHaveBeenCalled();
     expect(bridge.masterVolume.get).toHaveBeenCalled();
+  });
+
+  it("recovers from a rejected Home Assistant control IPC and leaves the light retryable", async () => {
+    const homeLight: HomeAssistantUiLight = { entityId: "light.office", name: "Desk lamp", area: "Study", aliases: [],
+      state: "off", available: true, brightnessPct: 60, rgbColor: [25, 30, 40], rgbwColor: null,
+      colorTemperatureKelvin: null, effect: null, effectList: [],
+      capabilities: { brightness: true, color: true } };
+    const controlLight = vi.fn().mockRejectedValue(new Error("synthetic IPC rejection"));
+    Object.assign(bridge, { homeAssistant: {
+      getAuthorizedLightStates: vi.fn(async () => ({ ok: true as const, value: { lights: [homeLight] } })),
+      controlLight,
+      applyLightEffect: vi.fn(async () => ({ ok: true as const, value: { outcome: "confirmed" as const, light: homeLight } })),
+      listAuthorizedLights: vi.fn(async () => ({ ok: true as const, value: { authorizedLights: [] } })),
+      discoverLights: vi.fn(async () => ({ ok: true as const, value: { lights: [] } })),
+      authorizeLight: vi.fn(async () => ({ ok: true as const, value: { authorizedLights: [], changed: false } })),
+      updateLightMetadata: vi.fn(async () => ({ ok: true as const, value: { authorizedLights: [] } })),
+      removeAuthorizedLight: vi.fn(async () => ({ ok: true as const, value: { authorizedLights: [] } })),
+    } });
+    await mountApp();
+    fireEvent.click(screen.getByRole("button", { name: "Home" }));
+    expect(screen.getByLabelText("Nexa Command Center")).toBeTruthy();
+    const toggle = await screen.findByRole("switch", { name: "Luz Desk lamp" });
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(screen.getByText("Error")).toBeTruthy());
+    await waitFor(() => expect((screen.getByRole("switch", { name: "Luz Desk lamp" }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole("switch", { name: "Luz Desk lamp" }));
+    await waitFor(() => expect(controlLight).toHaveBeenCalledTimes(2));
   });
 
   it("moves side panels before expansion and contracts before their return", async () => {

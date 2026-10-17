@@ -8,6 +8,7 @@ import { whatsappRegistrations } from '../integrations/whatsapp/index.js';
 import { speechRegistrations } from '../speech/index.js';
 import { communicationsRegistrations } from '../communications/tools.js';
 import { lifeguardRegistrations } from './lifeguard.js';
+import { homeAssistantRegistrations } from './home-assistant.js';
 import {
     closeWindowRegistration,
     focusWindowRegistration,
@@ -69,6 +70,7 @@ const localRegistrations = [
     ...speechRegistrations,
     ...communicationsRegistrations,
     ...lifeguardRegistrations,
+    ...homeAssistantRegistrations,
     ...spotifyRegistrations,
 ].map(registration => ({
     ...registration,
@@ -122,40 +124,37 @@ export function getToolsForModel(policy = defaultPermissionPolicy) {
 
 export const tools = getToolsForModel();
 
-export async function executeTool(name, args, context) {
-    const registration = localToolRegistry.get(name);
+function createExecutor(registry) {
+    return async function executeRegisteredTool(name, args, context) {
+        const registration = registry.get(name);
+        if (!registration) throw new Error(`Herramienta desconocida: ${name}`);
+        if (disabledLegacyMemoryWriteTools.has(name)) {
+            return { success: false, error: { code: 'memory1_write_disabled',
+                message: 'Las escrituras heredadas de Memory1 est\u00e1n deshabilitadas; no se modific\u00f3 ning\u00fan recuerdo.' },
+                permission: registration.permission };
+        }
+        const permission = checkToolPermission(registration, context?.permissionPolicy);
+        try {
+            context?.diagnostic?.('tool_permission', { tool: name, permission: permission.permission,
+                allowed: permission.allowed, reason: permission.reason });
+        } catch { /* Diagnostics must not change tool authorization or execution. */ }
+        if (!permission.allowed) return { success: false, error: { code: permission.reason,
+            message: `La pol\u00edtica de permisos no permite ejecutar ${name}.` }, permission: permission.permission };
+        return registration.execute({ ...context, args });
+    };
+}
 
-    if (!registration) {
-        throw new Error(`Herramienta desconocida: ${name}`);
+export const executeTool = createExecutor(localToolRegistry);
+
+/** Create a dispatcher with trusted host registrations replacing named defaults. */
+export function createToolExecutor(registrationOverrides = []) {
+    if (!Array.isArray(registrationOverrides)) throw new TypeError('tool_registration_overrides_invalid');
+    const registry = new Map(localToolRegistry);
+    for (const candidate of registrationOverrides) {
+        const name = candidate?.definition?.name;
+        if (typeof name !== 'string' || !localToolRegistry.has(name) || typeof candidate.execute !== 'function')
+            throw new TypeError('tool_registration_override_invalid');
+        registry.set(name, Object.freeze({ ...candidate, permission: toolPermissions[name] }));
     }
-
-    if (disabledLegacyMemoryWriteTools.has(name)) {
-        return {
-            success: false,
-            error: {
-                code: 'memory1_write_disabled',
-                message: 'Las escrituras heredadas de Memory1 están deshabilitadas; no se modificó ningún recuerdo.',
-            },
-            permission: registration.permission,
-        };
-    }
-
-    const permission = checkToolPermission(registration, context?.permissionPolicy);
-    try {
-        context?.diagnostic?.('tool_permission', { tool: name, permission: permission.permission,
-            allowed: permission.allowed, reason: permission.reason });
-    } catch { /* Diagnostics must not change tool authorization or execution. */ }
-
-    if (!permission.allowed) {
-        return {
-            success: false,
-            error: {
-                code: permission.reason,
-                message: `La política de permisos no permite ejecutar ${name}.`,
-            },
-            permission: permission.permission,
-        };
-    }
-
-    return registration.execute({ ...context, args });
+    return createExecutor(registry);
 }

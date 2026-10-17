@@ -1,13 +1,7 @@
-import { availableToolsMock, recentActivityMock, systemStatusMock } from "../data/dashboard-mock";
+import { availableToolsMock, systemStatusMock } from "../data/dashboard-mock";
 import { HolographicFrame } from "./HolographicFrame";
 import type { CSSProperties } from "react";
-import type { MasterVolumeStatus, SpotifyLiveStatus, SpotifyPlaybackControl } from "../../shared/ipc-contract";
-
-function ActivityGlyph({ icon }: { icon: (typeof recentActivityMock)[number]["icon"] }) {
-  if (icon === "window") return <svg viewBox="0 0 20 20"><rect x="3" y="4" width="14" height="12" rx="1.5" /><path d="M3 7h14" /></svg>;
-  if (icon === "ipc") return <svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="6.5" /><path d="M6.5 10h7M10 6.5v7" /></svg>;
-  return <svg viewBox="0 0 20 20"><path d="M10 3v8m-3-3 3 3 3-3M4 13v3h12v-3" /></svg>;
-}
+import type { HomeAssistantUiLight, MasterVolumeStatus, SpotifyLiveStatus, SpotifyPlaybackControl } from "../../shared/ipc-contract";
 
 function ModuleHeading({ id, title, label }: { id: string; title: string; label: string }) {
   return (
@@ -29,6 +23,14 @@ interface DashboardModulesProps {
   onOpenSpotifyTrack?: (url: string) => void;
   voiceRepliesEnabled?: boolean;
   onVoiceRepliesChange?: (enabled: boolean) => void;
+  homeLights?: HomeAssistantUiLight[];
+  homeLoading?: boolean;
+  homeError?: string | null;
+  homeBusyEntities?: ReadonlySet<string>;
+  homeOutcomes?: Readonly<Record<string, string>>;
+  onHomeToggle?: (light: HomeAssistantUiLight) => void;
+  onOpenHome?: () => void;
+  onRefreshHome?: () => void;
   className?: string;
   isHidden?: boolean;
 }
@@ -72,22 +74,36 @@ function SpotifyMiniPlayer({ status, busyAction, error, onControl, onOpenTrack }
 
 export function DashboardModules({ assistantState, spotifyStatus, spotifyBusyAction = null, spotifyError = null,
   masterVolume = { available: false, volume: null, errorCode: "device_unavailable" }, onMasterVolumeChange,
-  onSpotifyControl, onOpenSpotifyTrack, voiceRepliesEnabled = false, onVoiceRepliesChange, className = "", isHidden = false }: DashboardModulesProps) {
+  onSpotifyControl, onOpenSpotifyTrack, voiceRepliesEnabled = false, onVoiceRepliesChange, homeLights = [], homeLoading = false,
+  homeError = null, homeBusyEntities = new Set<string>(), homeOutcomes = {}, onHomeToggle, onOpenHome, onRefreshHome,
+  className = "", isHidden = false }: DashboardModulesProps) {
   return (
     <section className={`dashboard-modules${className ? ` ${className}` : ""}`} aria-label="Módulos del Command Center"
       aria-hidden={isHidden} inert={isHidden}>
-      <section className="dashboard-module surface-panel" aria-labelledby="activity-title">
+      <section className="dashboard-module surface-panel" aria-labelledby="nexa-home-mini-title">
         <HolographicFrame />
-        <ModuleHeading id="activity-title" title="Actividad reciente" label="DEMO · MOCK" />
-        <ul className="activity-list" aria-label="Eventos de ejemplo">
-          {recentActivityMock.map((item) => (
-            <li className="activity-item" key={item.id}>
-              <span className={`activity-icon activity-icon--${item.icon}`} aria-hidden="true"><ActivityGlyph icon={item.icon} /></span>
-              <span className="activity-copy"><strong>{item.label}</strong><small>{item.detail}</small></span>
-              <time>{item.time}</time>
-            </li>
-          ))}
-        </ul>
+        <ModuleHeading id="nexa-home-mini-title" title="Nexa Home" label="" />
+        <button type="button" className="home-mini-open" onClick={onOpenHome} aria-label="Abrir Home">Abrir Home ↗</button>
+        <div className="home-mini-list" aria-label="Luces autorizadas" aria-busy={homeLoading}>
+          {homeLoading && homeLights.length === 0 && <p className="home-mini-empty">Consultando luces…</p>}
+          {!homeLoading && homeLights.length === 0 && <p className="home-mini-empty">{homeError ?? "No hay luces autorizadas."}</p>}
+          {homeLights.map(light => {
+            const busy = homeBusyEntities.has(light.entityId);
+            const stateLabel = busy ? "Ejecutando…" : !light.available ? "No disponible"
+              : light.state === "on" ? "Encendida" : light.state === "off" ? "Apagada" : "Estado desconocido";
+            return <div className="home-mini-item" key={light.entityId}>
+              <div className="home-mini-copy"><strong title={light.name}>{light.name}</strong>
+                <small>{light.area ?? "Sin habitación"} · {homeOutcomes[light.entityId] ?? stateLabel}</small></div>
+              <button type="button" className="home-switch" role="switch" aria-label={"Luz " + light.name}
+                aria-checked={light.state === "on"} aria-busy={busy} disabled={!light.available || busy}
+                onClick={() => onHomeToggle?.(light)} title={!light.available ? "Luz no disponible" : busy ? "Ejecutando operación" : "Cambiar " + light.name}>
+                <span />
+              </button>
+            </div>;
+          })}
+          {homeError && homeLights.length > 0 && <p className="home-mini-error" role="alert">{homeError}</p>}
+        </div>
+        <button type="button" className="home-mini-refresh" onClick={onRefreshHome} disabled={homeLoading}>Actualizar</button>
       </section>
 
       <section className="dashboard-module dashboard-module--tools surface-panel" aria-labelledby="tools-title">

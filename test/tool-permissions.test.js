@@ -70,6 +70,9 @@ test('existing local tools declare their intended permissions', () => {
         prepare_calendar_event_cancel: 'action',
         lifeguard_search_incidents: 'external_read',
         lifeguard_read_incident: 'external_read',
+        home_list_authorized_lights: 'read',
+        home_get_light_state: 'read',
+        home_control_light: 'action',
     });
 
     for (const registration of localToolRegistry.values()) {

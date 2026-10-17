@@ -66,6 +66,18 @@ import { beginChatRuntimeSwitch, cleanupChatWindow, endChatRuntimeSwitch, refres
 import { isApprovedSyntheticStore, isReadableMemory2Store, registerMemoryModeIpcHandlers } from "./memory-mode-ipc.js";
 import { createMemoryModePreferencesStore, resolveInitialDesktopMemoryMode, type MemoryModeFallbackReason } from "./memory-mode-preferences.js";
 import { createOrganicMemoryPreferencesStore } from "./organic-memory-preferences.js";
+import { createHomeAssistantLightsStore } from "./home-assistant-lights-store.js";
+import { createHomeAssistantDeviceAdmin } from "./home-assistant-device-admin.js";
+import { registerHomeAssistantIpcHandlers, removeHomeAssistantIpcHandlers } from "./home-assistant-ipc.js";
+import { registerHomeAssistantControlIpcHandlers, removeHomeAssistantControlIpcHandlers } from "./home-assistant-control-ipc.js";
+// @ts-expect-error The shared Home Assistant client is JavaScript and intentionally has no declaration file.
+import { createHomeAssistantClient, createHomeAssistantDiscoveryClient } from "../../../../src/integrations/home-assistant/client.js";
+// @ts-expect-error The shared Home Assistant client is JavaScript and intentionally has no declaration file.
+import { createHomeAssistantEffectSpeedClient } from "../../../../src/integrations/home-assistant/effect-speed.js";
+// @ts-expect-error The shared Home Assistant tool registrations are JavaScript and intentionally have no declaration file.
+import { createHomeAssistantRegistrations, createHomeAssistantToolSelector } from "../../../../src/tools/home-assistant.js";
+// @ts-expect-error The shared tool registry is JavaScript and intentionally has no declaration file.
+import { createToolExecutor, getToolsForModel } from "../../../../src/tools/index.js";
 import {
   cleanupVoiceWindow,
   cancelVoiceSpeech,
@@ -269,6 +281,17 @@ let runtimeClosed = false;
 const windowPreferencesStore = createWindowPreferencesStore(app.getPath("userData"));
 const memoryModePreferencesStore = createMemoryModePreferencesStore(app.getPath("userData"));
 const organicMemoryPreferencesStore = createOrganicMemoryPreferencesStore(app.getPath("userData"));
+const homeAssistantLightsStore = createHomeAssistantLightsStore(app.getPath("userData"), { environment: process.env });
+const homeAssistantLightsStoreStatus = homeAssistantLightsStore.read();
+if (!homeAssistantLightsStoreStatus.ok) {
+  console.warn("[nexa-desktop] Home Assistant light registry unavailable", { error: homeAssistantLightsStoreStatus.error });
+}
+const homeAssistantEffectSpeedClient = createHomeAssistantEffectSpeedClient({ environment: process.env,
+  authorizedLightsProvider: () => homeAssistantLightsStore.read() });
+const homeAssistantDeviceAdmin = createHomeAssistantDeviceAdmin({ store: homeAssistantLightsStore,
+  discoveryClient: createHomeAssistantDiscoveryClient(), speedClient: homeAssistantEffectSpeedClient });
+const homeAssistantUiClient = createHomeAssistantClient({ environment: process.env,
+  authorizedLightsProvider: () => homeAssistantLightsStore.read() });
 const conversationStore = createConversationStore({ baseDirectory: resolve(app.getPath("userData"), "conversation-store") });
 
 function windowDisplays() {
@@ -280,9 +303,15 @@ function createDesktopConversationRuntime(memoryMode: "memory1" | "memory2-reado
     ? createDesktopOrganicMemoryHost({ storePath,
       relationshipLearningEnabled: organicMemoryPreferencesStore.readRelationshipLearningEnabled(),
       thirdPartyLearningEnabled: organicMemoryPreferencesStore.readThirdPartyLearningEnabled() }) : null;
+  const homeAssistantAuthorizationProvider = () => homeAssistantLightsStore.read();
+  const homeAssistantClient = createHomeAssistantClient({ environment: process.env,
+    authorizedLightsProvider: homeAssistantAuthorizationProvider });
+  const homeAssistantRuntimeExecutor = createToolExecutor(createHomeAssistantRegistrations(homeAssistantClient));
+  const getDesktopTools = createHomeAssistantToolSelector({ getTools: getToolsForModel,
+    authorizationProvider: homeAssistantAuthorizationProvider });
   const agentOptions = !startupPolicy.allowRuntimeTools
     ? { getTools: () => [], ask: async () => { throw new Error("desktop_isolation_provider_disabled"); }, logger: writeAgentTrace }
-    : { logger: writeAgentTrace };
+    : { getTools: getDesktopTools, logger: writeAgentTrace, execute: homeAssistantRuntimeExecutor };
   const runtime = createConversationRuntime({
     memoryMode,
     streamResponses: true,
@@ -749,6 +778,8 @@ function installWebContentsGuards(): void {
       onTrace: (details) => writeSafeTrace("audio", details.outcome === "failed" ? "master_volume_ipc_error" : "master_volume_diagnostic", details),
     });
     registerWeatherIpcHandler(() => mainWindow);
+    registerHomeAssistantIpcHandlers(() => mainWindow, homeAssistantDeviceAdmin);
+    registerHomeAssistantControlIpcHandlers(() => mainWindow, homeAssistantUiClient, undefined, homeAssistantEffectSpeedClient);
     ipcMain.handle(SPOTIFY_OPEN_TRACK_CHANNEL, async (event, value: unknown) => {
       if (!mainWindow || !isTrustedIpcSender(event as never, mainWindow as never)) throw new Error("untrusted_ipc_sender");
       const url = canonicalSpotifyTrackUrl(value);
@@ -990,6 +1021,8 @@ app.on("before-quit", (event) => {
     return;
   }
   removeWeatherIpcHandler();
+  removeHomeAssistantIpcHandlers();
+  removeHomeAssistantControlIpcHandlers();
   ipcMain.removeHandler(PING_CHANNEL);
   ipcMain.removeHandler(SPOTIFY_OPEN_TRACK_CHANNEL);
   ipcMain.removeHandler(GET_WALLPAPER_CHANNEL);

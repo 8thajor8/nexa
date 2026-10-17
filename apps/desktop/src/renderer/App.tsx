@@ -3,7 +3,7 @@ import type { TransitionEvent } from "react";
 import type { AuthorizationProvider, ChatAuthorizationRequirement, ChatConversationListCursor, ChatConversationSummary,
   ChatEventEnvelope, ChatIpcErrorCode, ChatMessageCursor, DesktopMemoryMode,
   DesktopMemoryModeResult, MasterVolumeStatus, SpotifyLiveStatus, SpotifyPlaybackControl, SpotifyNowPlayingCard, VoiceSpeechErrorCode,
-  VoiceSpeechEvent, VoiceChatTimingOrigin, VoiceChatTimingPhase, WeatherCurrentStatus } from "../shared/ipc-contract";
+  VoiceSpeechEvent, VoiceChatTimingOrigin, VoiceChatTimingPhase, WeatherCurrentStatus, HomeAssistantUiLight } from "../shared/ipc-contract";
 import { ASSISTANT_STATE_LABELS, createMockAssistantStateProvider } from "../shared/assistant-state";
 import { loadDesktopPreferences, saveDesktopPreferences, type DesktopPreferences } from "./desktop-preferences";
 import type { PttVoiceControllerPort, PttVoiceSnapshot, PttVoiceStatus } from "./voice/ptt-voice-controller";
@@ -16,12 +16,13 @@ import { WindowChrome } from "./components/WindowChrome";
 import { DashboardModules } from "./components/DashboardModules";
 import { CommandHeader } from "./components/CommandHeader";
 import { SettingsModal } from "./components/SettingsModal";
+import { HomeAssistantPanel } from "./components/HomeAssistantPanel";
 import { welcomeGreeting } from "./conversation-welcome";
 import type { MicrophoneDeviceStore } from "./audio/microphone-device-store";
 
 interface AppProps { voiceController: PttVoiceControllerPort; microphoneDevices: MicrophoneDeviceStore; }
 
-type WorkspacePhase = "command" | "preparing-exit" | "exiting" | "expanding" | "conversations"
+type WorkspacePhase = "command" | "home" | "preparing-exit" | "exiting" | "expanding" | "conversations"
   | "contracting" | "preparing-entry" | "entering";
 
 function nextWorkspacePhase(phase: WorkspacePhase): WorkspacePhase {
@@ -91,11 +92,11 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const isSyntheticOrganicPilot = window.nexaDesktop.isSyntheticOrganicPilot;
   const [preferences, setPreferences] = useState<DesktopPreferences>(() => loadDesktopPreferences());
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [activeView, setActiveView] = useState<"command" | "conversations">("command");
+  const [activeView, setActiveView] = useState<"command" | "conversations" | "home">("command");
   const [workspacePhase, setWorkspacePhase] = useState<WorkspacePhase>("command");
   const conversationLayout = ["expanding", "conversations", "contracting", "preparing-entry"].includes(workspacePhase);
   const workspaceExpanded = ["expanding", "conversations"].includes(workspacePhase);
-  const sidePanelsOffscreen = ["exiting", "expanding", "conversations", "contracting", "preparing-entry"].includes(workspacePhase);
+  const sidePanelsOffscreen = ["home", "exiting", "expanding", "conversations", "contracting", "preparing-entry"].includes(workspacePhase);
   const sidePanelsMoving = ["preparing-exit", "exiting", "preparing-entry", "entering"].includes(workspacePhase);
 
   const navigateWorkspace = useCallback((view: "command" | "conversations") => {
@@ -105,6 +106,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       return;
     }
     setWorkspacePhase((phase) => {
+      if (phase === "home") return view;
       if (view === "conversations") {
         if (phase === "command") return "preparing-exit";
         if (phase === "entering") return "exiting";
@@ -119,6 +121,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     });
   }, []);
 
+  const openHome = useCallback(() => { setActiveView("home"); setWorkspacePhase("home"); }, []);
   useEffect(() => {
     const preference = window.matchMedia?.("(prefers-reduced-motion: reduce)");
     if (!preference?.addEventListener) return;
@@ -199,6 +202,14 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
   const [spotifyControlBusy, setSpotifyControlBusy] = useState<SpotifyPlaybackControl | null>(null);
   const [spotifyControlError, setSpotifyControlError] = useState<string | null>(null);
   const [masterVolume, setMasterVolume] = useState<MasterVolumeStatus>({ available: false, volume: null, errorCode: "device_unavailable" });
+  const [homeLights, setHomeLights] = useState<HomeAssistantUiLight[]>([]);
+  const [homeLoading, setHomeLoading] = useState(true);
+  const [homeError, setHomeError] = useState<string | null>(null);
+  const [homeBusyEntities, setHomeBusyEntities] = useState<Set<string>>(() => new Set());
+  const [homeOutcomes, setHomeOutcomes] = useState<Record<string, string>>({});
+  const homeControlLocks = useRef(new Map<string, { promise: Promise<void>; release: () => void }>());
+  const homeLightAvailability = useRef(new Map<string, boolean>());
+  homeLightAvailability.current = new Map(homeLights.map(light => [light.entityId, light.available]));
   const masterVolumeTimer = useRef<number | null>(null);
   const pendingMasterVolume = useRef<number | null>(null);
   const [chatConversationId, setChatConversationId] = useState<string | null>(null);
@@ -989,6 +1000,86 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
     return () => { mounted = false; unsubscribe(); };
   }, [isIsolated]);
 
+  const refreshHomeLights = useCallback(async () => {
+    if (isIsolated || !window.nexaDesktop?.homeAssistant?.getAuthorizedLightStates) {
+      setHomeLights([]); setHomeLoading(false); return;
+    }
+    setHomeLoading(true); setHomeError(null);
+    try {
+      const result = await window.nexaDesktop.homeAssistant.getAuthorizedLightStates();
+      if (result.ok) setHomeLights(result.value.lights);
+      else { setHomeError(result.error); if (result.error.includes("store")) setHomeLights([]); }
+    } catch { setHomeError("home_assistant_unavailable"); }
+    finally { setHomeLoading(false); }
+  }, [isIsolated]);
+  useEffect(() => { void refreshHomeLights(); }, [refreshHomeLights]);
+  const controlHomeLight = useCallback(async (light: HomeAssistantUiLight,
+    control: { action: "turn_on" | "turn_off"; brightnessPct?: number; rgbColor?: [number, number, number] }) => {
+    while (homeControlLocks.current.has(light.entityId)) await homeControlLocks.current.get(light.entityId)!.promise;
+    if (!homeLightAvailability.current.get(light.entityId)) return;
+    let release!: () => void;
+    const promise = new Promise<void>(resolve => { release = resolve; });
+    homeControlLocks.current.set(light.entityId, { promise, release });
+    setHomeBusyEntities(current => new Set(current).add(light.entityId));
+    setHomeOutcomes(current => ({ ...current, [light.entityId]: "Ejecutando operación…" }));
+    setHomeError(null);
+    try {
+      const result = await window.nexaDesktop.homeAssistant.controlLight({ entityId: light.entityId, ...control });
+      if (!result.ok) {
+        setHomeOutcomes(current => ({ ...current, [light.entityId]: "Error" }));
+        setHomeError(result.error);
+      } else {
+        const labels = { confirmed: "Cambio confirmado", accepted_not_confirmed: "Solicitud aceptada; estado sin confirmar",
+          device_unavailable: "No disponible" };
+        setHomeOutcomes(current => ({ ...current, [light.entityId]: labels[result.value.outcome] }));
+        if (result.value.light)
+          setHomeLights(current => current.map(item => item.entityId === light.entityId ? result.value.light! : item));
+        if (result.value.outcome === "device_unavailable")
+          setHomeLights(current => current.map(item => item.entityId === light.entityId ? { ...item, available: false, state: "unavailable" } : item));
+      }
+      await refreshHomeLights();
+    } catch {
+      setHomeOutcomes(current => ({ ...current, [light.entityId]: "Error" }));
+      setHomeError("home_assistant_request_failed");
+    } finally {
+      if (homeControlLocks.current.get(light.entityId)?.promise === promise) homeControlLocks.current.delete(light.entityId);
+      release();
+      setHomeBusyEntities(current => { const next = new Set(current); next.delete(light.entityId); return next; });
+    }
+  }, [refreshHomeLights]);
+  const applyHomeLightEffect = useCallback(async (light: HomeAssistantUiLight, effect: string) => {
+    while (homeControlLocks.current.has(light.entityId)) await homeControlLocks.current.get(light.entityId)!.promise;
+    if (!homeLightAvailability.current.get(light.entityId)) return;
+    let release!: () => void;
+    const promise = new Promise<void>(resolve => { release = resolve; });
+    homeControlLocks.current.set(light.entityId, { promise, release });
+    setHomeBusyEntities(current => new Set(current).add(light.entityId));
+    setHomeOutcomes(current => ({ ...current, [light.entityId]: "Aplicando efecto…" }));
+    setHomeError(null);
+    try {
+      const result = await window.nexaDesktop.homeAssistant.applyLightEffect({ entityId: light.entityId, effect });
+      if (!result.ok) {
+        setHomeOutcomes(current => ({ ...current, [light.entityId]: "Error" }));
+        setHomeError(result.error);
+      } else {
+        const labels = { confirmed: `Efecto confirmado: ${effect}`, accepted_not_confirmed: "Efecto aceptado; estado sin confirmar",
+          device_unavailable: "No disponible" };
+        setHomeOutcomes(current => ({ ...current, [light.entityId]: labels[result.value.outcome] }));
+        if (result.value.light)
+          setHomeLights(current => current.map(item => item.entityId === light.entityId ? result.value.light! : item));
+        if (result.value.outcome === "device_unavailable")
+          setHomeLights(current => current.map(item => item.entityId === light.entityId ? { ...item, available: false, state: "unavailable" } : item));
+      }
+      await refreshHomeLights();
+    } catch {
+      setHomeOutcomes(current => ({ ...current, [light.entityId]: "Error" }));
+      setHomeError("home_assistant_request_failed");
+    } finally {
+      if (homeControlLocks.current.get(light.entityId)?.promise === promise) homeControlLocks.current.delete(light.entityId);
+      release();
+      setHomeBusyEntities(current => { const next = new Set(current); next.delete(light.entityId); return next; });
+    }
+  }, [refreshHomeLights]);
   const updateMasterVolume = useCallback((value: number) => {
     pendingMasterVolume.current = value;
     setMasterVolume((current) => current.available ? { ...current, volume: value } : current);
@@ -1145,19 +1236,22 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
 
   return (
     <div onTransitionEnd={onWorkspaceTransitionEnd} data-workspace-phase={workspacePhase}
-      className={`app-shell${wallpaperEnabled && wallpaperDataUrl ? " app-shell--wallpaper" : ""}${workspaceExpanded ? " app-shell--workspace-expanded" : ""}${sidePanelsMoving ? " app-shell--side-motion" : ""}${workspacePhase === "entering" ? " app-shell--entering" : ""}`}>
+      className={"app-shell" + (workspacePhase === "home" ? " app-shell--home" : "") + (wallpaperEnabled && wallpaperDataUrl ? " app-shell--wallpaper" : "") + (workspaceExpanded ? " app-shell--workspace-expanded" : "") + (sidePanelsMoving ? " app-shell--side-motion" : "") + (workspacePhase === "entering" ? " app-shell--entering" : "")}>
       {wallpaperEnabled && wallpaperDataUrl && (
         <img className="wallpaper-background" src={wallpaperDataUrl} alt="" aria-hidden="true" />
       )}
       <WindowChrome />
       <Sidebar activeView={activeView} onOpenCommandCenter={() => navigateWorkspace("command")}
-        onOpenConversations={() => navigateWorkspace("conversations")}
+        onOpenConversations={() => navigateWorkspace("conversations")} onOpenHome={openHome} showHome={!isIsolated}
         onOpenSettings={() => setSettingsOpen(true)} showSettings={!isSyntheticOrganicPilot} showConversations={!isIsolated} />
       <main className="workspace-shell">
         {isSyntheticOrganicPilot && <div className="synthetic-pilot-banner" role="status">PILOTO SINTÉTICO — SIN DATOS PERSONALES</div>}
         <CommandHeader preferences={preferences} weather={weatherStatus} weatherLoading={weatherLoading} />
 
-        <div className={`workspace-grid${conversationLayout ? " workspace-grid--conversations" : ""}`}>
+        {workspacePhase === "home" ? <HomeAssistantPanel lights={homeLights} loading={homeLoading} error={homeError}
+          busyEntities={homeBusyEntities} outcomes={homeOutcomes} onRefresh={() => { void refreshHomeLights(); }}
+          onControl={controlHomeLight} onApplyEffect={applyHomeLightEffect} />
+          : <div className={"workspace-grid" + (conversationLayout ? " workspace-grid--conversations" : "")}>
           <ConversationsPanel conversations={conversationItems} activeConversationId={chatConversationId}
             isVisible={conversationLayout}
             busy={conversationOpening || conversationListLoading || activeChatRequest.current !== null} loading={conversationListLoading}
@@ -1205,7 +1299,7 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
           <PresencePanel className={sidePanelsOffscreen ? "presence-panel--offscreen" : ""}
             isHidden={workspacePhase !== "command"}
             status={voiceSnapshot.status} statusLabel={VOICE_STATUS_LABELS[voiceSnapshot.status]} />
-        </div>
+        </div>}
 
       </main>
       <DashboardModules className={sidePanelsOffscreen ? "dashboard-modules--hidden" : ""} isHidden={workspacePhase !== "command"}
@@ -1213,6 +1307,10 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
         spotifyBusyAction={spotifyControlBusy} spotifyError={spotifyControlError}
         masterVolume={masterVolume} onMasterVolumeChange={updateMasterVolume}
         voiceRepliesEnabled={preferences.voiceRepliesEnabled} onVoiceRepliesChange={changeVoiceReplies}
+        homeLights={homeLights} homeLoading={homeLoading} homeError={homeError} homeBusyEntities={homeBusyEntities}
+        homeOutcomes={homeOutcomes} onHomeToggle={(light) => { void controlHomeLight(light,
+          { action: light.state === "on" ? "turn_off" : "turn_on" }); }}
+        onOpenHome={openHome} onRefreshHome={() => { void refreshHomeLights(); }}
         onSpotifyControl={(action) => { void controlSpotify(action); }} onOpenSpotifyTrack={(url) => { void openSpotifyTrack(url); }} />
       {settingsOpen && <SettingsModal preferences={preferences} onPreferencesChange={updatePreferences}
         microphoneDevices={microphoneDevices}
