@@ -20,9 +20,13 @@ import {
   CHAT_SEND_MESSAGE_CHANNEL,
   MEMORY_MODE_GET_CHANNEL,
   MEMORY_MODE_SET_CHANNEL,
+  MEMORY_RELATIONSHIP_LEARNING_SET_CHANNEL,
+  MEMORY_THIRD_PARTY_LEARNING_SET_CHANNEL,
+  MEMORY_CLEAR_ALL_CHANNEL,
   isDesktopMemoryMode,
   isDesktopMemoryModeResult,
   isDesktopMemoryModeStatus,
+  isDesktopMemoryClearResult,
   isPingResponse,
   isDesktopRestartResponse,
   isWallpaperResponse,
@@ -325,6 +329,23 @@ const api: NexaDesktopApi = {
       if (!isDesktopMemoryMode(mode)) throw new Error("invalid_memory_mode");
       const response: unknown = await ipcRenderer.invoke(MEMORY_MODE_SET_CHANNEL, mode);
       if (!isDesktopMemoryModeResult(response)) throw new Error("invalid_memory_mode_response");
+      return response;
+    },
+    async setRelationshipLearningEnabled(enabled) {
+      if (typeof enabled !== "boolean") throw new Error("invalid_relationship_learning_preference");
+      const response: unknown = await ipcRenderer.invoke(MEMORY_RELATIONSHIP_LEARNING_SET_CHANNEL, enabled);
+      if (!isDesktopMemoryModeResult(response)) throw new Error("invalid_relationship_learning_response");
+      return response;
+    },
+    async setThirdPartyLearningEnabled(enabled) {
+      if (typeof enabled !== "boolean") throw new Error("invalid_third_party_learning_preference");
+      const response: unknown = await ipcRenderer.invoke(MEMORY_THIRD_PARTY_LEARNING_SET_CHANNEL, enabled);
+      if (!isDesktopMemoryModeResult(response)) throw new Error("invalid_third_party_learning_response");
+      return response;
+    },
+    async clearAll() {
+      const response: unknown = await ipcRenderer.invoke(MEMORY_CLEAR_ALL_CHANNEL);
+      if (!isDesktopMemoryClearResult(response)) throw new Error("invalid_memory_clear_response");
       return response;
     },
   },

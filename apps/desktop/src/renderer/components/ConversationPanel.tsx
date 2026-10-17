@@ -2,7 +2,8 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ReactNode, UIEvent } from "react";
 import type { PttVoiceSnapshot } from "../voice/ptt-voice-controller";
 import type { VoiceFollowupStatus } from "../voice/voice-followup-controller";
-import type { AuthorizationProvider, ChatAuthorizationRequirement, ChatPresentationMetadata, SpotifyNowPlayingCard } from "../../shared/ipc-contract";
+import type { AuthorizationProvider, ChatAuthorizationRequirement, ChatPresentationMetadata, OrganicLearningEvent,
+  OrganicLearningReason, SpotifyNowPlayingCard } from "../../shared/ipc-contract";
 import { canonicalSpotifyTrackUrl } from "../../shared/spotify-link-validation";
 import { HolographicFrame } from "./HolographicFrame";
 
@@ -29,6 +30,12 @@ export interface ConversationChatMessage {
   readonly error?: string;
   readonly originalRequestText?: string;
   readonly presentation?: ChatPresentationMetadata;
+  readonly organicLearning?: OrganicLearningEvent;
+}
+
+export function applyOrganicLearningEvent(messages: readonly ConversationChatMessage[], event: OrganicLearningEvent): ConversationChatMessage[] {
+  return messages.map((entry) => entry.role === "user" && entry.requestId === event.requestId
+    && entry.conversationId === event.conversationId ? { ...entry, organicLearning: event } : entry);
 }
 
 interface ConversationPanelProps {
@@ -98,6 +105,42 @@ const STATUS_ANNOUNCEMENTS: Record<PttVoiceSnapshot["status"], string> = {
   error: "La operación de voz encontró un error.",
   "recovery-required": "Se requiere recuperar la sesión anterior antes de grabar.",
 };
+
+const ORGANIC_LEARNING_LABELS: Record<OrganicLearningEvent["state"], string> = {
+  pending: "Aprendizaje pendiente",
+  evaluating: "Evaluando memoria",
+  saved: "Guardado",
+  no_memory: "Sin recuerdo nuevo",
+  not_processed: "No procesado",
+};
+
+const ORGANIC_LEARNING_REASONS: Record<OrganicLearningReason, string> = {
+  not_eligible: "Este mensaje no era elegible para aprendizaje.",
+  queue_limit: "Se alcanzó el límite de evaluaciones pendientes.",
+  runtime_closing: "La evaluación se canceló al cerrar Runtime.",
+  cancelled: "La evaluación se canceló.",
+  evaluation_failed: "Falló la evaluación orgánica.",
+  write_failed: "Memory2 no confirmó una escritura.",
+  not_scheduled: "No se pudo programar la evaluación.",
+  schedule_failed: "Falló la programación de la evaluación.",
+  request_failed: "El turno no terminó correctamente; no se evaluó.",
+};
+
+function OrganicLearningIndicator({ event }: { event: OrganicLearningEvent }) {
+  const detail = event.state === "saved"
+    ? `Memory2 confirmó ${event.createdCount ?? 0} recuerdo(s) creado(s) y ${event.updatedCount ?? 0} actualizado(s).`
+    : event.state === "no_memory" ? "La evaluación terminó correctamente y no creó ni actualizó recuerdos."
+      : event.state === "pending" ? "La evaluación está en la cola de aprendizaje."
+        : event.state === "evaluating" ? "Memory2 está evaluando este mensaje."
+          : ORGANIC_LEARNING_REASONS[event.reason ?? "evaluation_failed"];
+  const failures = event.writeFailedCount ? ` Escrituras fallidas: ${event.writeFailedCount}.` : "";
+  return <details className={`organic-learning organic-learning--${event.state}`} data-organic-learning-state={event.state}>
+    <summary aria-label={`Aprendizaje orgánico: ${ORGANIC_LEARNING_LABELS[event.state]}`}>
+      <span aria-hidden="true" className="organic-learning__dot" />{ORGANIC_LEARNING_LABELS[event.state]}
+    </summary>
+    <span className="organic-learning__detail">{detail}{failures}</span>
+  </details>;
+}
 
 function errorMessage(snapshot: PttVoiceSnapshot): string | null {
   if (!snapshot.error) return null;
@@ -254,6 +297,7 @@ export function ConversationPanel({ snapshot, transcripts, chatMessages = [], au
                   aria-label="Cancelar mensaje en cola" title="Cancelar mensaje en cola">Cancelar</button>
               </span>}
               {entry.status === "processing" && <span className="chat-message-status chat-message-status--processing" role="status">Procesando</span>}
+              {entry.organicLearning && <OrganicLearningIndicator event={entry.organicLearning} />}
               {(entry.status === "cancelled" || entry.status === "error") && <span className={`chat-message-status chat-message-status--${entry.status}`}>{entry.error ?? (entry.status === "cancelled" ? "Cancelado" : "No enviado")}</span>}
             </div>
             <p>{entry.text}</p>

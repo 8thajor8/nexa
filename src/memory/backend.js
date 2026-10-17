@@ -6,6 +6,7 @@ import { createJsonMemoryRepository } from './json-repository.js';
 import { createMemoryService } from './service.js';
 import { createMemoryContextProvider } from './context-provider.js';
 import { loadMemory } from './memory.js';
+import { createOpenAIEmbeddingProvider } from '../brain/openai.js';
 
 function publicStartupError(code) {
     const error = new Error(`Selected Memory 2 store could not be opened (${code}). No fallback was performed.`);
@@ -50,7 +51,10 @@ export async function initializeEmptyMemoryStore({ storePath, now = () => new Da
 }
 
 export async function openMemoryBackend({ backend, storePath, loadLegacy = loadMemory,
-    repositoryFactory = createJsonMemoryRepository, now, organicMemoryAuthorizationFactory = null } = {}) {
+    repositoryFactory = createJsonMemoryRepository, now, organicMemoryAuthorizationFactory = null,
+    embeddingProvider = createOpenAIEmbeddingProvider(),
+    thirdPartyMemoryAccessEnabled = () => false,
+    relationshipMemoryAccessEnabled = () => false } = {}) {
     if (backend === 'memory1') return { backend, memory: await loadLegacy(), close: async () => {} };
     if (backend !== 'memory2') throw publicStartupError('memory_backend_invalid');
     await initializeEmptyMemoryStore({ storePath, ...(now ? { now } : {}) });
@@ -60,7 +64,10 @@ export async function openMemoryBackend({ backend, storePath, loadLegacy = loadM
         return { backend, repository, memory: { user: {}, preferences: {}, facts: [] },
             service: createMemoryService({ repository, ...(now ? { now } : {}),
                 organicMemoryAuthorizationFactory }),
-            contextProvider: createMemoryContextProvider({ repository }),
+            contextProvider: createMemoryContextProvider({ repository, embeddings: embeddingProvider,
+                indexPath: `${storePath}.semantic-index-v2.json`,
+                authorizeSubject: () => thirdPartyMemoryAccessEnabled() === true,
+                authorizeRelationships: () => relationshipMemoryAccessEnabled() === true }),
             close: () => repository.close() };
     } catch (error) {
         try { await repository.close(); } catch { /* Preserve the original startup failure. */ }

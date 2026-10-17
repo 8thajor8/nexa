@@ -1,6 +1,7 @@
 import { normalizeEntityName } from './entities.js';
 import { createHash } from 'node:crypto';
-import { assertExactObject, validateMemoryRecord, validateId, validateTemporal, validateTemporalInterval } from './schema.js';
+import { assertExactObject, validateMemoryRecord, validateId, validateTemporal, validateTemporalInterval,
+    validateRelationshipType } from './schema.js';
 import { getRelationPredicate } from './relation-predicates.js';
 
 export function validateForgetTarget(target) {
@@ -31,10 +32,19 @@ export function validatePersonCreation(request) {
 }
 
 export function validateRelationRequest(request, { correction = false } = {}) {
-    const keys = ['predicate', 'subject', 'object', 'valid_from', 'valid_to', ...(correction ? ['supersedes'] : [])];
-    assertExactObject(request, keys, 'relation');
+    const baseKeys = ['predicate', 'subject', 'object', 'valid_from', 'valid_to'];
+    const shapes = [baseKeys, [...baseKeys, 'relationship_type']].map(keys => correction ? [...keys, 'supersedes'] : keys);
+    let validShape = false;
+    for (const keys of shapes) {
+        try { assertExactObject(request, keys, 'relation'); validShape = true; break; } catch { /* Try the other exact shape. */ }
+    }
+    if (!validShape) throw new Error('memory_relation_shape_invalid');
     const definition = getRelationPredicate(request.predicate);
     if (!definition) throw new Error('memory_relation_predicate_invalid');
+    const keys = ['predicate', 'subject', 'object', 'valid_from', 'valid_to',
+        ...(definition.requiresRelationshipType ? ['relationship_type'] : []), ...(correction ? ['supersedes'] : [])];
+    assertExactObject(request, keys, 'relation');
+    if (definition.requiresRelationshipType) validateRelationshipType(request.relationship_type, 'relation.relationship_type');
     assertExactObject(request.subject, ['type', 'entity_type', 'id'], 'relation.subject');
     assertExactObject(request.object, ['type', 'entity_type', 'id'], 'relation.object');
     if (request.subject.type !== 'entity' || request.object.type !== 'entity_reference'

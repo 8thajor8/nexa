@@ -84,7 +84,8 @@ function parseV5(bytes) {
  * not coordinate with or provide a consistent snapshot against concurrent
  * writers that ignore this reader.
  */
-export async function openExistingMemory2Reader({ storePath } = {}) {
+export async function openExistingMemory2Reader({ storePath, embeddings = null, semanticIndexPath = null,
+    authorizeSubject = () => false, authorizeRelationships = () => false } = {}) {
     if (typeof storePath !== 'string' || !path.isAbsolute(storePath)) {
         throw publicError('memory_store_path_invalid');
     }
@@ -140,7 +141,8 @@ export async function openExistingMemory2Reader({ storePath } = {}) {
             },
         });
 
-        const facade = createMemory2ReadOnly({ repository, matchSpecificSelfQueries: true });
+        const facade = createMemory2ReadOnly({ repository, matchSpecificSelfQueries: true, embeddings,
+            indexPath: semanticIndexPath, authorizeSubject, authorizeRelationships });
         const result = Object.create(null);
         Object.defineProperties(result, {
             searchContext: { enumerable: true, value: options => {

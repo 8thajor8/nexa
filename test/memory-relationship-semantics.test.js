@@ -9,7 +9,8 @@ const relationId = n => `mem_00000000-0000-4000-8000-${String(n).padStart(12, '0
 
 function relation(n, { subject = person(1), object = person(2), status = 'active',
     validFrom = { value: '2030-01-01', precision: 'day' }, validTo = null,
-    scopeLabel = 'synthetic-private-a', kind = 'user_statement', derivation = 'explicit' } = {}) {
+    scopeLabel = 'synthetic-private-a', kind = 'user_statement', derivation = 'explicit',
+    predicate = 'partner_of', relationshipType = undefined } = {}) {
     const assertionId = relationId(n);
     const sourceId = `src_00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
     const evidence = { id: `ev_00000000-0000-4000-8000-${String(n).padStart(12, '0')}`,
@@ -19,9 +20,10 @@ function relation(n, { subject = person(1), object = person(2), status = 'active
         authority: 'data_only', locator: null, occurred_at: { value: '2035-01-01', precision: 'day' },
         recorded_at: '2035-01-01T00:00:00.000Z' };
     const assertion = { id: assertionId, kind: 'fact', subject: { type: 'entity', entity_type: 'person', id: subject.id },
-        predicate: 'partner_of', object: { type: 'entity_reference', entity_type: 'person', id: object.id },
+        predicate, object: { type: 'entity_reference', entity_type: 'person', id: object.id },
         status, valid_from: validFrom, valid_to: validTo, recorded_at: '2035-01-01T00:00:00.000Z',
         supersedes: [], compatibility: null };
+    if (relationshipType !== undefined) assertion.relationship_type = relationshipType;
     return { assertion, subjectEntity: subject, objectEntity: object,
         evidence: [{ evidence, source }], asOf: AS_OF, scopeLabel };
 }
@@ -46,6 +48,15 @@ test('describes a schema-backed relation with endpoints, evidence metadata and n
     assert.deepEqual(row, before);
 });
 
+test('typed personal relations preserve their specific meaning while legacy partner edges remain readable', () => {
+    const row = relation(31, { predicate: 'personal_relationship_of',
+        relationshipType: { category: 'family', label: 'hermano' } });
+    const result = describeRelation(row);
+    assert.equal(result.predicate, 'personal_relationship_of');
+    assert.deepEqual(result.relationshipType, { category: 'family', label: 'hermano' });
+    assert.equal(describeRelation(relation(32)).relationshipType, null);
+});
+
 test('relation direction is preserved; symmetric reverse matching is explicit and no transitive path is inferred', () => {
     const ab = relation(2);
     const bc = relation(3, { subject: person(2), object: person(3) });
@@ -59,7 +70,7 @@ test('relation direction is preserved; symmetric reverse matching is explicit an
     assert.equal(ab.assertion.object.id, person(2).id);
 });
 
-test('unsupported directed predicates fail closed until Schema v5 defines them explicitly', () => {
+test('unsupported directed predicates fail closed until explicitly defined', () => {
     const row = relation(4);
     row.assertion.predicate = 'person.parent_of';
     assert.throws(() => describeRelation(row));

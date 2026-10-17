@@ -5,10 +5,12 @@ import { randomUUID } from 'node:crypto';
 import { COMPATIBILITY_CATEGORIES, assertExactObject, validateId, validateMemoryRecord, validateTimestamp } from './schema.js';
 import { consumeMemoryAuthorization, validateRememberProposal } from './authorization.js';
 import { validateForgetTarget, validatePersonCreation, validateRelationRequest, validateRelationForget } from './commands.js';
+import { validateRelationshipType } from './schema.js';
 import { getRelationPredicate } from './relation-predicates.js';
 import { screenMemorySecret } from './secret-screening.js';
 import { MemoryRepositoryError } from './repository.js';
-import { getOrganicMemoryAttributePolicy } from '../core/organic-memory-authorization.js';
+import { getOrganicMemoryAttributePolicy, ORGANIC_RELATIONSHIP_ATTRIBUTE, ORGANIC_RELATIONSHIP_SCOPE,
+    ORGANIC_TYPED_RELATIONSHIP_ATTRIBUTE, ORGANIC_THIRD_PARTY_SCOPE, parseDirectOwnerPartnerStatement } from '../core/organic-memory-authorization.js';
 
 const publicErrors = Object.freeze({
     memory_write_not_authorized: 'A matching explicit direct-user memory command is required.',
@@ -46,6 +48,23 @@ function equivalent(a, b, store) {
 }
 function newId(prefix) { return prefix + '_' + randomUUID(); }
 function validateProposal(proposal) { validateRememberProposal(proposal); }
+function verifiedOrganicThirdPartySubject(current, proposal, evidence) {
+    const subjectId = proposal.subject.id;
+    if (subjectId === current.snapshot.self_person_id
+        || !current.snapshot.entities.some(item => item.id === subjectId && item.type === 'person')) return false;
+    if (evidence?.subjectReference) {
+        const related = current.snapshot.assertions.filter(item => item.status === 'active'
+            && ['partner_of', 'personal_relationship_of'].includes(item.predicate)
+            && (item.subject.id === current.snapshot.self_person_id || item.object.id === current.snapshot.self_person_id)
+            && (item.predicate === 'partner_of' ? evidence.subjectReference === 'pareja'
+                : item.relationship_type?.label === evidence.subjectReference));
+        const ids = new Set(related.map(item => item.subject.id === current.snapshot.self_person_id
+            ? item.object.id : item.subject.id));
+        return ids.size === 1 && ids.has(subjectId);
+    }
+    const resolution = resolveEntities(current, { text: evidence?.subjectName });
+    return resolution.status === 'resolved' && resolution.entityId === subjectId;
+}
 /** Domain service over the repository contract; it never constructs trusted prompts. */
 export function createMemoryService({ repository, now = () => new Date().toISOString(), idFactory = newId,
     secretScreen = screenMemorySecret, organicMemoryAuthorizationFactory = null } = {}) {
@@ -67,7 +86,17 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
     async function snapshot() { return repository.readSnapshot(); }
 
     function relationRecord(assertion) { return Boolean(getRelationPredicate(assertion.predicate)) && assertion.object?.type === 'entity_reference'; }
-    function relationKey(assertion) { return [assertion.predicate, assertion.subject.id, assertion.object.id].join(':'); }
+    function relationKey(assertion) { return canonical([assertion.predicate, assertion.subject.id, assertion.object.id,
+        assertion.relationship_type ?? null]); }
+    function sameRelationshipIdentity(existing, requested) {
+        if (relationKey(existing) === relationKey(requested)) return true;
+        const legacyPartner = existing.predicate === 'partner_of' ? existing : requested.predicate === 'partner_of' ? requested : null;
+        const typedPartner = existing.predicate === 'personal_relationship_of' ? existing
+            : requested.predicate === 'personal_relationship_of' ? requested : null;
+        if (!legacyPartner || !typedPartner || typedPartner.relationship_type?.category !== 'partner') return false;
+        return [legacyPartner.subject.id, legacyPartner.object.id].sort().join(':')
+            === [typedPartner.subject.id, typedPartner.object.id].sort().join(':');
+    }
     function relationProjection(assertion, entityId) {
         return { assertion: structuredClone(assertion), entityId, predicate: assertion.predicate,
             otherEntityId: assertion.subject.id === entityId ? assertion.object.id : assertion.subject.id,
@@ -96,11 +125,16 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
             invalidateContext: true, trust: { authority: 'data_only' } };
     }
 
-    async function persistRememberProposal(proposal, { derivation = 'explicit', extractionConfidence = null, preCommit = null } = {}) {
+    async function persistRememberProposal(proposal, { derivation = 'explicit', extractionConfidence = null, preCommit = null,
+        expectedActiveAssertionId = undefined } = {}) {
         try {
             const current = await snapshot();
             const candidates = current.snapshot.assertions.filter(record => record.status === 'active' && sameSlot(record, proposal, current.snapshot));
             if (candidates.length > 1) return failure('memory_ambiguous');
+            if (expectedActiveAssertionId !== undefined
+                && (expectedActiveAssertionId === null ? candidates.length !== 0
+                    : typeof expectedActiveAssertionId !== 'string' || candidates.length !== 1
+                        || candidates[0].id !== expectedActiveAssertionId)) return failure('memory_conflict');
             if (candidates.length === 1 && equivalent(candidates[0], proposal, current.snapshot)
                 && (!isEntityName(proposal.predicate) || eligibleNameAssertions(current.snapshot).some(record => record.id === candidates[0].id))) {
                 return { success: true, outcome: 'equivalent', id: candidates[0].id, revision: current.revision, changedIds: [], trust: { authority: 'data_only' } };
@@ -125,7 +159,7 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
                 { type: 'put', collection: 'sources', record: source }, { type: 'put', collection: 'evidence', record: evidence });
             if (preCommit) {
                 let allowed = false;
-                try { allowed = preCommit() === true; } catch { /* A stale grant fails closed. */ }
+                try { allowed = preCommit(current) === true; } catch { /* A stale grant fails closed. */ }
                 if (!allowed) return failure('memory_write_not_authorized');
             }
             const committed = await repository.commit({ expectedRevision: current.revision, expectedDigest: current.digest, changes });
@@ -138,23 +172,246 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
 
     async function persistOrganicProposal(input, authorization, evidence) {
         try {
+            if (input?.operation === 'remember_relationship')
+                return input.attribute === ORGANIC_TYPED_RELATIONSHIP_ATTRIBUTE
+                    ? await persistOrganicTypedRelationship(input, authorization, evidence)
+                    : await persistOrganicPartnerRelation(input, authorization, evidence);
             if ((authorization?.syntheticOnly !== true && authorization?.ownerOnly !== true)
                 || !['remember', 'update'].includes(input?.operation)
                 || !getOrganicMemoryAttributePolicy(input?.attribute)
-                || getOrganicMemoryAttributePolicy(input.attribute)?.scope !== input.scope)
+                || (input.scope !== ORGANIC_THIRD_PARTY_SCOPE
+                    && getOrganicMemoryAttributePolicy(input.attribute)?.scope !== input.scope))
                 return failure('memory_write_not_authorized');
             const proposal = structuredClone(evidence?.proposal);
             validateProposal(proposal);
             const attributePolicy = getOrganicMemoryAttributePolicy(input.attribute);
-            if (!attributePolicy || proposal.kind !== attributePolicy.kind || proposal.subject?.type !== 'owner'
+            const thirdParty = input.scope === ORGANIC_THIRD_PARTY_SCOPE;
+            if (!attributePolicy || proposal.kind !== attributePolicy.kind
+                || (thirdParty ? proposal.subject?.type !== 'entity' || proposal.subject?.entity_type !== 'person'
+                    : proposal.subject?.type !== 'owner')
                 || proposal.predicate !== attributePolicy.predicate || proposal.compatibility?.category !== attributePolicy.category
                 || proposal.compatibility?.key !== input.attribute || proposal.valid_from !== null || proposal.valid_to !== null
                 || typeof evidence?.extractionConfidence !== 'number' || !Number.isFinite(evidence.extractionConfidence)
                 || evidence.extractionConfidence < 0.9 || evidence.extractionConfidence > 1)
                 return failure('memory_invalid_input');
+            if (thirdParty) {
+                const current = await snapshot();
+                if (!verifiedOrganicThirdPartySubject(current, proposal, evidence)) return failure('memory_ambiguous');
+            }
             if (!secretScreen(proposal.object.value)?.safe) return failure('memory_secret_suspected');
+            const expectedActiveAssertionId = Object.hasOwn(evidence ?? {}, 'expectedPriorAssertionId')
+                ? evidence.expectedPriorAssertionId : undefined;
+            if (expectedActiveAssertionId !== undefined && expectedActiveAssertionId !== null
+                && typeof expectedActiveAssertionId !== 'string') return failure('memory_invalid_input');
             return await persistRememberProposal(proposal, { derivation: 'inferred', extractionConfidence: evidence.extractionConfidence,
-                preCommit: () => organicMemoryAuthorization?.verify(input)?.allowed === true });
+                expectedActiveAssertionId,
+                preCommit: current => organicMemoryAuthorization?.verify(input)?.allowed === true
+                    && (!thirdParty || verifiedOrganicThirdPartySubject(current, proposal, evidence)) });
+        } catch (error) { return safeFailure(error); }
+    }
+
+    /** Persist a directly stated owner↔partner edge and, when needed, its person/name
+     * records in one repository commit. The capability carries the verified literal
+     * quote transiently; only opaque source metadata is persisted. */
+    async function persistOrganicPartnerRelation(input, authorization, evidence) {
+        if ((authorization?.syntheticOnly !== true && authorization?.ownerOnly !== true)
+            || input?.scope !== ORGANIC_RELATIONSHIP_SCOPE || input?.attribute !== ORGANIC_RELATIONSHIP_ATTRIBUTE
+            || evidence?.origin !== 'direct_user' || evidence?.subject !== 'owner' || evidence?.explicit !== true
+            || evidence?.certain !== true || evidence?.sensitive !== false || evidence?.ambiguous !== false
+            || evidence?.thirdParty !== false || evidence?.modelOriginated !== false
+            || typeof evidence?.preferredName !== 'string' || typeof evidence?.sourceQuote !== 'string'
+            || typeof evidence?.userMessage !== 'string' || !evidence.userMessage.includes(evidence.sourceQuote))
+            return failure('memory_write_not_authorized');
+        const parsed = parseDirectOwnerPartnerStatement(evidence.sourceQuote);
+        if (!parsed || normalizeEntityName(parsed.preferredName) !== normalizeEntityName(evidence.preferredName)
+            || !secretScreen(evidence.preferredName)?.safe) return failure('memory_invalid_input');
+
+        try {
+            const current = await snapshot();
+            const resolution = resolveEntities(current, { text: evidence.preferredName });
+            if (resolution.status === 'ambiguous' || resolution.status === 'insufficient_evidence') return failure('memory_ambiguous');
+            let personId = resolution.status === 'resolved' ? resolution.entityId : null;
+            const createPerson = personId === null;
+            if (personId === current.snapshot.self_person_id) return failure('memory_invalid_input');
+            const targetPersonId = personId ?? idFactory('person');
+            const ownerId = current.snapshot.self_person_id;
+            const activePartners = current.snapshot.assertions.filter(record => record.status === 'active'
+                && record.predicate === 'partner_of' && (record.subject.id === ownerId || record.object.id === ownerId));
+            const samePartner = activePartners.some(record => record.subject.id === targetPersonId || record.object.id === targetPersonId);
+            if (activePartners.some(record => record.subject.id !== targetPersonId && record.object.id !== targetPersonId)) {
+                return { success: false, outcome: 'needs_clarification',
+                    error: { code: 'memory_relationship_conflict', message: 'An active partner relationship already exists.' } };
+            }
+            if (samePartner) {
+                const matching = activePartners.filter(record => record.subject.id === targetPersonId || record.object.id === targetPersonId);
+                if (matching.length !== 1) return failure('memory_ambiguous');
+                return { success: true, outcome: 'equivalent', id: matching[0].id,
+                    revision: current.revision, changedIds: [], trust: { authority: 'data_only' } };
+            }
+
+            const recordedAt = timestamp();
+            const sourceId = idFactory('src');
+            const relationId = idFactory('mem');
+            const relationEvidenceId = idFactory('ev');
+            const changes = [];
+            const createdIds = [];
+            if (createPerson) {
+                const person = { id: targetPersonId, type: 'person', created_at: recordedAt };
+                const nameAssertion = { id: idFactory('mem'), kind: 'fact',
+                    subject: { type: 'entity', entity_type: 'person', id: targetPersonId }, predicate: 'entity.preferred_name',
+                    object: { type: 'text', value: evidence.preferredName.trim().replace(/\s+/gu, ' ') }, status: 'active',
+                    valid_from: null, valid_to: null, recorded_at: recordedAt, supersedes: [], compatibility: null };
+                const nameEvidence = { id: idFactory('ev'), assertion_id: nameAssertion.id, source_id: sourceId,
+                    derivation: 'explicit', extraction_confidence: null, learned_at: recordedAt, last_confirmed_at: null, legacy_ref: null };
+                validateMemoryRecord('entities', person);
+                validateMemoryRecord('assertions', nameAssertion);
+                validateMemoryRecord('evidence', nameEvidence);
+                changes.push({ type: 'put', collection: 'entities', record: person },
+                    { type: 'put', collection: 'assertions', record: nameAssertion },
+                    { type: 'put', collection: 'evidence', record: nameEvidence });
+                createdIds.push(person.id, nameAssertion.id, nameEvidence.id);
+                personId = targetPersonId;
+            }
+            const request = validateRelationRequest({ predicate: 'partner_of',
+                subject: { type: 'entity', entity_type: 'person', id: ownerId },
+                object: { type: 'entity_reference', entity_type: 'person', id: personId }, valid_from: null, valid_to: null });
+            const relation = { id: relationId, kind: 'fact', subject: request.subject, predicate: request.predicate,
+                object: request.object, status: 'active', valid_from: null, valid_to: null, recorded_at: recordedAt,
+                supersedes: [], compatibility: null };
+            const source = { id: sourceId, kind: 'user_statement', origin_trust: 'user_asserted', authority: 'data_only',
+                locator: null, occurred_at: { value: recordedAt, precision: 'instant' }, recorded_at: recordedAt };
+            const relationEvidence = { id: relationEvidenceId, assertion_id: relation.id, source_id: sourceId,
+                derivation: 'explicit', extraction_confidence: null, learned_at: recordedAt, last_confirmed_at: null, legacy_ref: null };
+            validateMemoryRecord('assertions', relation);
+            validateMemoryRecord('sources', source);
+            validateMemoryRecord('evidence', relationEvidence);
+            changes.push({ type: 'put', collection: 'assertions', record: relation },
+                { type: 'put', collection: 'sources', record: source },
+                { type: 'put', collection: 'evidence', record: relationEvidence });
+            const allIds = current.snapshot.entities.concat(current.snapshot.assertions, current.snapshot.sources, current.snapshot.evidence)
+                .map(record => record.id);
+            const newIds = changes.filter(change => change.type === 'put').map(change => change.record.id);
+            if (newIds.some(id => allIds.includes(id)) || new Set(newIds).size !== newIds.length) return failure('memory_invalid_input');
+            if (organicMemoryAuthorization?.verify(input)?.allowed !== true) return failure('memory_write_not_authorized');
+            const committed = await repository.commit({ expectedRevision: current.revision, expectedDigest: current.digest, changes });
+            return { success: true, outcome: 'created', id: relation.id, personId,
+                revision: committed.revision, changedIds: [...createdIds, source.id, relation.id, relationEvidence.id],
+                trust: { authority: 'data_only' } };
+        } catch (error) { return safeFailure(error); }
+    }
+
+    /**
+     * Internal-only typed relationship writer. It requires an opaque capability
+     * whose trusted issuer attests that a semantic verifier checked the exact
+     * current-user evidence. No production issuer currently mints this proof;
+     * 05D must add that verifier before agent-driven writes can be enabled.
+     */
+    async function persistOrganicTypedRelationship(input, authorization, evidence) {
+        const relationshipType = evidence?.relationshipType;
+        if ((authorization?.syntheticOnly !== true && authorization?.ownerOnly !== true)
+            || input?.scope !== ORGANIC_RELATIONSHIP_SCOPE || input?.attribute !== ORGANIC_TYPED_RELATIONSHIP_ATTRIBUTE
+            || evidence?.origin !== 'direct_user' || evidence?.subject !== 'owner' || evidence?.explicit !== true
+            || evidence?.certain !== true || evidence?.sensitive !== false || evidence?.ambiguous !== false
+            || evidence?.thirdParty !== false || evidence?.modelOriginated !== false
+            || evidence?.semanticEvidenceVerified !== 'direct_owner_relationship_v1'
+            || !['family', 'partner', 'friend'].includes(relationshipType?.category)
+            || typeof evidence?.preferredName !== 'string' || typeof evidence?.sourceQuote !== 'string'
+            || typeof evidence?.userMessage !== 'string' || evidence.sourceQuote.length < 3
+            || evidence.sourceQuote.length > 500 || !evidence.userMessage.includes(evidence.sourceQuote))
+            return failure('memory_write_not_authorized');
+
+        try {
+            validateRelationshipType(relationshipType, 'evidence.relationshipType');
+            const quote = evidence.sourceQuote.trim();
+            const standalone = evidence.userMessage.split(/(?<=[.!?])\s+|\r?\n/u)
+                .some(sentence => sentence.trim() === quote);
+            const normalizeEvidenceText = value => value.normalize('NFD').replace(/\p{M}/gu, '')
+                .toLocaleLowerCase('es').replace(/\s+/gu, ' ').trim();
+            const containsPhrase = (text, phrase) => {
+                const normalizedText = normalizeEvidenceText(text), normalizedPhrase = normalizeEvidenceText(phrase);
+                const escaped = normalizedPhrase.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+                return new RegExp(`(^|[^\\p{L}\\p{N}])${escaped}($|[^\\p{L}\\p{N}])`, 'u').test(normalizedText);
+            };
+            // The opaque evidence capability attests semantic verification of the
+            // normalized label, including inflections absent from the literal quote.
+            if (!secretScreen(evidence.preferredName)?.safe
+                || !containsPhrase(quote, evidence.preferredName)
+                || !/(?:^|[^\p{L}\p{N}])(?:mi|mis|me|yo|tengo|somos|soy)(?=$|[^\p{L}\p{N}])/iu.test(quote))
+                return failure('memory_invalid_input');
+
+            const current = await snapshot();
+            const resolution = resolveEntities(current, { text: evidence.preferredName });
+            if (resolution.status === 'ambiguous' || resolution.status === 'insufficient_evidence') return failure('memory_ambiguous');
+            const ownerId = current.snapshot.self_person_id;
+            const personId = resolution.status === 'resolved' ? resolution.entityId : idFactory('person');
+            if (personId === ownerId) return failure('memory_invalid_input');
+
+            const request = validateRelationRequest({ predicate: 'personal_relationship_of',
+                subject: { type: 'entity', entity_type: 'person', id: ownerId },
+                object: { type: 'entity_reference', entity_type: 'person', id: personId },
+                relationship_type: structuredClone(relationshipType), valid_from: null, valid_to: null });
+            const existing = current.snapshot.assertions.filter(record => record.status === 'active'
+                && record.object?.type === 'entity_reference' && sameRelationshipIdentity(record, request)
+                && same(record.valid_from, request.valid_from) && same(record.valid_to, request.valid_to));
+            if (existing.length > 1) return failure('memory_ambiguous');
+            if (existing.length === 1) return { success: true, outcome: 'equivalent', id: existing[0].id,
+                revision: current.revision, changedIds: [], trust: { authority: 'data_only' } };
+            if (relationshipType.category === 'partner') {
+                const activePartners = current.snapshot.assertions.filter(record => record.status === 'active'
+                    && (record.predicate === 'partner_of'
+                        || (record.predicate === 'personal_relationship_of' && record.relationship_type?.category === 'partner'))
+                    && (record.subject.id === ownerId || record.object.id === ownerId));
+                if (activePartners.some(record => record.subject.id !== personId && record.object.id !== personId)) {
+                    return { success: false, outcome: 'needs_clarification',
+                        error: { code: 'memory_relationship_conflict', message: 'An active partner relationship already exists.' } };
+                }
+            }
+
+            const recordedAt = timestamp();
+            const sourceId = idFactory('src'), relationId = idFactory('mem'), relationEvidenceId = idFactory('ev');
+            const changes = [], createdIds = [];
+            if (resolution.status !== 'resolved') {
+                const person = { id: personId, type: 'person', created_at: recordedAt };
+                const nameAssertion = { id: idFactory('mem'), kind: 'fact',
+                    subject: { type: 'entity', entity_type: 'person', id: personId }, predicate: 'entity.preferred_name',
+                    object: { type: 'text', value: evidence.preferredName.trim().replace(/\s+/gu, ' ') }, status: 'active',
+                    valid_from: null, valid_to: null, recorded_at: recordedAt, supersedes: [], compatibility: null };
+                const nameEvidence = { id: idFactory('ev'), assertion_id: nameAssertion.id, source_id: sourceId,
+                    derivation: 'explicit', extraction_confidence: null, learned_at: recordedAt, last_confirmed_at: null, legacy_ref: null };
+                validateMemoryRecord('entities', person);
+                validateMemoryRecord('assertions', nameAssertion);
+                validateMemoryRecord('evidence', nameEvidence);
+                changes.push({ type: 'put', collection: 'entities', record: person },
+                    { type: 'put', collection: 'assertions', record: nameAssertion },
+                    { type: 'put', collection: 'evidence', record: nameEvidence });
+                createdIds.push(person.id, nameAssertion.id, nameEvidence.id);
+            }
+            const relation = { id: relationId, kind: 'fact', subject: request.subject, predicate: request.predicate,
+                object: request.object, relationship_type: request.relationship_type, status: 'active',
+                valid_from: null, valid_to: null, recorded_at: recordedAt, supersedes: [], compatibility: null };
+            const source = { id: sourceId, kind: 'user_statement', origin_trust: 'user_asserted', authority: 'data_only',
+                locator: null, occurred_at: { value: recordedAt, precision: 'instant' }, recorded_at: recordedAt };
+            const relationEvidence = { id: relationEvidenceId, assertion_id: relationId, source_id: sourceId,
+                derivation: 'explicit', extraction_confidence: null, learned_at: recordedAt,
+                last_confirmed_at: null, legacy_ref: null };
+            validateMemoryRecord('assertions', relation);
+            validateMemoryRecord('sources', source);
+            validateMemoryRecord('evidence', relationEvidence);
+            changes.push({ type: 'put', collection: 'assertions', record: relation },
+                { type: 'put', collection: 'sources', record: source },
+                { type: 'put', collection: 'evidence', record: relationEvidence });
+            const knownIds = new Set(current.snapshot.entities.concat(current.snapshot.assertions, current.snapshot.sources, current.snapshot.evidence)
+                .map(record => record.id));
+            const newIds = changes.filter(change => change.type === 'put').map(change => change.record.id);
+            if (newIds.some(id => knownIds.has(id)) || new Set(newIds).size !== newIds.length) return failure('memory_invalid_input');
+            const grantInput = { scope: ORGANIC_RELATIONSHIP_SCOPE, operation: 'remember_relationship',
+                attribute: ORGANIC_TYPED_RELATIONSHIP_ATTRIBUTE, evidenceCapability: input.evidenceCapability };
+            if (organicMemoryAuthorization?.verify(grantInput)?.allowed !== true) return failure('memory_write_not_authorized');
+            const committed = await repository.commit({ expectedRevision: current.revision,
+                expectedDigest: current.digest, changes });
+            return { success: true, outcome: 'created', id: relationId, personId,
+                revision: committed.revision, changedIds: [...createdIds, sourceId, relationId, relationEvidenceId],
+                trust: { authority: 'data_only' } };
         } catch (error) { return safeFailure(error); }
     }
 
@@ -164,6 +421,20 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
             const result = await organicMemoryAuthorization.persistIfAuthorized(input);
             return result.success ? result.result : failure('memory_write_not_authorized');
         } catch { return failure('memory_operation_failed'); }
+    }
+
+    /** Internal service entry point for a future trusted extractor. Not registered as an agent tool. */
+    async function rememberOrganicRelationship(evidenceCapability) {
+        if (!organicMemoryAuthorization) return failure('memory_write_not_authorized');
+        return rememberOrganic({ scope: ORGANIC_RELATIONSHIP_SCOPE, operation: 'remember_relationship',
+            attribute: ORGANIC_RELATIONSHIP_ATTRIBUTE, evidenceCapability });
+    }
+
+    /** Closed internal entry point for a future semantically verified relationship extractor. */
+    async function rememberOrganicTypedRelationship(evidenceCapability) {
+        if (!organicMemoryAuthorization) return failure('memory_write_not_authorized');
+        return rememberOrganic({ scope: ORGANIC_RELATIONSHIP_SCOPE, operation: 'remember_relationship',
+            attribute: ORGANIC_TYPED_RELATIONSHIP_ATTRIBUTE, evidenceCapability });
     }
 
     async function remember(input, authorization) {
@@ -479,7 +750,7 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
             if (entities.get(request.subject.id)?.type !== request.subject.entity_type
                 || entities.get(request.object.id)?.type !== request.object.entity_type) return failure('memory_invalid_input');
             const matches = current.snapshot.assertions.filter(record => record.status === 'active' && relationRecord(record)
-                && relationKey(record) === relationKey({ ...request, object: { ...request.object, type: 'entity_reference' } })
+                && sameRelationshipIdentity(record, { ...request, object: { ...request.object, type: 'entity_reference' } })
                 && same(record.valid_from, request.valid_from) && same(record.valid_to, request.valid_to));
             if (matches.length > 1) return failure('memory_ambiguous');
             if (matches.length === 1) return { success: true, outcome: 'equivalent', id: matches[0].id,
@@ -487,6 +758,7 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
             const recordedAt = timestamp();
             const assertion = { id: idFactory('mem'), kind: 'fact', subject: structuredClone(request.subject),
                 predicate: request.predicate, object: structuredClone(request.object), status: 'active',
+                ...(request.relationship_type ? { relationship_type: structuredClone(request.relationship_type) } : {}),
                 valid_from: structuredClone(request.valid_from), valid_to: structuredClone(request.valid_to),
                 recorded_at: recordedAt, supersedes: [], compatibility: null };
             const source = { id: idFactory('src'), kind: 'user_statement', origin_trust: 'user_asserted', authority: 'data_only',
@@ -517,12 +789,13 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
             if (entities.get(request.subject.id)?.type !== request.subject.entity_type
                 || entities.get(request.object.id)?.type !== request.object.entity_type) return failure('memory_invalid_input');
             const existing = current.snapshot.assertions.find(item => item.status === 'active' && item.id !== target.id && relationRecord(item)
-                && relationKey(item) === relationKey({ ...request, object: { ...request.object, type: 'entity_reference' } })
+                && sameRelationshipIdentity(item, { ...request, object: { ...request.object, type: 'entity_reference' } })
                 && same(item.valid_from, request.valid_from) && same(item.valid_to, request.valid_to));
             if (existing) return failure('memory_ambiguous');
             const recordedAt = timestamp();
             const assertion = { id: idFactory('mem'), kind: 'fact', subject: structuredClone(request.subject),
                 predicate: request.predicate, object: structuredClone(request.object), status: 'active',
+                ...(request.relationship_type ? { relationship_type: structuredClone(request.relationship_type) } : {}),
                 valid_from: structuredClone(request.valid_from), valid_to: structuredClone(request.valid_to), recorded_at: recordedAt,
                 supersedes: [target.id], compatibility: null };
             const source = { id: idFactory('src'), kind: 'user_statement', origin_trust: 'user_asserted', authority: 'data_only',
@@ -568,6 +841,16 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
         } catch (error) { return safeFailure(error); }
     }
 
+    async function clearAllMemories() {
+        if (typeof repository.clearMemoryData !== 'function') return failure('memory_operation_failed');
+        try {
+            const result = await repository.clearMemoryData();
+            return { success: true, outcome: 'cleared', revision: result.revision,
+                removedCount: Object.values(result.removed).reduce((sum, value) => sum + value, 0),
+                invalidateContext: true, trust: { authority: 'data_only' } };
+        } catch (error) { return safeFailure(error); }
+    }
+
     if (organicMemoryAuthorizationFactory) {
         organicMemoryAuthorization = organicMemoryAuthorizationFactory({ repository, persist: persistOrganicProposal });
         if (typeof organicMemoryAuthorization?.persistIfAuthorized !== 'function')
@@ -576,9 +859,10 @@ export function createMemoryService({ repository, now = () => new Date().toISOSt
 
     const service = Object.freeze({ createPerson, getPerson, getSelf, resolvePerson, resolveEntityMentions, retrieveCandidates,
         currentKnowledge, knowledgeValidAt, history, createRelation, correctRelation,
-        forgetRelation, relationsForEntity, remember, rememberOrganic, prepareConfirmedRemember, confirmPreparedRemember, cancelPreparedRemember,
+        forgetRelation, relationsForEntity, remember, rememberOrganic, rememberOrganicRelationship, rememberOrganicTypedRelationship,
+        prepareConfirmedRemember, confirmPreparedRemember, cancelPreparedRemember,
         prepareConfirmedUpdate, confirmPreparedUpdate, cancelPreparedUpdate,
         prepareConfirmedForget, confirmPreparedForget, cancelPreparedForget,
-        forget, getById, find, open: () => repository.open(), close: () => repository.close() });
+        forget, getById, find, clearAllMemories, open: () => repository.open(), close: () => repository.close() });
     return service;
 }

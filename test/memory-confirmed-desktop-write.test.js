@@ -621,7 +621,7 @@ test('topic selection prevents an old value from choosing between distinct edito
     });
 });
 
-test('generic semantic transitions select current facts by topic and exact old value', async () => {
+test('declarative semantic transitions stay conversational and do not enter the explicit write interpreter', async () => {
     const cases = [
         { fact: 'Mi navegador habitual es Chrome.', request: 'Me pasé de Chrome a Firefox.',
             quote: 'Me pasé de Chrome a Firefox', topic: 'navegador', oldValue: 'Chrome', newValue: 'Firefox' },
@@ -634,31 +634,26 @@ test('generic semantic transitions select current facts by topic and exact old v
     ];
     for (const [index, item] of cases.entries()) {
         await withStore(async ({ storePath }) => {
-            const runtime = createWritableRuntime(storePath, async request => request.tools.some(tool => tool.name === 'interpret_memory_intent')
-                ? semanticIntent({ intent: 'update_preference', sourceQuote: item.quote, topic: item.topic,
-                    oldValue: item.oldValue, newValue: item.newValue }) : final());
+            const requests = [];
+            const runtime = createWritableRuntime(storePath, async request => { requests.push(request); return final(); });
             const conversationId = runtime.createConversation();
             await send(runtime, conversationId, `generic-update-seed-${index}`, `Nexa, recordá que ${item.fact}`);
             await send(runtime, conversationId, `generic-update-seed-confirm-${index}`, 'sí');
-            const proposal = await send(runtime, conversationId, `generic-update-preview-${index}`, item.request);
-            assert.match(proposal, new RegExp(item.oldValue.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'iu'));
-            assert.match(proposal, new RegExp(item.newValue.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&'), 'iu'));
+            const response = await send(runtime, conversationId, `generic-update-preview-${index}`, item.request);
+            assert.equal(response, 'Respuesta sintética.');
+            assert.equal(requests.some(request => request.tools?.some(tool => tool.name === 'interpret_memory_intent')), false);
             assert.equal(JSON.parse(await readFile(storePath, 'utf8')).revision, 1);
-            await send(runtime, conversationId, `generic-update-confirm-${index}`, 'sí');
             const stored = JSON.parse(await readFile(storePath, 'utf8'));
             assert.equal(stored.assertions.filter(record => record.status === 'active').length, 1);
-            assert.ok(stored.assertions.find(record => record.status === 'active').object.value.includes(item.newValue));
-            assert.equal(stored.revision, 2);
+            assert.equal(stored.revision, 1);
             await runtime.close();
         });
     }
 });
 
-test('generic semantic update asks for clarification when topic and old value match multiple current facts', async () => {
+test('declarative transition with multiple possible targets does not claim an update failure before organic evaluation', async () => {
     await withStore(async ({ storePath }) => {
-        const runtime = createWritableRuntime(storePath, async () => semanticIntent({
-            intent: 'update_preference', sourceQuote: 'Me pasé de Chrome a Firefox',
-            topic: 'navegador', oldValue: 'Chrome', newValue: 'Firefox' }));
+        const runtime = createWritableRuntime(storePath, async () => final('Lo tengo en cuenta.'));
         const conversationId = runtime.createConversation();
         await send(runtime, conversationId, 'ambiguous-generic-seed-one',
             'Nexa, recordá que Mi navegador habitual es Chrome.');
@@ -668,7 +663,7 @@ test('generic semantic update asks for clarification when topic and old value ma
         await send(runtime, conversationId, 'ambiguous-generic-seed-two-confirm', 'sí');
         const before = JSON.parse(await readFile(storePath, 'utf8'));
         const response = await send(runtime, conversationId, 'ambiguous-generic-update', 'Me pasé de Chrome a Firefox');
-        assert.match(response, /varios recuerdos vigentes/u);
+        assert.equal(response, 'Lo tengo en cuenta.');
         assert.deepEqual(JSON.parse(await readFile(storePath, 'utf8')), before);
         await runtime.close();
     });

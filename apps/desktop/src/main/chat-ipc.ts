@@ -9,6 +9,7 @@ import {
   type AuthorizationRequiredEvent, type ChatConversationMessage, type ChatConversationMessagesRequest,
   type ChatConversationResponse, type ChatMessageCursor, type ChatConversationListRequest, type SpotifyNowPlayingEvent,
   type ChatEventEnvelope, type ChatIpcErrorCode, type ChatSendMessageRequest,
+  type OrganicLearningEvent, type OrganicLearningReason, type OrganicLearningState,
 } from "../shared/ipc-contract.js";
 import { isTrustedIpcSender } from "../shared/ipc-security.js";
 
@@ -17,6 +18,8 @@ export interface ConversationRuntimeApi {
   restoreConversation?(conversationId: string, messages: readonly (Pick<ChatConversationMessage, "role" | "content"> & { sequence?: number })[],
     toolRecords?: readonly unknown[]): boolean;
   sendMessage(input: Readonly<ChatSendMessageRequest>): Promise<RuntimeMessageResult>;
+  scheduleOrganicAssessment?(input: Readonly<ChatSendMessageRequest>): boolean;
+  clearAllMemory?(): Promise<boolean>;
   cancelRequest(requestId: string, origin?: string): boolean;
   onEvent(listener: (event: RuntimeMessageEvent) => void): () => void;
   getMemoryMode?(): string;
@@ -46,6 +49,8 @@ export type RuntimeMessageResult =
 export type RuntimeMessageEvent = RuntimeMessageResult | { conversationId: string; requestId: string; status: "processing" }
   | { conversationId: string; requestId: string; status: "text_delta"; delta: string }
   | { conversationId: string; requestId: string; status: "text_reset" }
+  | { conversationId: string; requestId: string; status: "organic_assessment"; state: OrganicLearningState;
+      createdCount?: number; updatedCount?: number; writeFailedCount?: number; reason?: OrganicLearningReason }
   | AuthorizationRequiredEvent | SpotifyNowPlayingEvent;
 
 interface ChatWindowContext {
@@ -148,6 +153,11 @@ function isRuntimeEvent(value: unknown): value is RuntimeMessageEvent {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const event = value as Record<string, unknown>;
   if (typeof event.conversationId !== "string" || typeof event.requestId !== "string") return false;
+  if (event.status === "organic_assessment") return ["pending", "evaluating", "saved", "no_memory", "not_processed"].includes(String(event.state))
+    && (event.reason === undefined || ["not_eligible", "queue_limit", "runtime_closing", "cancelled", "memory_cleared", "evaluation_failed",
+      "write_failed", "not_scheduled", "schedule_failed", "request_failed"].includes(String(event.reason)))
+    && ["createdCount", "updatedCount", "writeFailedCount"].every((key) => event[key] === undefined
+      || Number.isSafeInteger(event[key]) && Number(event[key]) >= 0 && Number(event[key]) <= 10);
   if (event.status === "processing" || event.status === "cancelled") return true;
   if (event.status === "text_delta") return typeof event.delta === "string" && event.delta.length > 0
     && event.delta.length <= 16_000 && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(event.delta);
@@ -163,6 +173,7 @@ function isRuntimeEvent(value: unknown): value is RuntimeMessageEvent {
 export class ChatIpcService {
   private readonly activeByRequest = new Map<string, ActiveRequest>();
   private readonly queuedRequests: ActiveRequest[] = [];
+  private readonly organicRecipients = new Map<string, { window: ChatWindowContext; conversationId: string }>();
   private runningRequestId: string | null = null;
   private readonly seenRequestIds = new WeakMap<object, Set<string>>();
   private conversationId: string | null = null;
@@ -347,6 +358,7 @@ export class ChatIpcService {
     this.seenRequestIds.set(window as object, seen);
     const active: ActiveRequest = { window, request, terminal: false, cancelPending: false, startedAt: performance.now() };
     this.activeByRequest.set(request.requestId, active);
+    this.organicRecipients.set(request.requestId, { window, conversationId: request.conversationId });
     this.trace("main_ipc_received", { requestId: request.requestId, source: request.source });
     if (request.source === "typed" || request.source === "voice") {
       try { this.voiceHooks.onNewInteraction?.(request.requestId, request.source); } catch { /* Speech cancellation must not block chat. */ }
@@ -463,6 +475,8 @@ export class ChatIpcService {
   }
 
   cleanupWindow(window: ChatWindowContext, origin: ChatCleanupOrigin = "window_closed"): void {
+    for (const [requestId, recipient] of this.organicRecipients)
+      if (recipient.window === window) this.organicRecipients.delete(requestId);
     for (const queued of [...this.queuedRequests]) {
       if (queued.window !== window) continue;
       const index = this.queuedRequests.indexOf(queued);
@@ -491,6 +505,7 @@ export class ChatIpcService {
   dispose(): void {
     this.unsubscribeRuntime?.();
     this.unsubscribeRuntime = null;
+    this.organicRecipients.clear();
   }
 
   beginRuntimeSwitch(): boolean {
@@ -513,6 +528,10 @@ export class ChatIpcService {
 
   private handleRuntimeEvent(event: RuntimeMessageEvent): void {
     if (!isRuntimeEvent(event)) return;
+    if (event.status === "organic_assessment") {
+      this.dispatchOrganicLearningEvent(event);
+      return;
+    }
     const active = this.activeByRequest.get(event.requestId);
     if (!active || active.terminal || event.conversationId !== active.request.conversationId) return;
     this.trace("runtime_event_received", { conversationId: event.conversationId, requestId: event.requestId,
@@ -546,6 +565,41 @@ export class ChatIpcService {
       return;
     }
     this.completeFromResult(active, event);
+  }
+
+  private dispatchOrganicLearningEvent(event: Pick<OrganicLearningEvent, "conversationId" | "requestId" | "state" | "createdCount" | "updatedCount" | "writeFailedCount" | "reason">): void {
+    const recipient = this.organicRecipients.get(event.requestId);
+    if (!recipient || recipient.conversationId !== event.conversationId) {
+      this.trace("organic_assessment_renderer_state", { conversationId: event.conversationId,
+        requestId: event.requestId, delivery: "dropped", state: event.state,
+        reason: event.reason ?? "recipient_unavailable" });
+      return;
+    }
+    const payload: OrganicLearningEvent = { conversationId: event.conversationId, requestId: event.requestId,
+      status: "organic_learning", state: event.state,
+      ...(event.createdCount !== undefined ? { createdCount: event.createdCount } : {}),
+      ...(event.updatedCount !== undefined ? { updatedCount: event.updatedCount } : {}),
+      ...(event.writeFailedCount !== undefined ? { writeFailedCount: event.writeFailedCount } : {}),
+      ...(event.reason ? { reason: event.reason } : {}) };
+    if (recipient.window.isDestroyed?.() || !isChatEventEnvelope(payload)) {
+      this.trace("organic_assessment_renderer_state", { conversationId: event.conversationId,
+        requestId: event.requestId, delivery: "dropped", state: event.state,
+        reason: recipient.window.isDestroyed?.() ? "window_unavailable" : "invalid_event" });
+      this.organicRecipients.delete(event.requestId);
+      return;
+    }
+    try {
+      recipient.window.webContents.send(CHAT_EVENT_CHANNEL, payload);
+      this.trace("organic_assessment_renderer_state", { conversationId: event.conversationId,
+        requestId: event.requestId, delivery: "sent", state: event.state,
+        ...(event.reason ? { reason: event.reason } : {}) });
+    }
+    catch {
+      this.trace("organic_learning_event_forward_failed", { requestId: event.requestId });
+      this.trace("organic_assessment_renderer_state", { conversationId: event.conversationId,
+        requestId: event.requestId, delivery: "dropped", state: event.state, reason: "ipc_send_failed" });
+    }
+    if (["saved", "no_memory", "not_processed"].includes(event.state)) this.organicRecipients.delete(event.requestId);
   }
 
   private completeFromResult(active: ActiveRequest, result: RuntimeMessageResult): void {
@@ -626,20 +680,42 @@ export class ChatIpcService {
       conversationId: active.request.conversationId, requestId: active.request.requestId, status: "error" as const,
       error: { code: "operation_failed" as const, message: "Runtime returned an invalid conversation result." },
     };
-    this.emit(active, safeEvent);
+    const delivered = this.emit(active, safeEvent);
+    if (safeEvent.status === "cancelled" || safeEvent.status === "error") {
+      this.trace("organic_assessment_renderer_state", { conversationId: active.request.conversationId,
+        requestId: active.request.requestId, delivery: delivered ? "sent" : "dropped",
+        state: "not_processed", reason: safeEvent.status === "cancelled" ? "request_cancelled" : "request_failed" });
+    }
     if (safeEvent.status === "completed") this.trace("response_ipc_dispatched", { requestId: active.request.requestId,
       source: active.request.source, durationMs: performance.now() - active.startedAt });
     this.activeByRequest.delete(active.request.requestId);
     if (this.runningRequestId === active.request.requestId) this.runningRequestId = null;
     this.drainQueue();
+    if (safeEvent.status === "completed" && delivered) {
+      try {
+        const runtime = this.getRuntime();
+        const canSchedule = typeof runtime?.scheduleOrganicAssessment === "function";
+        const scheduled = canSchedule ? runtime!.scheduleOrganicAssessment!(active.request) : true;
+        if (!scheduled || !canSchedule) {
+          this.trace("organic_assessment_schedule", { conversationId: active.request.conversationId,
+            requestId: active.request.requestId, status: "not_scheduled",
+            reason: canSchedule ? "runtime_declined" : "runtime_unavailable" });
+          this.organicRecipients.delete(active.request.requestId);
+        }
+      } catch {
+        this.trace("organic_assessment_schedule_failed", { requestId: active.request.requestId });
+        this.dispatchOrganicLearningEvent({ conversationId: active.request.conversationId,
+          requestId: active.request.requestId, state: "not_processed", reason: "schedule_failed" });
+      }
+    } else this.organicRecipients.delete(active.request.requestId);
     if (active.request.source === "voice" && (safeEvent.status === "cancelled" || safeEvent.status === "error")) {
       try { this.voiceHooks.onVoiceRequestTerminal?.(active.request.requestId, safeEvent.status); }
       catch { /* Voice cleanup cannot affect the terminal chat result. */ }
     }
   }
 
-  private emit(active: ActiveRequest, payload: ChatEventEnvelope): void {
-    if (active.window.isDestroyed?.() || !isChatEventEnvelope(payload)) return;
+  private emit(active: ActiveRequest, payload: ChatEventEnvelope): boolean {
+    if (active.window.isDestroyed?.() || !isChatEventEnvelope(payload)) return false;
     try {
       active.window.webContents.send(CHAT_EVENT_CHANNEL, payload);
       if (payload.status === "completed") {
@@ -648,9 +724,11 @@ export class ChatIpcService {
       }
       this.trace("renderer_event_send_called", { conversationId: payload.conversationId,
         requestId: payload.requestId, status: payload.status });
+      return true;
     } catch {
       this.trace("renderer_event_forward_failed", { conversationId: payload.conversationId,
         requestId: payload.requestId, status: payload.status });
+      return false;
     }
   }
 

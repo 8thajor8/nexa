@@ -3,6 +3,7 @@ import { createAgent } from './agent.js';
 import { createAutomaticMemoryDetector } from '../memory/automatic/detector.js';
 import { openExistingMemory2Reader } from '../memory/read-existing.js';
 import { config, resolveCliMemoryMode } from '../config.js';
+import { createOpenAIEmbeddingProvider } from '../brain/openai.js';
 
 const readOnlyConsentStore = Object.freeze({
     async load() { return null; },
@@ -60,7 +61,11 @@ export async function createRuntimeAgent({
         throw new Error('NEXA_MEMORY2_STORE_PATH must be an absolute path to an existing Schema v5 store.');
     }
 
-    const reader = await openExistingMemory2Reader({ storePath });
+    const reader = await openExistingMemory2Reader({ storePath,
+        embeddings: agentOptions.memoryEmbeddingProvider ?? createOpenAIEmbeddingProvider(),
+        semanticIndexPath: `${storePath}.semantic-index-v2.json`,
+        authorizeSubject: subjectId => agentOptions.isOrganicThirdPartyLearningEnabled?.(subjectId) === true,
+        authorizeRelationships: subjectId => agentOptions.isOrganicRelationshipLearningEnabled?.(subjectId) === true });
     try {
         return await createAgent({
             ...agentOptions,

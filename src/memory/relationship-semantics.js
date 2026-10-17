@@ -75,6 +75,8 @@ export function describeRelation(input) {
         assertionId: input.assertion.id,
         subjectEntityId: input.subjectEntity.id,
         predicate: input.assertion.predicate,
+        relationshipType: input.assertion.relationship_type
+            ? structuredClone(input.assertion.relationship_type) : null,
         objectEntityId: input.objectEntity.id,
         symmetric: definition.symmetric,
         assertionStatus: input.assertion.status,
@@ -100,7 +102,8 @@ function duplicateKey(relation) {
         ? [relation.subjectEntityId, relation.objectEntityId].sort()
         : [relation.subjectEntityId, relation.objectEntityId];
     const temporalKey = value => value === null ? null : [value.precision, value.value];
-    return JSON.stringify([relation.predicate, endpoints, temporalKey(relation.validFrom), temporalKey(relation.validTo)]);
+    return JSON.stringify([relation.predicate, relation.relationshipType, endpoints,
+        temporalKey(relation.validFrom), temporalKey(relation.validTo)]);
 }
 
 /**

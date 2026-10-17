@@ -11,6 +11,7 @@ import { getToolsForModel, hostedToolRegistry, localToolRegistry } from '../tool
 import { conversationToolRecordContextItem, isConversationToolRecord } from './conversation-tool-records.js';
 
 const ID_MAX_LENGTH = 128;
+const MAX_PENDING_ORGANIC_ASSESSMENTS = 8;
 
 const safeProviderCodes = new Set([
     'invalid_api_key', 'model_not_found', 'model_not_available', 'unsupported_model',
@@ -162,6 +163,10 @@ export function createConversationRuntime({
     let closing;
     let sharedWritableMemoryBackendPromise = null;
     let sharedWritableMemoryBackend = null;
+    let activeOrganicAssessment = null;
+    let memoryClearInProgress = false;
+    const pendingOrganicAssessments = [];
+    const recentOrganicAssessmentRequests = new Set();
 
     function getSharedWritableMemoryBackend() {
         if (!sharedWritableMemoryBackendPromise) {
@@ -169,6 +174,9 @@ export function createConversationRuntime({
                 backend: 'memory2',
                 storePath,
                 organicMemoryAuthorizationFactory: agentOptions.organicMemoryAuthorizationFactory ?? null,
+                embeddingProvider: agentOptions.memoryEmbeddingProvider,
+                thirdPartyMemoryAccessEnabled: () => agentOptions.isOrganicThirdPartyLearningEnabled?.() === true,
+                relationshipMemoryAccessEnabled: () => agentOptions.isOrganicRelationshipLearningEnabled?.() === true,
             }).then(backend => {
                 sharedWritableMemoryBackend = backend;
                 return backend;
@@ -195,6 +203,14 @@ export function createConversationRuntime({
             try { listener(event); } catch { /* Subscribers cannot change Runtime state. */ }
         }
         return true;
+    }
+
+    function emitOrganicAssessment(job, state, details = {}) {
+        const event = Object.freeze({ conversationId: job.conversationId, requestId: job.requestId,
+            status: 'organic_assessment', state, ...details });
+        for (const listener of listeners) {
+            try { listener(event); } catch { /* Subscribers cannot change Runtime state. */ }
+        }
     }
 
     function rejected(conversationId, requestId, code, message, withEvent = false) {
@@ -249,6 +265,7 @@ export function createConversationRuntime({
                     && (memoryMode === 'memory2' || memoryMode === 'memory2-confirmed-write')) {
                     const backend = await getSharedWritableMemoryBackend();
                     options.memory2Repository = backend.repository;
+                    options.memoryContextProvider = backend.contextProvider;
                 }
                 return agentFactory({ memoryMode, storePath,
                     initialConversationHistory: conversation.initialConversationHistory,
@@ -434,6 +451,119 @@ export function createConversationRuntime({
         return entry.promise;
     }
 
+    function startNextOrganicAssessment() {
+        if (closed || memoryClearInProgress || activeOrganicAssessment || pendingOrganicAssessments.length === 0) return;
+        const job = pendingOrganicAssessments.shift();
+        activeOrganicAssessment = job;
+        emitOrganicAssessment(job, 'evaluating');
+        job.promise = Promise.resolve().then(() => job.agent.assessOrganicMessage(job.text,
+            { signal: job.controller.signal, requestId: job.requestId, conversationId: job.conversationId }))
+            .then(result => {
+                const createdCount = result?.createdCount ?? result?.persistedCount ?? 0;
+                const updatedCount = result?.updatedCount ?? 0;
+                const writeFailedCount = result?.writeFailedCount ?? 0;
+                const state = result?.success && result.outcome === 'evaluated'
+                    ? createdCount + updatedCount > 0 ? 'saved' : writeFailedCount > 0 ? 'not_processed' : 'no_memory'
+                    : 'not_processed';
+                const reason = state !== 'not_processed' ? undefined
+                    : result?.success && result.outcome === 'skipped' ? result.reason ?? 'not_eligible'
+                        : result?.success ? 'write_failed' : job.controller.signal.aborted ? 'cancelled' : 'evaluation_failed';
+                emitOrganicAssessment(job, state, { createdCount, updatedCount, writeFailedCount,
+                    ...(reason ? { reason } : {}) });
+                trace('organic_assessment_completed', { conversationId: job.conversationId, requestId: job.requestId,
+                    status: result?.success ? result.outcome === 'skipped' ? 'skipped' : 'evaluated' : 'rejected',
+                    state, ...(reason ? { reason } : {}),
+                    proposedCount: result?.proposedCount ?? 0, acceptedCount: result?.acceptedCount ?? result?.eligibleCount ?? 0,
+                    rejectedCount: result?.rejectedCount ?? 0, createdCount: result?.createdCount ?? result?.persistedCount ?? 0,
+                    updatedCount: result?.updatedCount ?? 0, writeFailedCount: result?.writeFailedCount ?? 0,
+                    persistedCount: result?.persistedCount ?? 0,
+                    relationshipPersistedCount: result?.relationshipPersistedCount ?? 0 });
+            }).catch(() => {
+                emitOrganicAssessment(job, 'not_processed', { reason: job.controller.signal.aborted ? 'cancelled' : 'evaluation_failed' });
+                trace('organic_assessment_completed', { conversationId: job.conversationId,
+                    requestId: job.requestId, status: job.controller.signal.aborted ? 'cancelled' : 'error',
+                    state: 'not_processed', reason: job.controller.signal.aborted ? 'cancelled' : 'evaluation_failed' });
+            })
+            .finally(() => {
+                if (activeOrganicAssessment === job) activeOrganicAssessment = null;
+                startNextOrganicAssessment();
+            });
+        trace('organic_assessment_started', { conversationId: job.conversationId, requestId: job.requestId,
+            queueDepth: pendingOrganicAssessments.length });
+    }
+
+    function scheduleOrganicAssessment(input = {}) {
+        if (closed) {
+            if (validIdentifier(input.conversationId) && validIdentifier(input.requestId))
+                trace('organic_assessment_skipped', { conversationId: input.conversationId,
+                    requestId: input.requestId, reason: 'runtime_closing' });
+            return false;
+        }
+        if (agentOptions.deferOrganicMemoryLearning !== true || memoryMode !== 'memory2-confirmed-write') return false;
+        if (!validIdentifier(input.conversationId) || !validIdentifier(input.requestId)
+            || typeof input.text !== 'string' || !input.text.trim()
+            || (input.source !== 'typed' && input.source !== 'voice')) return false;
+        const requestKey = `${input.conversationId}\u0000${input.requestId}`;
+        if (memoryClearInProgress) {
+            emitOrganicAssessment({ conversationId: input.conversationId, requestId: input.requestId },
+                'not_processed', { reason: 'memory_cleared' });
+            return false;
+        }
+        if (recentOrganicAssessmentRequests.has(requestKey)) {
+            trace('organic_assessment_skipped', { conversationId: input.conversationId, requestId: input.requestId,
+                reason: 'duplicate_request' });
+            return false;
+        }
+        const agent = conversations.get(input.conversationId)?.agent;
+        if (typeof agent?.assessOrganicMessage !== 'function') return false;
+        if (pendingOrganicAssessments.length >= MAX_PENDING_ORGANIC_ASSESSMENTS) {
+            trace('organic_assessment_skipped', { conversationId: input.conversationId, requestId: input.requestId,
+                reason: 'queue_full', queueDepth: pendingOrganicAssessments.length });
+            emitOrganicAssessment({ conversationId: input.conversationId, requestId: input.requestId },
+                'not_processed', { reason: 'queue_limit' });
+            return false;
+        }
+        const job = { conversationId: input.conversationId, requestId: input.requestId, text: input.text,
+            agent, controller: new AbortController(), promise: null };
+        recentOrganicAssessmentRequests.add(requestKey);
+        if (recentOrganicAssessmentRequests.size > 256)
+            recentOrganicAssessmentRequests.delete(recentOrganicAssessmentRequests.values().next().value);
+        pendingOrganicAssessments.push(job);
+        emitOrganicAssessment(job, 'pending');
+        trace('organic_assessment_scheduled', { conversationId: job.conversationId, requestId: job.requestId,
+            queueDepth: pendingOrganicAssessments.length });
+        startNextOrganicAssessment();
+        return true;
+    }
+
+    async function clearAllMemory() {
+        if (closed || memoryClearInProgress || memoryMode !== 'memory2-confirmed-write') return false;
+        memoryClearInProgress = true;
+        for (const job of pendingOrganicAssessments.splice(0)) {
+            emitOrganicAssessment(job, 'not_processed', { reason: 'memory_cleared' });
+            trace('organic_assessment_skipped', { conversationId: job.conversationId,
+                requestId: job.requestId, reason: 'memory_cleared', queueDepth: 0 });
+        }
+        const active = activeOrganicAssessment;
+        active?.controller.abort();
+        try {
+            if (active?.promise) await active.promise;
+            if (closed) return false;
+            const backend = await getSharedWritableMemoryBackend();
+            const result = await backend.service?.clearAllMemories?.();
+            if (result?.success !== true || result.outcome !== 'cleared') return false;
+            await backend.contextProvider?.clearSemanticIndex?.();
+            await Promise.allSettled([...conversations.values()].map(conversation =>
+                conversation.agent?.invalidateMemoryContext?.()));
+            return true;
+        } catch {
+            return false;
+        } finally {
+            memoryClearInProgress = false;
+            startNextOrganicAssessment();
+        }
+    }
+
     function cancelRequest(requestId, origin = 'unspecified') {
         if (typeof requestId !== 'string') return false;
         const entry = activeRequests.get(requestId);
@@ -455,6 +585,12 @@ export function createConversationRuntime({
         if (closing) return closing;
         if (closed) return Promise.resolve();
         closed = true;
+        for (const job of pendingOrganicAssessments.splice(0)) {
+            trace('organic_assessment_skipped', { conversationId: job.conversationId, requestId: job.requestId,
+                reason: 'runtime_closing', queueDepth: 0 });
+            emitOrganicAssessment(job, 'not_processed', { reason: 'runtime_closing' });
+        }
+        activeOrganicAssessment?.controller.abort();
         for (const entry of activeRequests.values()) {
             if (!entry.controller.signal.aborted) {
                 entry.cancelOrigin = 'runtime_close';
@@ -465,6 +601,12 @@ export function createConversationRuntime({
         }
         closing = (async () => {
             await Promise.allSettled([...activeRequests.values()].map(entry => entry.promise));
+            if (activeOrganicAssessment?.promise) {
+                let timeout;
+                await Promise.race([activeOrganicAssessment.promise,
+                    new Promise(resolve => { timeout = setTimeout(resolve, 250); })]);
+                clearTimeout(timeout);
+            }
             const errors = [];
             for (const conversation of conversations.values()) {
                 if (!conversation.agent) continue;
@@ -479,12 +621,13 @@ export function createConversationRuntime({
                 sharedWritableMemoryBackendPromise = null;
             }
             conversations.clear();
+            recentOrganicAssessmentRequests.clear();
             listeners.clear();
             if (errors.length) throw new Error('conversation_runtime_close_failed');
         })();
         return closing;
     }
 
-    return Object.freeze({ createConversation, restoreConversation, sendMessage, cancelRequest, onEvent,
+    return Object.freeze({ createConversation, restoreConversation, sendMessage, scheduleOrganicAssessment, clearAllMemory, cancelRequest, onEvent,
         getMemoryMode: () => memoryMode === 'memory2-confirmed-write' ? memoryMode : resolveCliMemoryMode(memoryMode), close });
 }

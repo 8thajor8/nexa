@@ -45,7 +45,8 @@ async function withFixture(contents, callback) {
 test('opens an existing v5 store and returns the context-provider structure without changing bytes or creating auxiliaries', async () => {
     const bytes = Buffer.from(JSON.stringify(store(), null, 2) + '\n');
     await withFixture(bytes, async ({ directory, storePath }) => {
-        const reader = await openExistingMemory2Reader({ storePath });
+        const reader = await openExistingMemory2Reader({ storePath, embeddings: { model: 'synthetic-test-v1',
+            async embedMany(texts) { return texts.map(() => [1, 0]); } } });
         assert.deepEqual(Object.getOwnPropertyNames(reader).sort(), ['close', 'readContext', 'searchContext']);
         assert.equal(Object.getPrototypeOf(reader), null);
         const result = await reader.readContext({ message: 'What do I remember?' });
@@ -53,10 +54,10 @@ test('opens an existing v5 store and returns the context-provider structure with
         assert.equal(result.revision, 1);
         assert.match(result.digest, /^[a-f0-9]{64}$/u);
         assert.equal(result.generation, 0);
-        assert.equal(result.items[0].type, 'function_call');
-        assert.equal(JSON.parse(result.items[1].output).assertions[0].object.value, 'Synthetic reader fixture.');
-        assert.equal((await reader.searchContext({ query: 'Synthetic' })).assertions[0].object.value,
-            'Synthetic reader fixture.');
+        assert.deepEqual(result.items, [], 'automatic context does not guess memory relevance from generic wording');
+        const search = await reader.searchContext({ query: 'Synthetic' });
+        assert.equal(search.status, 'found', JSON.stringify(search));
+        assert.ok(search.assertions.some(item => item.object?.value === 'Synthetic reader fixture.'));
         assert.deepEqual(await readdir(directory), ['memory-v2.json']);
         assert.deepEqual(await readFile(storePath), bytes);
         await reader.close();

@@ -29,9 +29,21 @@ function renderSettings(onClose = vi.fn(), onPreferencesChange = vi.fn()) {
   const windowApi = { get: vi.fn(async () => snapshot), set: vi.fn(async (preferences) => ({ ...snapshot, preferences,
     effectiveFullscreen: preferences.startFullscreen, effectiveDisplayId: preferences.displayId })),
     onChanged: vi.fn((listener) => { changedListener = listener; return vi.fn(); }) };
-  const memoryApi = { getStatus: vi.fn(async () => ({ mode: "memory1" as const, memory2Available: true, memory2WriteAvailable: true, switching: false, fallbackReason: null })),
-    setMode: vi.fn(async (mode: DesktopMemoryMode): Promise<DesktopMemoryModeResult> => ({ ok: true,
-      status: { mode, memory2Available: true, memory2WriteAvailable: true, switching: false, fallbackReason: null } })) };
+  const memoryStatus = { mode: "memory1" as DesktopMemoryMode, memory2Available: true, memory2WriteAvailable: true,
+    switching: false, fallbackReason: null, relationshipLearningEnabled: false, relationshipLearningEffective: false,
+    thirdPartyLearningEnabled: true, thirdPartyLearningEffective: false };
+  const memoryApi = { getStatus: vi.fn(async () => ({ ...memoryStatus })),
+    clearAll: vi.fn(async () => ({ ok: true as const })),
+    setMode: vi.fn(async (mode: DesktopMemoryMode): Promise<DesktopMemoryModeResult> => {
+      memoryStatus.mode = mode;
+      memoryStatus.thirdPartyLearningEffective = mode === "memory2-confirmed-write" && memoryStatus.thirdPartyLearningEnabled;
+      return { ok: true, status: { ...memoryStatus } };
+    }),
+    setThirdPartyLearningEnabled: vi.fn(async (enabled: boolean): Promise<DesktopMemoryModeResult> => {
+      memoryStatus.thirdPartyLearningEnabled = enabled;
+      memoryStatus.thirdPartyLearningEffective = enabled && memoryStatus.mode === "memory2-confirmed-write";
+      return { ok: true, status: { ...memoryStatus } };
+    }) };
   const restartDesktop = vi.fn(async () => ({ ok: true as const, accepted: true as const }));
   Object.defineProperty(window, "nexaDesktop", { configurable: true, value: { windowSettings: windowApi, memory: memoryApi, restartDesktop } });
   return { onClose, onPreferencesChange, windowApi, memoryApi, restartDesktop, emitSettings: (settings: typeof snapshot) => changedListener?.(settings), ...render(createElement(SettingsModal, {
@@ -102,6 +114,44 @@ describe("Settings modal", () => {
     await waitFor(() => expect((selector as HTMLSelectElement).value).toBe("memory2-confirmed-write"));
     expect(memoryApi.setMode).toHaveBeenCalledWith("memory2-confirmed-write");
     expect(screen.getByText(/las preferencias cotidianas claras pueden aprenderse automáticamente/i)).toBeTruthy();
+  });
+
+  it("shows the independent third-party permission and sends its changes through Main", async () => {
+    const { memoryApi } = renderSettings();
+    const checkbox = await screen.findByRole("checkbox", { name: "Recordar información sobre otras personas" });
+    expect((checkbox as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(checkbox);
+    await waitFor(() => expect(memoryApi.setThirdPartyLearningEnabled).toHaveBeenCalledWith(false));
+    await waitFor(() => expect((checkbox as HTMLInputElement).checked).toBe(false));
+    expect(screen.getByRole("checkbox", { name: "Recordar relaciones personales" })).toHaveProperty("checked", false);
+  });
+
+  it("requires explicit confirmation before clearing Memory2 and reports only confirmed success", async () => {
+    const { memoryApi } = renderSettings();
+    const selector = await screen.findByRole("combobox", { name: "Backend de memoria" });
+    fireEvent.change(selector, { target: { value: "memory2-confirmed-write" } });
+    await screen.findByRole("button", { name: "Borrar recuerdos de Memory2" });
+    fireEvent.click(screen.getByRole("button", { name: "Borrar recuerdos de Memory2" }));
+    expect(memoryApi.clearAll).not.toHaveBeenCalled();
+    expect(screen.getByText("¿Borrar toda la memoria de Nexa?")).toBeTruthy();
+    expect(screen.getByText(/Esta acción no se puede deshacer/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Cancelar" }));
+    expect(memoryApi.clearAll).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Borrar recuerdos de Memory2" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sí, borrar toda la memoria" }));
+    await waitFor(() => expect(memoryApi.clearAll).toHaveBeenCalledOnce());
+    expect(await screen.findByText(/Se borraron los recuerdos de Memory2/i)).toBeTruthy();
+  });
+
+  it("does not display success when Memory2 reports a clear failure", async () => {
+    const { memoryApi } = renderSettings();
+    memoryApi.clearAll.mockResolvedValueOnce({ ok: false, error: "operation_failed" });
+    const selector = await screen.findByRole("combobox", { name: "Backend de memoria" });
+    fireEvent.change(selector, { target: { value: "memory2-confirmed-write" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Borrar recuerdos de Memory2" }));
+    fireEvent.click(screen.getByRole("button", { name: "Sí, borrar toda la memoria" }));
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    expect(screen.queryByText(/Se borraron los recuerdos de Memory2/i)).toBeNull();
   });
 
   it("loads monitor details and persists monitor and fullscreen preferences through Main", async () => {

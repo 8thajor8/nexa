@@ -103,6 +103,23 @@ test('symmetric creation canonicalizes endpoints, is idempotent, and reads from 
     assert.equal(saved.snapshot.sources.length, 1);
 });
 
+test('Memory2 clear removes relation history and orphan person entities but preserves the owner entity', async t => {
+    const { service, repository, self, createPerson } = await setup(t);
+    const other = await createPerson();
+    assert.equal((await create(service, request(self, other))).success, true);
+    const before = await repository.readSnapshot();
+    assert.equal(before.snapshot.assertions.length, 1);
+    assert.equal(before.snapshot.entities.length, 2);
+    const cleared = await service.clearAllMemories();
+    assert.equal(cleared.success, true);
+    const after = await repository.readSnapshot();
+    assert.deepEqual(after.snapshot.assertions, []);
+    assert.deepEqual(after.snapshot.sources, []);
+    assert.deepEqual(after.snapshot.evidence, []);
+    assert.deepEqual(after.snapshot.entities.map(item => item.id), [self]);
+    assert.deepEqual((await service.relationsForEntity({ entityId: self, predicate: null })).relationships, []);
+});
+
 test('one person may have multiple partners; creation never silently supersedes', async t => {
     const { service, repository, self, createPerson } = await setup(t); const a = await createPerson(), b = await createPerson();
     const r1 = await create(service, request(self, a)); const r2 = await create(service, request(self, b));

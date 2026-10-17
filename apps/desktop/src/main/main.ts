@@ -14,7 +14,7 @@ import { desktopStartupPolicy, prepareDesktopIsolation, resolveSyntheticMemory2S
 import { createSyntheticOrganicPilotSession } from "./organic-memory-pilot.js";
 import { createDesktopOrganicMemoryHost } from "./organic-memory-desktop.js";
 // @ts-expect-error The repository's JavaScript Memory 2 initializer intentionally has no generated declaration file.
-import { initializeEmptyMemoryStore } from "../../../../src/memory/backend.js";
+import { initializeEmptyMemoryStore, openMemoryBackend } from "../../../../src/memory/backend.js";
 // @ts-expect-error The repository's JavaScript Memory 2 reader intentionally has no generated declaration file.
 import { openExistingMemory2Reader } from "../../../../src/memory/read-existing.js";
 // @ts-expect-error The repository's JavaScript Runtime intentionally has no generated declaration file.
@@ -23,6 +23,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { registerIpcHandlers } from "./ipc.js";
 import { createDesktopRestartController, DEV_RESTART_EXIT_CODE } from "./restart.js";
+import { sanitizeOrganicMemoryDiagnosticDetails } from "./organic-memory-diagnostic-payload.js";
 import { registerChatNavigationHandlers } from "./chat-navigation.js";
 import { isAllowedNavigation, isTrustedIpcSender } from "../shared/ipc-security.js";
 import {
@@ -38,6 +39,7 @@ import {
   SPOTIFY_OPEN_TRACK_CHANNEL,
   MEMORY_MODE_GET_CHANNEL,
   MEMORY_MODE_SET_CHANNEL,
+  MEMORY_CLEAR_ALL_CHANNEL,
   DESKTOP_RENDERER_ISOLATION_ARGUMENT,
   DESKTOP_RENDERER_ORGANIC_PILOT_ARGUMENT,
 } from "../shared/ipc-contract.js";
@@ -50,6 +52,7 @@ import {
 } from "./security.js";
 import { getWindowsWallpaper } from "./wallpaper.js";
 import { desktopTraceDisposition } from "./diagnostic-policy.js";
+import { createOrganicRelationshipTraceWriter } from "./organic-relationship-trace.js";
 import { applyWindowPlacement, centeredWindowBounds, createWindowOperationQueue, createWindowPreferencesStore, describeDisplays,
   fullscreenPreferenceAfterTransition, isFullscreenToggleInput, setFullscreenAndWait,
   normalizeWindowPreferences, preferencesAfterPlacement, resolveFullscreenForSettingsUpdate, type ScreenDisplayLike } from "./window-settings.js";
@@ -62,6 +65,7 @@ import { beginChatRuntimeSwitch, cleanupChatWindow, endChatRuntimeSwitch, refres
   registerChatIpcHandlers, removeChatIpcHandlers, type ConversationRuntimeApi } from "./chat-ipc.js";
 import { isApprovedSyntheticStore, isReadableMemory2Store, registerMemoryModeIpcHandlers } from "./memory-mode-ipc.js";
 import { createMemoryModePreferencesStore, resolveInitialDesktopMemoryMode, type MemoryModeFallbackReason } from "./memory-mode-preferences.js";
+import { createOrganicMemoryPreferencesStore } from "./organic-memory-preferences.js";
 import {
   cleanupVoiceWindow,
   cancelVoiceSpeech,
@@ -219,6 +223,9 @@ const syntheticMemoryStoreCandidate = process.env.LOCALAPPDATA
   ? join(process.env.LOCALAPPDATA, "Nexa", "Temporary", "memory-desktop-01", "nexa-memory2-synthetic-desktop-v5.json")
   : undefined;
 const desktopDiagnosticsEnabled = process.env.NEXA_DIAGNOSTICS === "true";
+const organicRelationshipTrace = createOrganicRelationshipTraceWriter({
+  enabled: !app.isPackaged && process.env.NEXA_ORGANIC_RELATIONSHIP_DIAGNOSTICS === "true",
+});
 const audioDuckingDiagnosticsEnabled = process.env.NEXA_AUDIO_DUCKING_DIAGNOSTICS === "true";
 let audioDuckingShutdownStarted = false;
 let audioDuckingClosed = false;
@@ -261,6 +268,7 @@ let closingRuntime = false;
 let runtimeClosed = false;
 const windowPreferencesStore = createWindowPreferencesStore(app.getPath("userData"));
 const memoryModePreferencesStore = createMemoryModePreferencesStore(app.getPath("userData"));
+const organicMemoryPreferencesStore = createOrganicMemoryPreferencesStore(app.getPath("userData"));
 const conversationStore = createConversationStore({ baseDirectory: resolve(app.getPath("userData"), "conversation-store") });
 
 function windowDisplays() {
@@ -269,7 +277,9 @@ function windowDisplays() {
 
 function createDesktopConversationRuntime(memoryMode: "memory1" | "memory2-readonly" | "memory2-confirmed-write", storePath?: string): ConversationRuntimeApi {
   const organicHost = memoryMode === "memory2-confirmed-write" && storePath
-    ? createDesktopOrganicMemoryHost({ storePath }) : null;
+    ? createDesktopOrganicMemoryHost({ storePath,
+      relationshipLearningEnabled: organicMemoryPreferencesStore.readRelationshipLearningEnabled(),
+      thirdPartyLearningEnabled: organicMemoryPreferencesStore.readThirdPartyLearningEnabled() }) : null;
   const agentOptions = !startupPolicy.allowRuntimeTools
     ? { getTools: () => [], ask: async () => { throw new Error("desktop_isolation_provider_disabled"); }, logger: writeAgentTrace }
     : { logger: writeAgentTrace };
@@ -294,15 +304,27 @@ function createDesktopConversationRuntime(memoryMode: "memory1" | "memory2-reado
         : basename(storePath ?? "") === "nexa-memory2-synthetic-desktop-v5.json" ? "synthetic_memory_desktop_01"
           : memoryMode === "memory1" ? "not_applicable" : "unknown",
       ...(memoryMode === "memory2-confirmed-write" ? { allowConfirmedMemoryWrites: true,
-        enableOrganicMemoryLearning: true, organicMemoryAuthorizationFactory: organicHost?.authorizationFactory,
-        organicEvidenceCapabilityFactory: organicHost?.evidenceCapabilityFactory } : {}) },
+        enableOrganicMemoryLearning: true, deferOrganicMemoryLearning: true,
+        organicMemoryAuthorizationFactory: organicHost?.authorizationFactory,
+        organicEvidenceCapabilityFactory: organicHost?.evidenceCapabilityFactory,
+        organicThirdPartyEvidenceCapabilityFactory: organicHost?.thirdPartyEvidenceCapabilityFactory,
+        isOrganicThirdPartyLearningEnabled: () => organicHost?.thirdPartyLearningEnabled === true,
+        organicRelationshipEvidenceCapabilityFactory: organicHost?.relationshipEvidenceCapabilityFactory,
+        isOrganicRelationshipLearningEnabled: () => organicHost?.relationshipLearningEnabled === true } : {}) },
     diagnostic: (event: Record<string, unknown>) => {
       const { event: name, ...details } = event;
+      if (name === "organic_relationship_trace") {
+        organicRelationshipTrace(details);
+        return;
+      }
       writeSafeTrace("runtime", String(name), details);
     },
   }) as ConversationRuntimeApi;
   if (!organicHost) return runtime;
-  return Object.freeze({ ...runtime, close: async () => { organicHost.revoke(); await runtime.close(); } }) as ConversationRuntimeApi;
+  return Object.freeze({ ...runtime,
+    setRelationshipLearningEnabled: (enabled: boolean) => organicHost.setRelationshipLearningEnabled(enabled),
+    setThirdPartyLearningEnabled: (enabled: boolean) => organicHost.setThirdPartyLearningEnabled(enabled),
+    close: async () => { organicHost.revoke(); await runtime.close(); } }) as ConversationRuntimeApi;
 }
 
 function resolveApprovedMemory2StorePath(): string | null {
@@ -319,6 +341,23 @@ async function prepareApprovedMemory2WriteStore(storePath: string): Promise<void
   await mkdir(dirname(approvedPath), { recursive: true });
   if (resolveApprovedMemory2WriteStorePath() !== approvedPath) throw new Error("memory2_write_store_path_rejected");
   await initializeEmptyMemoryStore({ storePath: approvedPath });
+}
+
+async function clearApprovedMemory2Store(): Promise<boolean> {
+  const storePath = resolveApprovedMemory2WriteStorePath();
+  if (!storePath) return false;
+  try { await lstat(storePath); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return true;
+    return false;
+  }
+  const backend = await openMemoryBackend({ backend: "memory2", storePath });
+  try {
+    const result = await backend.service?.clearAllMemories?.();
+    return result?.success === true && result.outcome === "cleared";
+  } finally {
+    await backend.close();
+  }
 }
 
 let windowPreferences: WindowPreferences = { displayId: "", startFullscreen: true };
@@ -521,11 +560,20 @@ function writeSafeTrace(area: string, event: string, details: Record<string, unk
     "targetWorkAreaX", "targetWorkAreaY", "targetWorkAreaWidth", "targetWorkAreaHeight", "targetDisplayBoundsX",
     "targetDisplayBoundsY", "targetDisplayBoundsWidth", "targetDisplayBoundsHeight", "stableSamples", "checkpoint", "failurePhase",
     "validationReason", "resultTextType", "resultTextLength", "resultTextBytes", "resultTextEmpty", "resultTextOverLimit",
+    "queueDepth", "proposedCount", "acceptedCount", "eligibleCount", "rejectedCount", "createdCount", "updatedCount",
+    "state", "delivery", "recoveredCount", "deliveredCount", "factsCount", "relationshipsCount", "candidateCount",
+    "verifierApprovedCount", "postVerificationRejectedCount", "postValidationPassedCount",
+    "writeFailedCount", "persistedCount", "unchangedCount", "relationshipPersistedCount", "relationshipUnchangedCount",
+    "relationshipNeedsClarificationCount", "relationshipRejectedCount", "relationshipVerifierRejectedCount",
+    "relationshipEvidenceRejectedCount", "assertionCount", "relationCount", "matchCount", "contextItemCount", "resultCount",
     "resultTextHasDisallowedControl", "streamedTextLength", "streamedTextBytes", "streamedTextMatchesFinal"];
   const safeDetails = Object.fromEntries(safeFields.filter((key) => {
     const value = details[key];
+    if ((key === "conversationId" || key === "requestId")
+      && (typeof value !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/u.test(value))) return false;
     return value === null || ["string", "number", "boolean"].includes(typeof value);
   }).map((key) => [key, details[key]]));
+  Object.assign(safeDetails, sanitizeOrganicMemoryDiagnosticDetails(area, event, details));
   const disposition = desktopTraceDisposition(desktopDiagnosticsEnabled, area, event, safeDetails);
   if (disposition === "silent") return;
   const line = `[nexa-desktop] ${JSON.stringify({ area, event, timestamp: new Date().toISOString(), ...safeDetails })}`;
@@ -827,6 +875,7 @@ function installWebContentsGuards(): void {
       resolveStorePath: resolveApprovedMemory2StorePath,
       resolveWriteStorePath: resolveApprovedMemory2WriteStorePath,
       prepareWriteStore: prepareApprovedMemory2WriteStore,
+      clearMemoryStore: clearApprovedMemory2Store,
       openReader: openExistingMemory2Reader as never,
       beginRuntimeSwitch: beginChatRuntimeSwitch,
       refreshRuntimeAfterSwitch: refreshChatRuntimeAfterSwitch,
@@ -834,6 +883,7 @@ function installWebContentsGuards(): void {
       initialMode: initialMemoryMode,
       initialFallbackReason: memoryModeFallbackReason,
       preferencesStore: memoryModePreferencesStore,
+      relationshipPreferencesStore: organicMemoryPreferencesStore,
     });
   }
   if (startupPolicy.registerAuthorization) {
@@ -913,6 +963,7 @@ app.on("before-quit", (event) => {
     removeChatIpcHandlers();
     ipcMain.removeHandler(MEMORY_MODE_GET_CHANNEL);
     ipcMain.removeHandler(MEMORY_MODE_SET_CHANNEL);
+    ipcMain.removeHandler(MEMORY_CLEAR_ALL_CHANNEL);
     removeAuthorizationIpcHandlers();
     const closeRuntime = organicPilotSession ? organicPilotSession.close() : conversationRuntime.close();
     void closeRuntime.catch(() => {
@@ -927,6 +978,7 @@ app.on("before-quit", (event) => {
   removeChatIpcHandlers();
   ipcMain.removeHandler(MEMORY_MODE_GET_CHANNEL);
   ipcMain.removeHandler(MEMORY_MODE_SET_CHANNEL);
+  ipcMain.removeHandler(MEMORY_CLEAR_ALL_CHANNEL);
   removeAuthorizationIpcHandlers();
   removeSpotifyLiveStatusHandlers();
   removeMasterVolumeIpcHandlers();

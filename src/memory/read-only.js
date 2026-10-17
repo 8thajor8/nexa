@@ -18,8 +18,11 @@ function safeError(code) {
  * Read-only view over an injected Memory2 repository.
  * The caller retains ownership of the repository and must close it separately.
  */
-export function createMemory2ReadOnly({ repository, matchSpecificSelfQueries = false } = {}) {
-    const contextProvider = createMemoryContextProvider({ repository, matchSpecificSelfQueries });
+export function createMemory2ReadOnly({ repository, matchSpecificSelfQueries = false, embeddings = null,
+    semanticIndex = null, indexPath = null, authorizeSubject = () => false,
+    authorizeRelationships = () => false } = {}) {
+    const contextProvider = createMemoryContextProvider({ repository, matchSpecificSelfQueries, embeddings,
+        semanticIndex, indexPath, authorizeSubject, authorizeRelationships });
     let closed = false;
 
     const facade = Object.create(null);

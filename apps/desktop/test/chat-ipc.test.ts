@@ -63,6 +63,127 @@ function harness(runtime: ConversationRuntimeApi | null,
 describe("Main chat IPC to Conversation Runtime", () => {
   beforeEach(() => vi.clearAllMocks());
 
+  it("starts organic assessment only after the assistant is persisted and the response is dispatched", async () => {
+    const assistantPersisted = deferred<void>();
+    const events: string[] = [];
+    const { runtime } = fakeRuntime();
+    runtime.scheduleOrganicAssessment = vi.fn(() => { events.push("assessment"); return true; });
+    const store = {
+      createConversation: vi.fn(async (id?: string) => ({ conversationId: id ?? conversationId })),
+      listConversations: vi.fn(async () => ({ conversations: [], nextCursor: null })),
+      getConversation: vi.fn(async () => null),
+      appendMessage: vi.fn(async (_id: string, message: { role: string }) => {
+        if (message.role === "assistant") { await assistantPersisted.promise; events.push("persisted"); }
+      }),
+      listMessages: vi.fn(async () => ({ messages: [], nextCursor: null, incompleteTail: false })),
+    };
+    const h = harness(runtime, undefined, undefined, store);
+    const send = h.contents.send;
+    send.mockImplementation((_channel: string, payload: ChatEventEnvelope) => {
+      if (payload.status === "completed") events.push("delivered");
+    });
+    try {
+      h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+      await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, request);
+      await vi.waitFor(() => expect(store.appendMessage.mock.calls.some((call) => call[1].role === "assistant")).toBe(true));
+      expect(runtime.scheduleOrganicAssessment).not.toHaveBeenCalled();
+      assistantPersisted.resolve();
+      await vi.waitFor(() => expect(runtime.scheduleOrganicAssessment).toHaveBeenCalledOnce());
+      expect(events).toEqual(["persisted", "delivered", "assessment"]);
+    } finally { h.service.dispose(); }
+  });
+
+  it("does not assess cancelled or failed conversations", async () => {
+    for (const result of [
+      { conversationId, requestId: request.requestId, status: "cancelled" as const },
+      { conversationId, requestId: request.requestId, status: "error" as const,
+        error: { code: "operation_failed", message: "Synthetic failure" } },
+    ]) {
+      const { runtime } = fakeRuntime(Promise.resolve(result));
+      runtime.scheduleOrganicAssessment = vi.fn(() => true);
+      const h = harness(runtime);
+      try {
+        h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+        await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, request);
+        await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) =>
+          (call[1] as ChatEventEnvelope).status === result.status)).toBe(true));
+        expect(runtime.scheduleOrganicAssessment).not.toHaveBeenCalled();
+      } finally { h.service.dispose(); }
+    }
+  });
+
+  it("forwards organic learning outcomes after the response using the original request correlation", async () => {
+    const diagnostics: Array<[string, Readonly<Record<string, string | number | boolean | null>>]> = [];
+    const { runtime, listeners } = fakeRuntime();
+    runtime.scheduleOrganicAssessment = vi.fn((input) => {
+      for (const listener of listeners) {
+        listener({ conversationId: input.conversationId, requestId: input.requestId,
+          status: "organic_assessment", state: "pending" });
+        listener({ conversationId: input.conversationId, requestId: input.requestId,
+          status: "organic_assessment", state: "evaluating" });
+        listener({ conversationId: input.conversationId, requestId: input.requestId,
+          status: "organic_assessment", state: "saved", createdCount: 1, updatedCount: 0 });
+      }
+      return true;
+    });
+    const h = harness(runtime, (event, details) => diagnostics.push([event, details]));
+    try {
+      h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+      await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, request);
+      await vi.waitFor(() => expect(h.contents.send.mock.calls.some((call) => (call[1] as ChatEventEnvelope).status === "completed")).toBe(true));
+      const events = h.contents.send.mock.calls.map((call) => call[1] as ChatEventEnvelope)
+        .filter((event) => event.status === "organic_learning");
+      expect(events).toEqual([
+        { conversationId, requestId: request.requestId, status: "organic_learning", state: "pending" },
+        { conversationId, requestId: request.requestId, status: "organic_learning", state: "evaluating" },
+        { conversationId, requestId: request.requestId, status: "organic_learning", state: "saved", createdCount: 1, updatedCount: 0 },
+      ]);
+      expect(events.every((event) => event.conversationId === conversationId && event.requestId === request.requestId)).toBe(true);
+      expect(diagnostics.filter(([event]) => event === "organic_assessment_renderer_state")).toEqual([
+        ["organic_assessment_renderer_state", { conversationId, requestId: request.requestId,
+          delivery: "sent", state: "pending" }],
+        ["organic_assessment_renderer_state", { conversationId, requestId: request.requestId,
+          delivery: "sent", state: "evaluating" }],
+        ["organic_assessment_renderer_state", { conversationId, requestId: request.requestId,
+          delivery: "sent", state: "saved" }],
+      ]);
+    } finally { h.service.dispose(); }
+  });
+
+  it("traces the categorized no-processing reason delivered to the Renderer", async () => {
+    const diagnostics: Array<[string, Readonly<Record<string, string | number | boolean | null>>]> = [];
+    const { runtime, listeners } = fakeRuntime();
+    runtime.scheduleOrganicAssessment = vi.fn((input) => {
+      listeners.forEach((listener) => listener({ conversationId: input.conversationId,
+        requestId: input.requestId, status: "organic_assessment", state: "not_processed", reason: "evaluation_failed" }));
+      return true;
+    });
+    const h = harness(runtime, (event, details) => diagnostics.push([event, details]));
+    try {
+      h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+      await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, request);
+      await vi.waitFor(() => expect(diagnostics.some(([event, details]) => event === "organic_assessment_renderer_state"
+        && details.state === "not_processed")).toBe(true));
+      expect(diagnostics).toContainEqual(["organic_assessment_renderer_state", {
+        conversationId, requestId: request.requestId, delivery: "sent", state: "not_processed", reason: "evaluation_failed",
+      }]);
+      expect(JSON.stringify(diagnostics)).not.toContain(request.text);
+    } finally { h.service.dispose(); }
+  });
+
+  it("does not claim evaluation when Runtime does not schedule organic learning", async () => {
+    const { runtime } = fakeRuntime();
+    runtime.scheduleOrganicAssessment = vi.fn(() => false);
+    const h = harness(runtime);
+    try {
+      h.invoke(CHAT_CREATE_CONVERSATION_CHANNEL);
+      await h.invoke(CHAT_SEND_MESSAGE_CHANNEL, request);
+      await vi.waitFor(() => expect(runtime.scheduleOrganicAssessment).toHaveBeenCalledOnce());
+      expect(h.contents.send.mock.calls.map((call) => call[1] as ChatEventEnvelope)
+        .some((event) => event.status === "organic_learning" && event.state === "saved")).toBe(false);
+    } finally { h.service.dispose(); }
+  });
+
   it("titles a PTT-first request from its persisted user message without waiting for the assistant", async () => {
     const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "nexa-conversation-title-"));
     const store = createConversationStore({ baseDirectory: path.join(temporaryRoot, "conversations") });

@@ -128,6 +128,45 @@ test('forget requires a matching direct command, deletes an exact assertion and 
     assert.equal(snapshot.snapshot.assertions[0].id, current.id); assert.deepEqual(snapshot.snapshot.assertions[0].supersedes, []);
     assert.equal(snapshot.snapshot.evidence.some(item => item.assertion_id === old.id), false);
 });
+
+test('clearAllMemories removes only Memory2 records and preserves neighboring persona, settings, and conversations', async t => {
+    const { service, repository, directory } = await setup(t);
+    const value = 'Synthetic owner plays alto saxophone.';
+    const prop = proposal(value);
+    assert.equal((await service.remember({ proposal: prop }, await rememberGrant(service, value, prop))).success, true);
+    const settingsPath = path.join(directory, 'desktop-settings.json');
+    const personaPath = path.join(directory, 'persona-v1.json');
+    const conversationsPath = path.join(directory, 'conversations.json');
+    const settingsFixture = { voice: 'nova', permission: true, presence: 'holographic' };
+    const personaFixture = { version: 1, identity: 'Nexa', tone: 'warm and direct' };
+    const conversationsFixture = { conversations: [{ id: 'synthetic-conversation', messages: [{ role: 'user', content: 'Synthetic chat.' }] }] };
+    await fs.writeFile(settingsPath, JSON.stringify(settingsFixture), 'utf8');
+    await fs.writeFile(personaPath, JSON.stringify(personaFixture), 'utf8');
+    await fs.writeFile(conversationsPath, JSON.stringify(conversationsFixture), 'utf8');
+    const before = await repository.readSnapshot();
+    assert.equal(before.snapshot.assertions.length, 1);
+    const result = await service.clearAllMemories();
+    assert.equal(result.success, true);
+    assert.equal(result.outcome, 'cleared');
+    const after = await repository.readSnapshot();
+    assert.equal(after.snapshot.revision, before.snapshot.revision + 1);
+    assert.deepEqual(after.snapshot.assertions, []);
+    assert.deepEqual(after.snapshot.sources, []);
+    assert.deepEqual(after.snapshot.evidence, []);
+    assert.deepEqual(after.snapshot.entities.map(item => item.id), [after.snapshot.self_person_id]);
+    assert.deepEqual(JSON.parse(await fs.readFile(settingsPath, 'utf8')), settingsFixture);
+    assert.deepEqual(JSON.parse(await fs.readFile(personaPath, 'utf8')), personaFixture);
+    assert.deepEqual(JSON.parse(await fs.readFile(conversationsPath, 'utf8')), conversationsFixture);
+    assert.equal((await service.clearAllMemories()).success, true, 'a second wipe on an empty Store succeeds');
+});
+
+test('clearAllMemories fails closed when the repository wipe fails', async t => {
+    const { service, repository } = await setup(t);
+    const failing = createMemoryService({ repository: { ...repository, clearMemoryData: async () => { throw new Error('synthetic failure'); } } });
+    const result = await failing.clearAllMemories();
+    assert.equal(result.success, false);
+    assert.notEqual(result.outcome, 'cleared');
+});
 test('forget resolves and hard-deletes the exact compatibility slot including its full history', async t => {
     const { service, repository } = await setup(t); const a = proposal('Fictional Nia likes maps.');
     await service.remember({ proposal: a }, await rememberGrant(service, a.object.value, a));

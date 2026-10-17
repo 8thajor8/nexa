@@ -5,6 +5,8 @@ import path from 'node:path';
 import test from 'node:test';
 import { createConversationRuntime } from '../src/core/conversation-runtime.js';
 import { initializeEmptyMemoryStore } from '../src/memory/backend.js';
+import { createMemoryContextProvider } from '../src/memory/context-provider.js';
+import { createJsonMemoryRepository } from '../src/memory/json-repository.js';
 import { validateMemoryStore } from '../src/memory/schema.js';
 import { createOperationalDiagnostics, createTechnicalDiagnosticReport } from '../src/core/system-diagnostics.js';
 import { getActiveWindowTool } from '../src/windows/window-control.js';
@@ -78,6 +80,23 @@ function addSyntheticTextHistory(store, { key, values, idStart }) {
         store.evidence.push({ id: evidenceId, assertion_id: assertionId, source_id: sourceId, derivation: 'explicit',
             extraction_confidence: 1, learned_at: recordedAt, last_confirmed_at: null, legacy_ref: null });
     }
+    store.revision = 1;
+    store.updated_at = recordedAt;
+}
+
+function addUnlinkedActivityState(store, { key, value, id, secondsAfterCreation }) {
+    const suffix = String(id).padStart(12, '0');
+    const recordedAt = new Date(Date.parse(store.created_at) + secondsAfterCreation * 1000).toISOString();
+    const assertionId = `mem_00000000-0000-4000-8000-${suffix}`;
+    const sourceId = `src_00000000-0000-4000-8000-${suffix}`;
+    const evidenceId = `ev_00000000-0000-4000-8000-${suffix}`;
+    store.assertions.push({ id: assertionId, kind: 'fact', subject: { type: 'owner' }, predicate: 'user.note',
+        object: { type: 'text', value }, status: 'active', valid_from: null, valid_to: null, recorded_at: recordedAt,
+        supersedes: [], compatibility: { category: 'user', key } });
+    store.sources.push({ id: sourceId, kind: 'user_statement', origin_trust: 'user_asserted', authority: 'data_only',
+        locator: null, occurred_at: null, recorded_at: recordedAt });
+    store.evidence.push({ id: evidenceId, assertion_id: assertionId, source_id: sourceId, derivation: 'explicit',
+        extraction_confidence: 1, learned_at: recordedAt, last_confirmed_at: null, legacy_ref: null });
     store.revision = 1;
     store.updated_at = recordedAt;
 }
@@ -167,6 +186,101 @@ test('contextual current and previous followups use the selected Memory2 history
         assert.equal(await send(instance, conversationId, '¿Y ahora?', 'followup-current-after-error'), 'Ahora usás Cursor.');
         assert.equal(composeCount, 2);
         await instance.close();
+    });
+});
+
+test('current routine timing stays conversational while cessation date uses verified history', async () => {
+    await withStore(async ({ storePath }) => {
+        const store = JSON.parse(await readFile(storePath, 'utf8'));
+        addSyntheticTextHistory(store, { key: 'synthetic-weekly-routine', idStart: 631,
+            values: ['Los martes ensayo con mi banda.'] });
+        validateMemoryStore(store);
+        await writeFile(storePath, JSON.stringify(store), 'utf8');
+        const requests = [];
+        const instance = createRuntime(storePath, async request => {
+            requests.push(structuredClone(request));
+            return final('Ensayás con tu banda los martes.');
+        });
+        const conversationId = instance.createConversation();
+        try {
+            assert.equal(await send(instance, conversationId, '¿Cuándo ensayo?', 'routine-current-query'),
+                'Ensayás con tu banda los martes.');
+            assert.equal(requests.length, 1, 'a current routine question must reach the conversational model');
+            assert.equal(requests[0].tools.some(tool => tool.name === 'compose_memory_history_answer'), false,
+                'a routine question must not use the historical date-answer route');
+            assert.ok(requests[0].input.some(item => item?.call_id?.startsWith('memory_context_')),
+                'the current routine remains available through ordinary Memory2 context retrieval');
+
+            assert.equal(await send(instance, conversationId, '¿Cuándo dejé de ensayar?', 'routine-history-query'),
+                'No tengo registrada una fecha verificable para ese cambio.');
+            assert.equal(requests.length, 1,
+                'a cessation-date question remains on the read-only historical route and refuses to invent a date');
+        } finally { await instance.close(); }
+    });
+});
+
+test('an unlinked explicit activity cessation resolves current state and history without merging other topics', async () => {
+    await withStore(async ({ storePath }) => {
+        const store = JSON.parse(await readFile(storePath, 'utf8'));
+        addUnlinkedActivityState(store, { key: 'legacy-diving', value: 'Practico buceo.', id: 711,
+            secondsAfterCreation: 1 });
+        addUnlinkedActivityState(store, { key: 'practice-diving', value: 'Ya no practico buceo.', id: 712,
+            secondsAfterCreation: 2 });
+        addUnlinkedActivityState(store, { key: 'practice-swimming', value: 'Practico natación.', id: 713,
+            secondsAfterCreation: 3 });
+        validateMemoryStore(store);
+        await writeFile(storePath, JSON.stringify(store), 'utf8');
+
+        const repository = createJsonMemoryRepository({ storePath });
+        await repository.open();
+        try {
+            const provider = createMemoryContextProvider({ repository });
+            const currentSearch = await provider.search({ query: 'buceo', includeHistorical: false });
+            assert.deepEqual(currentSearch.assertions.map(item => item.object.value), ['Ya no practico buceo.']);
+            assert.deepEqual(currentSearch.conflicts, [], 'the current search does not report a completed cessation as a conflict');
+            const historicalSearch = await provider.search({ query: 'buceo', includeHistorical: true });
+            assert.ok(historicalSearch.assertions.some(item => item.object.value === 'Practico buceo.'),
+                'an explicit historical search still retains the earlier activity');
+        } finally { await repository.close(); }
+
+        const requests = [];
+        const instance = createRuntime(storePath, async request => {
+            requests.push(structuredClone(request));
+            const history = historyPayload(request);
+            if (history) {
+                assert.equal(history.status, 'verified');
+                assert.equal(history.hasPrevious, true);
+                assert.deepEqual(history.facts.map(item => [item.value, item.state]), [
+                    ['Practico buceo.', 'replaced'], ['Ya no practico buceo.', 'current'],
+                ]);
+                return composed([{ text: 'Sí, antes practicabas buceo.', role: 'previous', factIndexes: [0] }]);
+            }
+            return final('Actualmente ya no practicás buceo.');
+        });
+        const conversationId = instance.createConversation();
+        try {
+            assert.equal(await send(instance, conversationId, '¿Sigo practicando buceo?', 'activity-current'),
+                'Actualmente ya no practicás buceo.');
+            const currentPayloadItem = requests[0].input.find(item => item?.type === 'function_call_output'
+                && item.call_id?.startsWith('memory_context_'));
+            assert.ok(currentPayloadItem);
+            const currentPayload = JSON.parse(currentPayloadItem.output);
+            assert.ok(currentPayload.assertions.some(item => item.object.value === 'Ya no practico buceo.'));
+            assert.equal(currentPayload.assertions.some(item => item.object.value === 'Practico buceo.'), false,
+                'the superseded positive record is not supplied as a current-state contradiction');
+            assert.ok(currentPayload.assertions.some(item => item.object.value === 'Practico natación.'),
+                'a different activity remains a separate current fact');
+
+            assert.equal(await send(instance, conversationId, '¿Practicaba buceo antes?', 'activity-history'),
+                'Sí, antes practicabas buceo.');
+            assert.equal(requests.length, 2);
+
+            const beforeDateQuestion = requests.length;
+            assert.equal(await send(instance, conversationId, '¿Cuándo dejé de practicar buceo?', 'activity-date'),
+                'No tengo registrada una fecha verificable para ese cambio.');
+            assert.equal(requests.length, beforeDateQuestion,
+                'the history route does not invent a cessation date');
+        } finally { await instance.close(); }
     });
 });
 

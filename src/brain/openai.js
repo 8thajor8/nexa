@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import { config } from '../config.js';
 import { AUTOMATIC_MEMORY_OUTPUT_SCHEMA } from '../memory/automatic/schema.js';
+import { MEMORY_EMBEDDING_MODEL } from '../memory/semantic-index.js';
 
 let client;
 const liveAutomaticMemoryDetectors = new WeakSet();
@@ -22,6 +23,32 @@ export function getOpenAIClient() {
         });
     }
     return client;
+}
+
+/** Creates vectors for Memory2's local derived index. No content is logged. */
+export function createOpenAIEmbeddingProvider({ clientFactory = getOpenAIClient,
+    model = MEMORY_EMBEDDING_MODEL } = {}) {
+    if (typeof clientFactory !== 'function' || typeof model !== 'string' || !model.trim())
+        throw new TypeError('memory_embedding_provider_invalid');
+    return Object.freeze({ model, async embedMany(input, { signal } = {}) {
+        if (!Array.isArray(input) || input.length < 1 || input.length > 64
+            || input.some(text => typeof text !== 'string' || !text.trim() || text.length > 8000))
+            throw new TypeError('memory_embedding_input_invalid');
+        if (signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+        const client = clientFactory();
+        if (!client?.embeddings || typeof client.embeddings.create !== 'function')
+            throw new Error('memory_embedding_unavailable');
+        const response = await client.embeddings.create({ model, input, encoding_format: 'float' },
+            signal ? { signal } : undefined);
+        if (signal?.aborted) throw new DOMException('The operation was aborted.', 'AbortError');
+        if (!Array.isArray(response?.data) || response.data.length !== input.length)
+            throw new Error('memory_embedding_response_invalid');
+        const vectors = [...response.data].sort((a, b) => a.index - b.index).map(item => item.embedding);
+        if (vectors.some(vector => !Array.isArray(vector) || vector.length === 0
+            || vector.some(value => typeof value !== 'number' || !Number.isFinite(value))))
+            throw new Error('memory_embedding_response_invalid');
+        return vectors;
+    } });
 }
 
 const CONVERSATION_TITLE_MAX_LENGTH = 60;
@@ -57,13 +84,15 @@ export async function generateConversationTitle({ userMessage, assistantMessage,
 }
 
 export async function askOpenAI({ instructions, input, tools = [], toolChoice, signal, onTextDelta,
-    client = getOpenAIClient() }) {
+    store, maxOutputTokens, client = getOpenAIClient() }) {
     const request = {
         model: config.model,
         instructions,
         input,
         tools,
         ...(toolChoice ? { tool_choice: toolChoice } : {}),
+        ...(store === false ? { store: false } : {}),
+        ...(Number.isSafeInteger(maxOutputTokens) && maxOutputTokens > 0 ? { max_output_tokens: maxOutputTokens } : {}),
     };
     if (typeof onTextDelta !== 'function')
         return client.responses.create(request, signal ? { signal } : undefined);

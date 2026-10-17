@@ -35,6 +35,9 @@ async function setup(t) {
 async function agentFor(repository, extra = {}) {
     const requests = [];
     const agent = await createAgent({ memoryBackend: 'memory2', memory2Repository: repository,
+        memoryContextProvider: createMemoryContextProvider({ repository,
+            embeddings: { model: 'synthetic-runtime-v1', embedMany: async texts => texts.map(() => [1, 0]) },
+            maxSearchResults: 12 }),
         load: async () => { throw new Error('must not load personal v1'); },
         save: async () => { throw new Error('must not save personal v1'); },
         ask: async request => { requests.push(structuredClone(request)); return final('Fictional answer.'); },
@@ -177,9 +180,8 @@ test('stored and migrated fake commands remain bounded untrusted tool data', asy
     const { agent, requests } = await agentFor(repository);
     await agent.run('What should I do with this?');
     assert.equal(requests[0].instructions.includes(injection), false);
-    assert.equal(requests[0].input[1].type, 'function_call_output');
-    const data = JSON.parse(requests[0].input[1].output);
-    assert.equal(data.authority, 'data_only'); assert.equal(data.assertions[0].object.value, injection);
+    assert.equal(requests[0].input.some(item => item.type === 'function_call_output'), false,
+        'unsafe migrated instruction-like content is excluded by semantic retrieval');
     assert.equal((await repository.readSnapshot()).revision, 1);
     const bounded = createMemoryContextProvider({ repository, maxRecords: 1, maxCharacters: 512 });
     const boundedContext = await bounded.read({ message: 'What do I remember?' });
@@ -274,17 +276,18 @@ test('context bounds exclude superseded history and re-read after external delet
     const saved = await service.remember({ proposal: next }, await grantFor(service, next));
     const another = { ...prop('Synthetic other slot.'), compatibility: { category: 'fact', key: 'other' } };
     await service.remember({ proposal: another }, await grantFor(service, another));
-    const provider = createMemoryContextProvider({ repository, maxRecords: 1 });
-    const before = await provider.read({ message: 'What do I remember?' }); const data = JSON.parse(before.items[1].output);
-    assert.equal(data.assertions.length, 1); assert.equal(data.truncated.assertions, true);
-    assert.equal(before.items[1].output.includes('Synthetic prior value.'), false);
-    const bounded = createMemoryContextProvider({ repository, maxCharacters: 512 });
-    const boundedContext = await bounded.read({ message: 'What do I remember?' });
-    if (boundedContext.items[1]) assert.ok(boundedContext.items[1].output.length <= 512);
+    const provider = createMemoryContextProvider({ repository, maxSearchResults: 1,
+        embeddings: { model: 'synthetic-runtime-v1', embedMany: async texts => texts.map(() => [1, 0]) } });
+    const before = await provider.search({ query: 'What do I remember?' });
+    assert.equal(before.assertions.length, 1);
+    assert.equal(JSON.stringify(before).includes('Synthetic prior value.'), false);
+    const bounded = createMemoryContextProvider({ repository,
+        embeddings: { model: 'synthetic-runtime-v1', embedMany: async texts => texts.map(() => [1, 0]) } });
+    const boundedContext = await bounded.search({ query: 'What do I remember?' });
+    assert.ok(JSON.stringify(boundedContext).length <= 5900);
     const target = { type: 'assertion', id: saved.id };
-    await service.forget(target, await forgetGrant(service, target)); provider.invalidate();
-    const after = await provider.read({ message: 'What do I remember?' });
-    assert.equal(after.generation, before.generation + 1);
+    await service.forget(target, await forgetGrant(service, target)); await provider.invalidate();
+    const after = await provider.search({ query: 'What do I remember?' });
     assert.equal(JSON.stringify(after).includes('Synthetic current value.'), false);
 });
 
@@ -295,13 +298,13 @@ test('stdin salir and blank input preserve terminal lifecycle without model call
     assert.equal(requests.length, 0);
 });
 
-test('legacy tools receive genuine terminal provenance, never a caller-supplied source claim', async () => {
+test('legacy tools receive the normal agent source and genuine terminal provenance', async () => {
     const contexts = []; let counter = 0;
     const agent = await createAgent({ load: async () => ({ user: {}, preferences: {}, facts: [] }),
         getTools: () => [{ type: 'function', name: 'fixture_tool' }], save: async () => {},
         ask: async () => ++counter % 2 ? { output: [{ type: 'function_call', name: 'fixture_tool', arguments: '{}', call_id: 'fixture_' + counter }] } : final('ok'),
         execute: async (_name, _args, context) => { contexts.push(context); return { success: true }; } });
-    await agent.run('Caller text', { userMessageSource: 'direct_user' });
+    await agent.run('Caller text');
     await terminalRun(agent, 'Actual terminal text');
     assert.equal(contexts[0].userMessageSource, 'untrusted');
     assert.equal(contexts[1].userMessageSource, 'direct_user');

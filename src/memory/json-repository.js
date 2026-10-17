@@ -448,6 +448,37 @@ export function createJsonMemoryRepository({ storePath, fileSystem = {}, now = (
                 assertionId, operationKey };
         });
     }
+    function clearMemoryData() {
+        return serialized(async () => {
+            requireOpen();
+            await verifyOwnership();
+            const original = await readDisk();
+            assertUnchanged(original);
+            const store = original.store;
+            const removed = {
+                assertions: store.assertions.length,
+                entities: store.entities.filter(item => item.id !== store.self_person_id).length,
+                sources: store.sources.length,
+                evidence: store.evidence.length,
+                migrations: store.migrations.length,
+                automaticOperations: store.automatic_operations?.length ?? 0,
+            };
+            if (!Object.values(removed).some(Boolean)) return { ...publish(original), removed };
+            const candidate = structuredClone(store);
+            candidate.entities = candidate.entities.filter(item => item.id === candidate.self_person_id);
+            candidate.assertions = [];
+            candidate.sources = [];
+            candidate.evidence = [];
+            candidate.migrations = [];
+            if (Array.isArray(candidate.automatic_operations)) candidate.automatic_operations = [];
+            candidate.revision += 1;
+            candidate.updated_at = now();
+            try { validateMemoryStore(candidate); }
+            catch (cause) { throw new MemoryRepositoryError('memory_invalid_changes', { cause }); }
+            const committed = await persistCandidate(original, candidate);
+            return { ...committed, removed };
+        });
+    }
     function close() {
         return serialized(async () => {
             if (state === 'closed') return;
@@ -456,5 +487,5 @@ export function createJsonMemoryRepository({ storePath, fileSystem = {}, now = (
         });
     }
     return Object.freeze({ open, readSnapshot, readAutomaticMemorySnapshot, commit,
-        commitAutomaticOperation, close });
+        commitAutomaticOperation, clearMemoryData, close });
 }

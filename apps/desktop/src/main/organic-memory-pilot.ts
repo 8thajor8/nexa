@@ -137,10 +137,9 @@ export function createSyntheticOrganicPilotHost({ repository, now = () => Date.n
     const object = proposal?.object as Record<string, unknown> | undefined;
     if (typeof quote !== "string" || quote.length < 3 || typeof userMessage !== "string"
       || !userMessage.includes(quote) || !object || object.type !== "text" || typeof object.value !== "string") return null;
-    const expectedPrefix = evidence.attribute === "editor.habitual" ? "Mi editor habitual es "
-      : "Mi editor favorito para hacer pruebas es ";
-    if (!object.value.startsWith(expectedPrefix) || !object.value.endsWith(".")
-      || !quote.includes(object.value.slice(expectedPrefix.length, -1))) return null;
+    // The Runtime persists the verifier-approved normalized fact value. This
+    // synthetic host mirrors that contract while still requiring literal quote evidence.
+    if (!object.value.trim() || !quote.includes(object.value.trim())) return null;
     if (grantConsent) {
       for (const item of authorizations) {
         try { item.authorization.setSyntheticConsent(item.grantCapability, "granted", [...ORGANIC_SCOPES], 60_000); }

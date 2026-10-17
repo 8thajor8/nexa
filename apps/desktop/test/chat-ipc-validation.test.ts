@@ -41,6 +41,14 @@ describe("chat IPC contracts", () => {
     expect(isChatEventEnvelope({ conversationId, requestId, status: "queued" })).toBe(true);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "queued", extra: true })).toBe(false);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "completed", response: "actual" })).toBe(true);
+    expect(isChatEventEnvelope({ conversationId, requestId, status: "organic_learning", state: "pending" })).toBe(true);
+    expect(isChatEventEnvelope({ conversationId, requestId, status: "organic_learning", state: "saved", createdCount: 1, updatedCount: 0 })).toBe(true);
+    expect(isChatEventEnvelope({ conversationId, requestId, status: "organic_learning", state: "saved", createdCount: 0, updatedCount: 0 })).toBe(false);
+    expect(isChatEventEnvelope({ conversationId, requestId, status: "organic_learning", state: "no_memory", createdCount: 0, updatedCount: 0 })).toBe(true);
+    expect(isChatEventEnvelope({ conversationId, requestId, status: "organic_learning", state: "not_processed", reason: "queue_limit" })).toBe(true);
+    expect(isChatEventEnvelope({ conversationId, requestId, status: "organic_learning", state: "not_processed" })).toBe(false);
+    expect(isChatEventEnvelope({ conversationId, requestId, status: "organic_learning", state: "saved", createdCount: "one" })).toBe(false);
+    expect(isChatEventEnvelope({ conversationId, requestId, status: "organic_learning", state: "saved", createdCount: 1, privateMemory: "Alex" })).toBe(false);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "conversation_title_updated", title: "Clima en Madrid" })).toBe(true);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "conversation_title_updated", title: "x".repeat(61) })).toBe(false);
     expect(isChatEventEnvelope({ conversationId, requestId, status: "conversation_title_updated", title: "Título manual", source: "manual" })).toBe(true);

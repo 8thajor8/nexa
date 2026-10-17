@@ -12,7 +12,7 @@ const MAX_TEXT_LENGTH = 16_000;
 const ERROR_CODES: readonly ChatIpcErrorCode[] = ["invalid_request", "busy", "conversation_not_found",
   "request_not_found", "runtime_unavailable", "cancel_not_accepted", "operation_failed"];
 const EVENT_STATUSES = ["queued", "processing", "text_delta", "text_reset", "completed", "cancelled", "error", "authorization_required"] as const;
-const EXTERNAL_EVENT_STATUSES = [...EVENT_STATUSES, "spotify_now_playing", "conversation_title_updated"] as const;
+const EXTERNAL_EVENT_STATUSES = [...EVENT_STATUSES, "spotify_now_playing", "conversation_title_updated", "organic_learning"] as const;
 type RecordValue = Record<string, unknown>;
 
 function isRecord(value: unknown): value is RecordValue {
@@ -153,6 +153,21 @@ export function isChatEventEnvelope(value: unknown): value is ChatEventEnvelope 
       && (card.imageUrl === null || isSafeProviderUrl(card.imageUrl, "i.scdn.co"))
       && (card.spotifyUrl === null || isSpotifyTrackUrl(card.spotifyUrl))
       && typeof card.playing === "boolean";
+  }
+  if (value.status === "organic_learning") {
+    const allowedKeys = new Set(["conversationId", "requestId", "status", "state", "createdCount", "updatedCount",
+      "writeFailedCount", "reason"]);
+    if (Object.keys(value).some((key) => !allowedKeys.has(key))
+      || !["pending", "evaluating", "saved", "no_memory", "not_processed"].includes(String(value.state))) return false;
+    for (const key of ["createdCount", "updatedCount", "writeFailedCount"] as const)
+      if (value[key] !== undefined && (typeof value[key] !== "number" || !Number.isSafeInteger(value[key])
+        || value[key] < 0 || value[key] > 10)) return false;
+    const reasons = ["not_eligible", "queue_limit", "runtime_closing", "cancelled", "evaluation_failed", "write_failed",
+      "not_scheduled", "schedule_failed", "request_failed"];
+    if (value.reason !== undefined && !reasons.includes(String(value.reason))) return false;
+    if (value.state === "saved") return (Number(value.createdCount ?? 0) + Number(value.updatedCount ?? 0)) > 0;
+    if (value.state === "not_processed") return value.reason !== undefined;
+    return value.reason === undefined;
   }
   if (value.status === "conversation_title_updated") return (exactKeys(value, ["conversationId", "requestId", "status", "title"])
     || exactKeys(value, ["conversationId", "requestId", "status", "title", "source"]))

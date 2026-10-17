@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { createConversationRuntime } from '../src/core/conversation-runtime.js';
+import { initializeEmptyMemoryStore } from '../src/memory/backend.js';
 
 function final(text) {
     return { status: 'completed', output: [{ type: 'message', role: 'assistant',
@@ -66,6 +67,224 @@ test('Desktop streaming emits correlated text deltas before one confirmed final 
     assert.ok(events.every(event => event.conversationId === conversationId && event.requestId === requestId));
     assert.equal(events.at(-1).text, 'Hola Nexa');
     await runtime.close();
+});
+
+test('organic assessments are non-blocking and run sequentially in FIFO order', async () => {
+    let releaseFirst;
+    const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+    const diagnostics = [];
+    const organicEvents = [];
+    const started = [];
+    let secondStarted;
+    const secondGate = new Promise(resolve => { secondStarted = resolve; });
+    const runtime = createConversationRuntime({ memoryMode: 'memory2-confirmed-write',
+        agentOptions: { deferOrganicMemoryLearning: true }, diagnostic: event => diagnostics.push(event),
+        agentFactory: async () => ({
+            run: async () => 'Respuesta lista.',
+            assessOrganicMessage: async message => {
+                started.push(message);
+                if (message === 'Declaración uno') await firstGate;
+                if (message === 'Declaración dos') secondStarted();
+                return { success: true, outcome: 'evaluated', proposedCount: 1, acceptedCount: 1, createdCount: 1 };
+            },
+            close: async () => {},
+        }) });
+    const conversationId = runtime.createConversation();
+    runtime.onEvent(event => { if (event.status === 'organic_assessment') organicEvents.push(event); });
+    try {
+        assert.equal((await runtime.sendMessage({ conversationId, requestId: 'bg-bootstrap', text: 'Inicio.', source: 'typed' })).status, 'completed');
+        assert.equal(runtime.scheduleOrganicAssessment({ conversationId, requestId: 'bg-one', text: 'Declaración uno', source: 'typed' }), true);
+        assert.equal(runtime.scheduleOrganicAssessment({ conversationId, requestId: 'bg-one', text: 'Declaración uno', source: 'typed' }), false);
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(started, ['Declaración uno']);
+        assert.equal((await runtime.sendMessage({ conversationId, requestId: 'bg-two', text: 'Seguimos.', source: 'typed' })).status, 'completed');
+        assert.equal(runtime.scheduleOrganicAssessment({ conversationId, requestId: 'bg-two', text: 'Declaración dos', source: 'typed' }), true);
+        assert.deepEqual(started, ['Declaración uno']);
+        releaseFirst();
+        await secondGate;
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(started, ['Declaración uno', 'Declaración dos']);
+        assert.deepEqual(organicEvents.map(event => [event.requestId, event.state]), [
+            ['bg-one', 'pending'], ['bg-one', 'evaluating'], ['bg-two', 'pending'],
+            ['bg-one', 'saved'], ['bg-two', 'evaluating'], ['bg-two', 'saved'],
+        ]);
+        assert.ok(organicEvents.filter(event => event.state === 'saved').every(event => event.createdCount > 0));
+        assert.equal(diagnostics.filter(item => item.event === 'organic_assessment_started').length, 2);
+        assert.equal(diagnostics.filter(item => item.event === 'organic_assessment_completed').length, 2);
+        assert.ok(diagnostics.some(item => item.event === 'organic_assessment_skipped' && item.reason === 'duplicate_request'));
+    } finally {
+        releaseFirst();
+        await runtime.close();
+    }
+});
+
+test('organic assessment reports no-memory separately from confirmed persistence', async () => {
+    const events = [];
+    const runtime = createConversationRuntime({ memoryMode: 'memory2-confirmed-write',
+        agentOptions: { deferOrganicMemoryLearning: true },
+        agentFactory: async () => ({ run: async () => 'Respuesta lista.',
+            assessOrganicMessage: async () => ({ success: true, outcome: 'evaluated', proposedCount: 1, acceptedCount: 0,
+                createdCount: 0, updatedCount: 0, writeFailedCount: 0 }), close: async () => {} }) });
+    runtime.onEvent(event => { if (event.status === 'organic_assessment') events.push(event); });
+    const conversationId = runtime.createConversation();
+    await runtime.sendMessage({ conversationId, requestId: 'bg-no-memory', text: 'Mensaje sintético', source: 'typed' });
+    assert.equal(runtime.scheduleOrganicAssessment({ conversationId, requestId: 'bg-no-memory', text: 'Mensaje sintético', source: 'typed' }), true);
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(events.map(event => event.state), ['pending', 'evaluating', 'no_memory']);
+    assert.equal(events.some(event => event.state === 'saved'), false);
+    await runtime.close();
+});
+
+test('organic assessment errors are reported as not processed without diagnostic mode', async () => {
+    const events = [];
+    const runtime = createConversationRuntime({ memoryMode: 'memory2-confirmed-write',
+        agentOptions: { deferOrganicMemoryLearning: true },
+        agentFactory: async () => ({ run: async () => 'Respuesta lista.',
+            assessOrganicMessage: async () => { throw new Error('synthetic private failure detail'); }, close: async () => {} }) });
+    runtime.onEvent(event => { if (event.status === 'organic_assessment') events.push(event); });
+    const conversationId = runtime.createConversation();
+    await runtime.sendMessage({ conversationId, requestId: 'bg-error', text: 'Mensaje sintético privado', source: 'typed' });
+    runtime.scheduleOrganicAssessment({ conversationId, requestId: 'bg-error', text: 'Mensaje sintético privado', source: 'typed' });
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(events.map(({ state, reason }) => [state, reason]), [
+        ['pending', undefined], ['evaluating', undefined], ['not_processed', 'evaluation_failed'],
+    ]);
+    assert.equal(JSON.stringify(events).includes('Mensaje sintético privado'), false);
+    assert.equal(JSON.stringify(events).includes('synthetic private failure detail'), false);
+    await runtime.close();
+});
+
+test('organic assessment queue is bounded and skips pending work on Runtime close', async () => {
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const diagnostics = [];
+    const organicEvents = [];
+    const assessed = [];
+    const runtime = createConversationRuntime({ memoryMode: 'memory2-confirmed-write',
+        agentOptions: { deferOrganicMemoryLearning: true }, diagnostic: event => diagnostics.push(event),
+        agentFactory: async () => ({ run: async () => 'Listo.',
+            assessOrganicMessage: async (message, { signal }) => {
+                assessed.push(message);
+                if (message === 'activo') {
+                    await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+                    return { success: false, outcome: 'cancelled' };
+                }
+                await gate;
+                return { success: true, outcome: 'evaluated' };
+            }, close: async () => {} }) });
+    const conversationId = runtime.createConversation();
+    runtime.onEvent(event => { if (event.status === 'organic_assessment') organicEvents.push(event); });
+    await runtime.sendMessage({ conversationId, requestId: 'queue-bootstrap', text: 'Inicio.', source: 'typed' });
+    assert.equal(runtime.scheduleOrganicAssessment({ conversationId, requestId: 'queue-active', text: 'activo', source: 'typed' }), true);
+    await new Promise(resolve => setImmediate(resolve));
+    for (let index = 0; index < 8; index++)
+        assert.equal(runtime.scheduleOrganicAssessment({ conversationId, requestId: `queue-${index}`, text: `pendiente ${index}`, source: 'typed' }), true);
+    assert.equal(runtime.scheduleOrganicAssessment({ conversationId, requestId: 'queue-overflow', text: 'overflow', source: 'typed' }), false);
+    assert.ok(organicEvents.some(event => event.requestId === 'queue-overflow' && event.state === 'not_processed' && event.reason === 'queue_limit'));
+    assert.ok(diagnostics.some(item => item.event === 'organic_assessment_skipped' && item.reason === 'queue_full'));
+    await runtime.close();
+    assert.deepEqual(assessed, ['activo']);
+    assert.equal(organicEvents.filter(event => event.state === 'not_processed' && event.reason === 'runtime_closing').length, 8);
+    assert.equal(diagnostics.filter(item => item.event === 'organic_assessment_skipped' && item.reason === 'runtime_closing').length, 8);
+    assert.equal(JSON.stringify(diagnostics).includes('pendiente'), false, 'diagnostics must not contain assessed message content');
+    release();
+});
+
+test('closing Runtime aborts the independent organic assessment', async () => {
+    let assessmentSignal;
+    const events = [];
+    const runtime = createConversationRuntime({ memoryMode: 'memory2-confirmed-write',
+        agentOptions: { deferOrganicMemoryLearning: true },
+        agentFactory: async () => ({
+            run: async () => 'Respuesta lista.',
+            assessOrganicMessage: async (_message, { signal }) => {
+                assessmentSignal = signal;
+                await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+                throw new Error('cancelled');
+            },
+            close: async () => {},
+        }) });
+    const conversationId = runtime.createConversation();
+    runtime.onEvent(event => { if (event.status === 'organic_assessment') events.push(event); });
+    await runtime.sendMessage({ conversationId, requestId: 'bg-close', text: 'Mi proyecto actual es Aurora.', source: 'typed' });
+    runtime.scheduleOrganicAssessment({ conversationId, requestId: 'bg-close', text: 'Mi proyecto actual es Aurora.', source: 'typed' });
+    await new Promise(resolve => setImmediate(resolve));
+    await runtime.close();
+    assert.equal(assessmentSignal.aborted, true);
+    assert.ok(events.some(event => event.state === 'not_processed' && event.reason === 'cancelled'));
+});
+
+test('clearing Memory2 aborts the active organic evaluation and discards queued evaluations before wiping', async t => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'nexa-runtime-memory-clear-'));
+    const storePath = path.join(directory, 'memory-v5.json');
+    await initializeEmptyMemoryStore({ storePath });
+    const memoryFixture = JSON.parse(await readFile(storePath, 'utf8'));
+    const timestamp = new Date().toISOString();
+    memoryFixture.assertions.push({ id: 'mem_00000001-1111-4111-8111-111111111111', kind: 'fact',
+        subject: { type: 'owner' }, predicate: 'user.note', object: { type: 'text', value: 'Synthetic memory fixture.' },
+        status: 'active', valid_from: null, valid_to: null, recorded_at: timestamp, supersedes: [],
+        compatibility: { category: 'fact', key: 'synthetic_clear_test' } });
+    memoryFixture.sources.push({ id: 'src_00000001-1111-4111-8111-111111111111', kind: 'user_statement',
+        origin_trust: 'user_asserted', authority: 'data_only', locator: null,
+        occurred_at: { value: timestamp, precision: 'instant' }, recorded_at: timestamp });
+    memoryFixture.evidence.push({ id: 'ev_00000001-1111-4111-8111-111111111111',
+        assertion_id: 'mem_00000001-1111-4111-8111-111111111111', source_id: 'src_00000001-1111-4111-8111-111111111111',
+        derivation: 'explicit', extraction_confidence: null, learned_at: timestamp, last_confirmed_at: null, legacy_ref: null });
+    await writeFile(storePath, JSON.stringify(memoryFixture, null, 2) + '\n', 'utf8');
+    t.after(async () => { await rm(directory, { recursive: true, force: true }); });
+    let started;
+    const activeStarted = new Promise(resolve => { started = resolve; });
+    let assessmentSignal;
+    const assessed = [];
+    const events = [];
+    const invalidateMemoryContext = () => { invalidationCount += 1; return true; };
+    let invalidationCount = 0;
+    const runtime = createConversationRuntime({ memoryMode: 'memory2-confirmed-write', storePath,
+        agentOptions: { deferOrganicMemoryLearning: true },
+        agentFactory: async () => ({ run: async () => 'Respuesta lista.',
+            assessOrganicMessage: async (message, { signal }) => {
+                assessed.push(message); assessmentSignal = signal; started();
+                await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+                throw new Error('cancelled');
+            }, invalidateMemoryContext, close: async () => {} }) });
+    const conversationId = runtime.createConversation();
+    runtime.onEvent(event => { if (event.status === 'organic_assessment') events.push(event); });
+    await runtime.sendMessage({ conversationId, requestId: 'wipe-bootstrap', text: 'Inicio.', source: 'typed' });
+    runtime.scheduleOrganicAssessment({ conversationId, requestId: 'wipe-active', text: 'synthetic active', source: 'typed' });
+    await activeStarted;
+    runtime.scheduleOrganicAssessment({ conversationId, requestId: 'wipe-queued', text: 'synthetic queued', source: 'typed' });
+    assert.equal(await runtime.clearAllMemory(), true);
+    assert.equal(assessmentSignal.aborted, true);
+    assert.deepEqual(assessed, ['synthetic active']);
+    assert.ok(events.some(event => event.requestId === 'wipe-queued' && event.state === 'not_processed'
+        && event.reason === 'memory_cleared'));
+    assert.equal(events.some(event => event.requestId === 'wipe-queued' && event.state === 'evaluating'), false);
+    assert.equal(JSON.stringify(events).includes('synthetic queued'), false);
+    const afterClear = JSON.parse(await readFile(storePath, 'utf8'));
+    assert.deepEqual(afterClear.assertions, []);
+    assert.deepEqual(afterClear.sources, []);
+    assert.deepEqual(afterClear.evidence, []);
+    assert.equal(afterClear.entities.length, 1);
+    assert.equal(invalidationCount, 1);
+    await runtime.close();
+});
+
+test('closing Runtime remains bounded when a synthetic assessor ignores cancellation', async () => {
+    let release;
+    const pending = new Promise(resolve => { release = resolve; });
+    const runtime = createConversationRuntime({ memoryMode: 'memory2-confirmed-write',
+        agentOptions: { deferOrganicMemoryLearning: true },
+        agentFactory: async () => ({ run: async () => 'Lista.',
+            assessOrganicMessage: async () => pending, close: async () => {} }) });
+    const conversationId = runtime.createConversation();
+    await runtime.sendMessage({ conversationId, requestId: 'bg-bounded', text: 'Mi proyecto actual es Aurora.', source: 'typed' });
+    runtime.scheduleOrganicAssessment({ conversationId, requestId: 'bg-bounded', text: 'Mi proyecto actual es Aurora.', source: 'typed' });
+    const started = performance.now();
+    await runtime.close();
+    assert.ok(performance.now() - started < 1_000);
+    release({ success: true, outcome: 'skipped' });
 });
 
 test('Runtime without streaming keeps its prior event contract', async () => {
@@ -348,15 +567,28 @@ test('runtime uses the shared read-only Memory2 composition and does not mutate 
     const original = Buffer.from(JSON.stringify(fixture, null, 2) + '\n');
     await writeFile(storePath, original);
     const requests = [];
+    let searchResultPending = false;
     const runtime = createConversationRuntime({ memoryMode: 'memory2-readonly', storePath,
-        agentOptions: agentOptions({ ask: async request => { requests.push(structuredClone(request)); return final('Contexto leído.'); } }) });
+        agentOptions: agentOptions({ memoryEmbeddingProvider: { model: 'synthetic-runtime-v1',
+            async embedMany(texts) { return texts.map(() => [1, 0]); } },
+            ask: async request => {
+                requests.push(structuredClone(request));
+                if (searchResultPending) {
+                    assert.ok(request.input.some(item => item.type === 'function_call_output'
+                        && item.output.includes('Conversation synthetic only.')));
+                    searchResultPending = false;
+                    return final('Contexto leído.');
+                }
+                searchResultPending = true;
+                return toolCall('search_memory2', { query: 'What is my note?', subjectReference: '', temporal: 'current' }, 'memory-search');
+            } }) });
     try {
         const conversationId = runtime.createConversation();
         assert.equal((await runtime.sendMessage({ conversationId, requestId: 'm2-read-1', text: '¿Qué sabés de mí?', source: 'typed' })).status, 'completed');
-        assert.ok(requests[0].input.some(item => item.type === 'function_call_output'
+        assert.ok(requests[1].input.some(item => item.type === 'function_call_output'
             && item.output.includes('Conversation synthetic only.')));
         assert.deepEqual(await readFile(storePath), original);
-        assert.deepEqual(await readdir(directory), ['store-v5.json']);
+        assert.deepEqual((await readdir(directory)).sort(), ['store-v5.json', 'store-v5.json.semantic-index-v2.json']);
     } finally {
         await runtime.close();
         assert.deepEqual(await readFile(storePath), original);

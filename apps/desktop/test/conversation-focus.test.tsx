@@ -3,7 +3,7 @@
 import { createElement } from "react";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ConversationPanel, type ConversationChatMessage } from "../src/renderer/components/ConversationPanel";
+import { applyOrganicLearningEvent, ConversationPanel, type ConversationChatMessage } from "../src/renderer/components/ConversationPanel";
 import type { PttVoiceSnapshot } from "../src/renderer/voice/ptt-voice-controller";
 import { canonicalSpotifyTrackUrl } from "../src/shared/spotify-link-validation";
 
@@ -65,6 +65,49 @@ describe("chat composer focus", () => {
     fireEvent.change(input, { target: { value: "Siguiente intervención" } });
     fireEvent.submit(input.closest("form")!);
     expect(onSendMessage).toHaveBeenCalledWith("Siguiente intervención");
+  });
+
+  it("shows independent, confirmed organic learning outcomes per user message", () => {
+    const first = { ...userMessage, id: "request-saved", requestId: "request-saved", text: "Dato sintético uno",
+      organicLearning: { conversationId: "conversation-1", requestId: "request-saved", status: "organic_learning" as const,
+        state: "saved" as const, createdCount: 1, updatedCount: 0 } };
+    const second = { ...userMessage, id: "request-none", requestId: "request-none", text: "Dato sintético dos",
+      organicLearning: { conversationId: "conversation-1", requestId: "request-none", status: "organic_learning" as const,
+        state: "no_memory" as const, createdCount: 0, updatedCount: 0 } };
+    render(panel({ chatMessages: [first, second] }));
+
+    expect(screen.getByText("Guardado")).toBeTruthy();
+    expect(screen.getByText("Sin recuerdo nuevo")).toBeTruthy();
+    expect(document.querySelectorAll('[data-organic-learning-state="saved"]')).toHaveLength(1);
+    expect(document.querySelectorAll('[data-organic-learning-state="no_memory"]')).toHaveLength(1);
+    fireEvent.click(screen.getByText("Guardado"));
+    expect(screen.getByText("Memory2 confirmó 1 recuerdo(s) creado(s) y 0 actualizado(s)." )).toBeTruthy();
+    expect(screen.queryByText("contenido privado de memoria")).toBeNull();
+  });
+
+  it("distinguishes pending, evaluating and omitted learning without claiming a save", () => {
+    const states = ["pending", "evaluating", "not_processed"] as const;
+    const messages = states.map((state, index) => ({ ...userMessage, id: `request-${state}`, requestId: `request-${state}`,
+      text: `Mensaje sintético ${index}`, organicLearning: { conversationId: "conversation-1", requestId: `request-${state}`,
+        status: "organic_learning" as const, state, ...(state === "not_processed" ? { reason: "queue_limit" as const } : {}) } }));
+    render(panel({ chatMessages: messages }));
+    expect(screen.getByText("Aprendizaje pendiente")).toBeTruthy();
+    expect(screen.getByText("Evaluando memoria")).toBeTruthy();
+    expect(screen.getByText("No procesado")).toBeTruthy();
+    expect(screen.queryByText("Guardado")).toBeNull();
+    fireEvent.click(screen.getByText("No procesado"));
+    expect(screen.getByText("Se alcanzó el límite de evaluaciones pendientes.")).toBeTruthy();
+  });
+
+  it("correlates an organic event only to the matching user message and conversation", () => {
+    const otherConversation = { ...userMessage, id: "same-request-other-conversation", conversationId: "conversation-2" };
+    const assistant = { ...responseMessage, id: "same-request-assistant", conversationId: "conversation-1" };
+    const event = { conversationId: "conversation-1", requestId: userMessage.requestId, status: "organic_learning" as const,
+      state: "saved" as const, createdCount: 1, updatedCount: 0 };
+    const updated = applyOrganicLearningEvent([userMessage, otherConversation, assistant], event);
+    expect(updated[0]?.organicLearning).toEqual(event);
+    expect(updated[1]?.organicLearning).toBeUndefined();
+    expect(updated[2]?.organicLearning).toBeUndefined();
   });
 
   it("does not reclaim focus moved intentionally and preserves Shift+Enter and voice controls", () => {

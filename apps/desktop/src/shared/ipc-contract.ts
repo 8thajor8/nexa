@@ -30,6 +30,9 @@ export const CHAT_RENAME_CONVERSATION_CHANNEL = "chat:rename-conversation" as co
 export const CHAT_EVENT_CHANNEL = "chat:event" as const;
 export const MEMORY_MODE_GET_CHANNEL = "memory:mode:get" as const;
 export const MEMORY_MODE_SET_CHANNEL = "memory:mode:set" as const;
+export const MEMORY_RELATIONSHIP_LEARNING_SET_CHANNEL = "memory:relationship-learning:set" as const;
+export const MEMORY_THIRD_PARTY_LEARNING_SET_CHANNEL = "memory:third-party-learning:set" as const;
+export const MEMORY_CLEAR_ALL_CHANNEL = "memory:clear-all" as const;
 export const AUTHORIZATION_CONNECT_CHANNEL = "authorization:connect" as const;
 export const AUTHORIZATION_CANCEL_CHANNEL = "authorization:cancel" as const;
 export const SPOTIFY_OPEN_TRACK_CHANNEL = "spotify:open-track" as const;
@@ -135,7 +138,20 @@ export interface ChatPresentationMetadata {
   kind: "diagnostic" | "tool_catalog";
   technicalDetail: string;
 }
-export type ChatEventStatus = "queued" | "processing" | "text_delta" | "text_reset" | "completed" | "cancelled" | "error" | "authorization_required" | "spotify_now_playing" | "conversation_title_updated";
+export type OrganicLearningState = "pending" | "evaluating" | "saved" | "no_memory" | "not_processed";
+export type OrganicLearningReason = "not_eligible" | "queue_limit" | "runtime_closing" | "cancelled"
+  | "evaluation_failed" | "write_failed" | "not_scheduled" | "schedule_failed" | "request_failed";
+export interface OrganicLearningEvent {
+  conversationId: string;
+  requestId: string;
+  status: "organic_learning";
+  state: OrganicLearningState;
+  createdCount?: number;
+  updatedCount?: number;
+  writeFailedCount?: number;
+  reason?: OrganicLearningReason;
+}
+export type ChatEventStatus = "queued" | "processing" | "text_delta" | "text_reset" | "completed" | "cancelled" | "error" | "authorization_required" | "spotify_now_playing" | "conversation_title_updated" | "organic_learning";
 interface ChatEventBase {
   conversationId: string;
   requestId: string;
@@ -148,6 +164,7 @@ export type ChatEventEnvelope =
   | (ChatEventBase & { status: "text_reset" })
   | (ChatEventBase & { status: "queued" })
   | (ChatEventBase & { status: "processing" })
+  | OrganicLearningEvent
   | (ChatEventBase & { status: "cancelled" })
   | (ChatEventBase & { status: "completed"; response: string; presentation?: ChatPresentationMetadata })
   | (ChatEventBase & { status: "error"; error: { code: ChatIpcErrorCode; message: string } });
@@ -169,13 +186,29 @@ export interface DesktopMemoryModeStatus {
   memory2WriteAvailable: boolean;
   switching: boolean;
   fallbackReason: "invalid_preference" | "mode_unavailable" | null;
+  relationshipLearningEnabled: boolean;
+  relationshipLearningEffective: boolean;
+  thirdPartyLearningEnabled: boolean;
+  thirdPartyLearningEffective: boolean;
 }
 export type DesktopMemoryModeResult =
   | { ok: true; status: DesktopMemoryModeStatus }
   | { ok: false; error: "busy" | "memory2_unavailable" | "memory2_write_unavailable" | "operation_failed" };
+export type DesktopMemoryClearResult = { ok: true }
+  | { ok: false; error: "busy" | "memory2_write_unavailable" | "operation_failed" };
 export interface DesktopMemoryApi {
   getStatus(): Promise<DesktopMemoryModeStatus>;
   setMode(mode: DesktopMemoryMode): Promise<DesktopMemoryModeResult>;
+  setRelationshipLearningEnabled(enabled: boolean): Promise<DesktopMemoryModeResult>;
+  setThirdPartyLearningEnabled(enabled: boolean): Promise<DesktopMemoryModeResult>;
+  clearAll(): Promise<DesktopMemoryClearResult>;
+}
+export function isDesktopMemoryClearResult(value: unknown): value is DesktopMemoryClearResult {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return record.ok === true && Object.keys(record).length === 1
+    || record.ok === false && Object.keys(record).length === 2
+      && ["busy", "memory2_write_unavailable", "operation_failed"].includes(String(record.error));
 }
 
 export function isDesktopMemoryMode(value: unknown): value is DesktopMemoryMode {
@@ -184,8 +217,10 @@ export function isDesktopMemoryMode(value: unknown): value is DesktopMemoryMode 
 export function isDesktopMemoryModeStatus(value: unknown): value is DesktopMemoryModeStatus {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
-  return Object.keys(record).length === 5 && isDesktopMemoryMode(record.mode)
+  return Object.keys(record).length === 9 && isDesktopMemoryMode(record.mode)
     && typeof record.memory2Available === "boolean" && typeof record.memory2WriteAvailable === "boolean"
+    && typeof record.relationshipLearningEnabled === "boolean" && typeof record.relationshipLearningEffective === "boolean"
+    && typeof record.thirdPartyLearningEnabled === "boolean" && typeof record.thirdPartyLearningEffective === "boolean"
     && typeof record.switching === "boolean"
     && (record.fallbackReason === null || record.fallbackReason === "invalid_preference" || record.fallbackReason === "mode_unavailable");
 }

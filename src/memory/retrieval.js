@@ -15,7 +15,6 @@ export const MEMORY_RETRIEVAL_LIMITS = Object.freeze({
 const QUERY_KEYS = ['entityIds', 'includeSelf', 'predicates', 'relationPredicates', 'statuses', 'limits', 'relevanceText'];
 const LIMIT_KEYS = Object.keys(MEMORY_RETRIEVAL_LIMITS);
 const VALID_STATUSES = Object.freeze(['active', 'superseded']);
-const QUERY_STOP_WORDS = new Set(('a al algo as at con de del desde el en es for from he her how i in is it la las le lo los me mi mis my of on or para por que se she sobre the this to un una uno y yo you your do what where which who about are can describe tell use using related remember have has usuario usuarios usuaria usuarias ficticio ficticia ficticios ficticias prefiero prefiere prefieren prefiera preferir preferencia preferencias recuerdo recuerdos recuerda recuerdas recuerden recuerde tenes tienes tiene tienen sabes sabe conozco conoces conoce conocen informacion memoria memorias user users owner owners fictitious prefer prefers preferred remembers recall recalls knows know knowledge').split(' '));
 
 function assertAllowedObject(value, keys, path) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('memory_retrieval_invalid');
@@ -58,36 +57,6 @@ function boundedOccurrences(text, phrase) {
 
 function compareText(a, b) { return a < b ? -1 : a > b ? 1 : 0; }
 function uniqueSorted(values) { return [...new Set(values)].sort(compareText); }
-
-function relevanceTokens(text) {
-    if (typeof text !== 'string') return [];
-    const singularize = token => token.length >= 5
-        ? token.endsWith('es') ? token.slice(0, -2) : token.endsWith('s') ? token.slice(0, -1) : token
-        : token;
-    const canonicalize = token => token === 'nota' ? 'note' : token;
-    return [...new Set((text.normalize('NFD').replace(/\p{M}/gu, '').toLowerCase().match(/[\p{L}\p{N}]{2,}/gu) ?? [])
-        .filter(token => !QUERY_STOP_WORDS.has(token) && !QUERY_STOP_WORDS.has(singularize(token)))
-        .map(token => canonicalize(singularize(token))))]
-        .filter(token => !QUERY_STOP_WORDS.has(token)).slice(0, 64);
-}
-
-export function hasMemoryRelevanceTerms(text) {
-    return relevanceTokens(text).length > 0;
-}
-
-function scoreRecordForTokens(record, terms) {
-    if (!terms.length || !record || typeof record !== 'object') return 0;
-    const predicateTokens = new Set(relevanceTokens(record.predicate));
-    const objectTokens = new Set(relevanceTokens(record.object?.type === 'text' ? record.object.value : ''));
-    let score = 0;
-    for (const term of terms) score += (predicateTokens.has(term) ? 2 : 0) + (objectTokens.has(term) ? 1 : 0);
-    return score;
-}
-
-/** Deterministic lexical signal only; it does not infer semantic equivalence. */
-export function scoreMemoryRecordRelevance(record, relevanceText = '') {
-    return scoreRecordForTokens(record, relevanceTokens(relevanceText));
-}
 
 /** Finds complete name/alias mentions within a sentence. Spans are offsets in
  * normalizedText, not offsets into the original string. Partial leading words
@@ -181,10 +150,8 @@ function normalizeQuery(query) {
         if (!Number.isInteger(value) || value < 0 || value > MEMORY_RETRIEVAL_LIMITS[key]) throw new TypeError('memory_retrieval_limit_invalid');
         limits[key] = value;
     }
-    const relevanceText = query.relevanceText ?? '';
-    if (typeof relevanceText !== 'string' || !relevanceText.isWellFormed() || relevanceText.length > 16000) throw new TypeError('memory_retrieval_invalid');
     return { entityIds: uniqueSorted(checkedIds), includeSelf, predicates: predicates === null ? null : uniqueSorted(predicates),
-        relationPredicates: uniqueSorted(relationPredicates), statuses: uniqueSorted(statuses), relevanceText, limits };
+        relationPredicates: uniqueSorted(relationPredicates), statuses: uniqueSorted(statuses), limits };
 }
 
 function queryWithStatuses(query, statuses) {
@@ -249,7 +216,6 @@ export function retrieveCandidates(current, rawQuery) {
     const statusSet = new Set(query.statuses);
     const predicateSet = query.predicates === null ? null : new Set(query.predicates);
     const relationPredicateSet = new Set(query.relationPredicates);
-    const queryTerms = relevanceTokens(query.relevanceText);
 
     const perEntityRelations = [];
     let neighborsTruncated = false;
@@ -291,17 +257,16 @@ export function retrieveCandidates(current, rawQuery) {
             && (predicateSet === null || predicateSet.has(record.predicate))
             && canonicalSubject(record.subject, store).id === entityId)
             .sort((a, b) => compareText(a.predicate, b.predicate) || compareText(a.id, b.id));
-        for (const record of direct) assertionCandidates.push({ record, entityId, isSeed: seedSet.has(entityId),
-            relevanceScore: scoreRecordForTokens(record, queryTerms) });
+        for (const record of direct) assertionCandidates.push({ record, entityId, isSeed: seedSet.has(entityId) });
     }
     assertionCandidates.sort((a, b) => Number(b.isSeed) - Number(a.isSeed)
-        || b.relevanceScore - a.relevanceScore
+        || b.record.recorded_at.localeCompare(a.record.recorded_at)
         || compareText(a.entityId, b.entityId) || compareText(a.record.predicate, b.record.predicate) || compareText(a.record.id, b.record.id));
     const perKeyCounts = new Map(), seenAssertionIds = new Set(), selectedAssertions = [];
     for (const candidate of assertionCandidates) {
         const { record, entityId } = candidate;
         if (seenAssertionIds.has(record.id)) continue;
-        const key = entityId + '\u0000' + record.predicate;
+        const key = entityId + '\u0000' + record.predicate + '\u0000' + (record.compatibility?.key ?? '');
         const count = perKeyCounts.get(key) ?? 0;
         if (count >= query.limits.maxPerEntityPredicate || selectedAssertions.length >= query.limits.maxAssertions) continue;
         seenAssertionIds.add(record.id); perKeyCounts.set(key, count + 1); selectedAssertions.push(candidate);

@@ -122,8 +122,12 @@ describe("chat preload allowlist", () => {
 
   it("exposes only validated Memory mode operations through fixed IPC channels", async () => {
     const api = await loadPreload();
-    const memory = api.memory as { getStatus(): Promise<unknown>; setMode(mode: string): Promise<unknown> };
-    const status = { mode: "memory1", memory2Available: true, memory2WriteAvailable: true, switching: false, fallbackReason: null };
+    const memory = api.memory as { getStatus(): Promise<unknown>; setMode(mode: string): Promise<unknown>;
+      setRelationshipLearningEnabled(enabled: boolean): Promise<unknown>; setThirdPartyLearningEnabled(enabled: boolean): Promise<unknown>;
+      clearAll(): Promise<unknown> };
+    const status = { mode: "memory1", memory2Available: true, memory2WriteAvailable: true, switching: false,
+      fallbackReason: null, relationshipLearningEnabled: false, relationshipLearningEffective: false,
+      thirdPartyLearningEnabled: true, thirdPartyLearningEffective: false };
     mocks.invoke.mockResolvedValueOnce(status);
     await expect(memory.getStatus()).resolves.toEqual(status);
     expect(mocks.invoke).toHaveBeenLastCalledWith("memory:mode:get");
@@ -131,6 +135,19 @@ describe("chat preload allowlist", () => {
     await expect(memory.setMode("memory2-readonly")).resolves.toMatchObject({ ok: true });
     expect(mocks.invoke).toHaveBeenLastCalledWith("memory:mode:set", "memory2-readonly");
     await expect(memory.setMode("memory2")).rejects.toThrow("invalid_memory_mode");
+    mocks.invoke.mockResolvedValueOnce({ ok: true, status: { ...status, relationshipLearningEnabled: true } });
+    await expect(memory.setRelationshipLearningEnabled(true)).resolves.toMatchObject({ ok: true });
+    expect(mocks.invoke).toHaveBeenLastCalledWith("memory:relationship-learning:set", true);
+    await expect(memory.setRelationshipLearningEnabled("yes" as never)).rejects.toThrow("invalid_relationship_learning_preference");
+    mocks.invoke.mockResolvedValueOnce({ ok: true, status: { ...status, thirdPartyLearningEnabled: false } });
+    await expect(memory.setThirdPartyLearningEnabled(false)).resolves.toMatchObject({ ok: true });
+    expect(mocks.invoke).toHaveBeenLastCalledWith("memory:third-party-learning:set", false);
+    await expect(memory.setThirdPartyLearningEnabled("no" as never)).rejects.toThrow("invalid_third_party_learning_preference");
+    mocks.invoke.mockResolvedValueOnce({ ok: true });
+    await expect(memory.clearAll()).resolves.toEqual({ ok: true });
+    expect(mocks.invoke).toHaveBeenLastCalledWith("memory:clear-all");
+    mocks.invoke.mockResolvedValueOnce({ ok: false, error: "operation_failed", path: "C:/secret" });
+    await expect(memory.clearAll()).rejects.toThrow("invalid_memory_clear_response");
   });
 
   it("exposes a bounded technical-detail copy operation through its fixed Main channel", async () => {

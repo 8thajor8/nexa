@@ -69,6 +69,12 @@ function sensitiveCategory(candidate) {
     return 'none';
 }
 
+/** Conservative privacy check for text sent to semantic Memory2 embeddings. */
+export function isSensitiveAutomaticMemoryText(text) {
+    if (typeof text !== 'string' || !screenMemorySecret(text).safe) return true;
+    return SENSITIVE_PATTERNS.some(([, pattern]) => pattern.test(text));
+}
+
 function policyDecision(candidate, validated, snapshot, trustedSpeaker) {
     const reasons = [];
     if (validated.secretDetected) return { disposition: 'ignore', sensitivity: 'credential', reasons: ['secret_detected'] };

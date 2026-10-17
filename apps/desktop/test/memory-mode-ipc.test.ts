@@ -1,13 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
-import { MEMORY_MODE_GET_CHANNEL, MEMORY_MODE_SET_CHANNEL, type DesktopMemoryMode } from "../src/shared/ipc-contract.js";
+import { MEMORY_MODE_GET_CHANNEL, MEMORY_MODE_SET_CHANNEL, MEMORY_RELATIONSHIP_LEARNING_SET_CHANNEL,
+  MEMORY_THIRD_PARTY_LEARNING_SET_CHANNEL,
+  MEMORY_CLEAR_ALL_CHANNEL,
+  type DesktopMemoryMode } from "../src/shared/ipc-contract.js";
 import { registerMemoryModeIpcHandlers, type MemoryModeRuntime } from "../src/main/memory-mode-ipc.js";
 
 const fact = "El usuario ficticio prefiere VS Code como editor de código.";
 
 function setup({ busy = false, validStore = true, failCreate = false, preferenceWriteFails = false,
-  initialMode = "memory1", initialFallbackReason = null }: {
+  initialMode = "memory1", initialFallbackReason = null, relationshipEnabled = false }: {
     busy?: boolean; validStore?: boolean; failCreate?: boolean; preferenceWriteFails?: boolean;
     initialMode?: DesktopMemoryMode; initialFallbackReason?: "invalid_preference" | "mode_unavailable" | null;
+    relationshipEnabled?: boolean;
   } = {}) {
   const handlers = new Map<string, (event: never, value?: unknown) => unknown>();
   const ipc = { handle: vi.fn((channel: string, handler: (event: never, value?: unknown) => unknown) => handlers.set(channel, handler)),
@@ -15,7 +19,13 @@ function setup({ busy = false, validStore = true, failCreate = false, preference
   const contents = { mainFrame: {} };
   const window = { webContents: contents };
   const event = { sender: contents, senderFrame: contents.mainFrame } as never;
-  const current = { value: { getMemoryMode: () => initialMode, close: vi.fn(async () => undefined) } as MemoryModeRuntime | null };
+  let relationshipValue = relationshipEnabled;
+  let thirdPartyValue = true;
+  const current = { value: { getMemoryMode: () => initialMode,
+    clearAllMemory: vi.fn(async () => true),
+    setRelationshipLearningEnabled: vi.fn((enabled: boolean) => { relationshipValue = enabled; return enabled; }),
+    setThirdPartyLearningEnabled: vi.fn((enabled: boolean) => { thirdPartyValue = enabled; return enabled; }),
+    close: vi.fn(async () => undefined) } as MemoryModeRuntime | null };
   let createCount = 0;
   const createRuntime = vi.fn(async (_mode: string, _path?: string) => {
     createCount += 1;
@@ -31,28 +41,37 @@ function setup({ busy = false, validStore = true, failCreate = false, preference
   const refreshRuntimeAfterSwitch = vi.fn();
   const endRuntimeSwitch = vi.fn();
   const prepareWriteStore = vi.fn(async () => undefined);
+  const clearMemoryStore = vi.fn(async () => true);
   const preferencesStore = { write: vi.fn((mode: string) => { if (preferenceWriteFails) throw new Error("write failed"); }) };
+  const relationshipPreferencesStore = { readRelationshipLearningEnabled: () => relationshipValue,
+    writeRelationshipLearningEnabled: vi.fn((enabled: boolean) => { if (preferenceWriteFails) throw new Error("write failed"); relationshipValue = enabled; }),
+    readThirdPartyLearningEnabled: () => thirdPartyValue,
+    writeThirdPartyLearningEnabled: vi.fn((enabled: boolean) => { if (preferenceWriteFails) throw new Error("write failed"); thirdPartyValue = enabled; }) };
   registerMemoryModeIpcHandlers({ getWindow: () => window as never, getRuntime: () => current.value,
     setRuntime: runtime => { current.value = runtime; }, createRuntime,
     resolveStorePath: () => "C:/Users/test/AppData/Local/Nexa/Temporary/memory-desktop-01/nexa-memory2-synthetic-desktop-v5.json",
     resolveWriteStorePath: () => "C:/Users/test/AppData/Local/Nexa/Temporary/memory-write-01/nexa-memory2-synthetic-write-v5.json",
     prepareWriteStore,
+    clearMemoryStore,
     openReader, beginRuntimeSwitch, refreshRuntimeAfterSwitch, endRuntimeSwitch, preferencesStore, initialMode,
-    initialFallbackReason, ipc });
+    initialFallbackReason, relationshipPreferencesStore, ipc });
   const invoke = (channel: string, value?: unknown, senderEvent = event) => handlers.get(channel)!(senderEvent, value);
-  return { invoke, current, createRuntime, openReader, prepareWriteStore, preferencesStore, beginRuntimeSwitch, refreshRuntimeAfterSwitch, endRuntimeSwitch };
+  return { invoke, current, createRuntime, openReader, prepareWriteStore, clearMemoryStore, preferencesStore, relationshipPreferencesStore, beginRuntimeSwitch, refreshRuntimeAfterSwitch, endRuntimeSwitch };
 }
+
+const relationshipDisabled = { relationshipLearningEnabled: false, relationshipLearningEffective: false,
+  thirdPartyLearningEnabled: true, thirdPartyLearningEffective: false };
 
 describe("Desktop session-only Memory2 selection", () => {
   it("starts in Memory1 and only exposes Memory2 for the exact synthetic read-only fixture", async () => {
     const h = setup();
-    await expect(h.invoke(MEMORY_MODE_GET_CHANNEL)).resolves.toEqual({ mode: "memory1", memory2Available: true, memory2WriteAvailable: true, switching: false, fallbackReason: null });
+    await expect(h.invoke(MEMORY_MODE_GET_CHANNEL)).resolves.toEqual({ mode: "memory1", memory2Available: true, memory2WriteAvailable: true, switching: false, fallbackReason: null, ...relationshipDisabled });
     await expect(h.invoke(MEMORY_MODE_SET_CHANNEL, "memory2-readonly")).resolves.toEqual({ ok: true,
-      status: { mode: "memory2-readonly", memory2Available: true, memory2WriteAvailable: true, switching: false, fallbackReason: null } });
+      status: { mode: "memory2-readonly", memory2Available: true, memory2WriteAvailable: true, switching: false, fallbackReason: null, ...relationshipDisabled } });
     expect(h.createRuntime).toHaveBeenCalledWith("memory2-readonly", expect.stringContaining("nexa-memory2-synthetic"));
     expect(h.refreshRuntimeAfterSwitch).toHaveBeenCalledOnce();
     expect(h.openReader).toHaveBeenCalled();
-    await expect(h.invoke(MEMORY_MODE_GET_CHANNEL)).resolves.toEqual({ mode: "memory2-readonly", memory2Available: true, memory2WriteAvailable: true, switching: false, fallbackReason: null });
+    await expect(h.invoke(MEMORY_MODE_GET_CHANNEL)).resolves.toEqual({ mode: "memory2-readonly", memory2Available: true, memory2WriteAvailable: true, switching: false, fallbackReason: null, ...relationshipDisabled });
   });
 
   it("reports a restored Runtime mode and a visible safe fallback reason", async () => {
@@ -66,7 +85,7 @@ describe("Desktop session-only Memory2 selection", () => {
     const h = setup();
     await h.invoke(MEMORY_MODE_SET_CHANNEL, "memory2-readonly");
     h.current.value = { getMemoryMode: () => "memory1", close: vi.fn(async () => undefined) };
-    await expect(h.invoke(MEMORY_MODE_GET_CHANNEL)).resolves.toEqual({ mode: "memory1", memory2Available: true, memory2WriteAvailable: true, switching: false, fallbackReason: null });
+    await expect(h.invoke(MEMORY_MODE_GET_CHANNEL)).resolves.toEqual({ mode: "memory1", memory2Available: true, memory2WriteAvailable: true, switching: false, fallbackReason: null, ...relationshipDisabled });
   });
 
   it("does not switch when the fixture is invalid or the conversation is busy", async () => {
@@ -114,7 +133,8 @@ describe("Desktop session-only Memory2 selection", () => {
     const createRuntime = vi.fn(async () => runtime);
     registerMemoryModeIpcHandlers({ getWindow: () => ({ webContents: contents } as never), getRuntime: () => runtime,
       setRuntime: () => undefined, createRuntime, resolveStorePath: () => null, resolveWriteStorePath: () => null,
-      prepareWriteStore: vi.fn(async () => undefined), openReader: vi.fn(async () => ({ readContext: async () => ({ items: [] }), close: async () => undefined })),
+      prepareWriteStore: vi.fn(async () => undefined), clearMemoryStore: vi.fn(async () => true),
+      openReader: vi.fn(async () => ({ readContext: async () => ({ items: [] }), close: async () => undefined })),
       beginRuntimeSwitch: () => true, refreshRuntimeAfterSwitch: () => undefined, endRuntimeSwitch: () => undefined,
       initialMode: "memory1", ipc });
     await expect(handlers.get(MEMORY_MODE_SET_CHANNEL)!(event, "memory2-confirmed-write"))
@@ -128,5 +148,57 @@ describe("Desktop session-only Memory2 selection", () => {
     await expect(h.invoke(MEMORY_MODE_GET_CHANNEL, undefined)).resolves.toBeDefined();
     const other = { sender: {}, senderFrame: {} } as never;
     await expect(h.invoke(MEMORY_MODE_GET_CHANNEL, undefined, other)).rejects.toThrow("untrusted_ipc_sender");
+  });
+
+  it("persists relationship consent and wires revocation to Memory2 authorization", async () => {
+    const h = setup({ initialMode: "memory2-confirmed-write" });
+    await expect(h.invoke(MEMORY_RELATIONSHIP_LEARNING_SET_CHANNEL, true)).resolves.toMatchObject({
+      ok: true, status: { relationshipLearningEnabled: true, relationshipLearningEffective: true },
+    });
+    expect(h.current.value?.setRelationshipLearningEnabled).toHaveBeenCalledWith(true);
+    await expect(h.invoke(MEMORY_RELATIONSHIP_LEARNING_SET_CHANNEL, false)).resolves.toMatchObject({
+      ok: true, status: { relationshipLearningEnabled: false, relationshipLearningEffective: false },
+    });
+    expect(h.current.value?.setRelationshipLearningEnabled).toHaveBeenLastCalledWith(false);
+  });
+
+  it("stores the preference without enabling writes when general Memory2 writing is inactive", async () => {
+    const h = setup({ initialMode: "memory1" });
+    await expect(h.invoke(MEMORY_RELATIONSHIP_LEARNING_SET_CHANNEL, true)).resolves.toMatchObject({
+      ok: true, status: { relationshipLearningEnabled: true, relationshipLearningEffective: false },
+    });
+    expect(h.current.value?.setRelationshipLearningEnabled).not.toHaveBeenCalled();
+  });
+
+  it("changes third-party permission independently and rejects untrusted or invalid requests", async () => {
+    const h = setup({ initialMode: "memory2-confirmed-write" });
+    await expect(h.invoke(MEMORY_THIRD_PARTY_LEARNING_SET_CHANNEL, false)).resolves.toMatchObject({ ok: true,
+      status: { thirdPartyLearningEnabled: false, thirdPartyLearningEffective: false, relationshipLearningEnabled: false } });
+    expect(h.current.value?.setThirdPartyLearningEnabled).toHaveBeenCalledWith(false);
+    await expect(h.invoke(MEMORY_THIRD_PARTY_LEARNING_SET_CHANNEL, "false")).resolves
+      .toEqual({ ok: false, error: "operation_failed" });
+    await expect(h.invoke(MEMORY_THIRD_PARTY_LEARNING_SET_CHANNEL, true, { sender: {}, senderFrame: {} } as never))
+      .rejects.toThrow("untrusted_ipc_sender");
+  });
+
+  it("clears only through the trusted Main Runtime with no renderer-supplied path", async () => {
+    const h = setup({ initialMode: "memory2-confirmed-write" });
+    await expect(h.invoke(MEMORY_CLEAR_ALL_CHANNEL)).resolves.toEqual({ ok: true });
+    expect(h.current.value?.clearAllMemory).toHaveBeenCalledOnce();
+    expect(h.beginRuntimeSwitch).toHaveBeenCalledOnce();
+    expect(h.endRuntimeSwitch).toHaveBeenCalledOnce();
+    await expect(h.invoke(MEMORY_CLEAR_ALL_CHANNEL, "C:/arbitrary/store.json")).resolves.toEqual({ ok: false, error: "busy" });
+    await expect(h.invoke(MEMORY_CLEAR_ALL_CHANNEL, undefined, { sender: {}, senderFrame: {} } as never))
+      .rejects.toThrow("untrusted_ipc_sender");
+    const readonly = setup({ initialMode: "memory2-readonly" });
+    await expect(readonly.invoke(MEMORY_CLEAR_ALL_CHANNEL)).resolves.toEqual({ ok: true });
+    expect(readonly.clearMemoryStore).toHaveBeenCalledOnce();
+  });
+
+  it("does not report success when the Runtime wipe fails", async () => {
+    const h = setup({ initialMode: "memory2-confirmed-write" });
+    h.current.value!.clearAllMemory = vi.fn(async () => false);
+    await expect(h.invoke(MEMORY_CLEAR_ALL_CHANNEL)).resolves.toEqual({ ok: false, error: "operation_failed" });
+    expect(h.endRuntimeSwitch).toHaveBeenCalledOnce();
   });
 });

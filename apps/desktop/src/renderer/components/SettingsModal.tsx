@@ -25,6 +25,10 @@ export function SettingsModal({ preferences, onPreferencesChange, microphoneDevi
   const [memoryStatus, setMemoryStatus] = useState<DesktopMemoryModeStatus | null>(null);
   const [memoryError, setMemoryError] = useState<string | null>(null);
   const [memoryLoading, setMemoryLoading] = useState(false);
+  const [memoryClearConfirming, setMemoryClearConfirming] = useState(false);
+  const [memoryClearPending, setMemoryClearPending] = useState(false);
+  const [memoryClearError, setMemoryClearError] = useState<string | null>(null);
+  const [memoryClearSuccess, setMemoryClearSuccess] = useState(false);
   const [restartConfirming, setRestartConfirming] = useState(false);
   const [restartPending, setRestartPending] = useState(false);
   const [restartError, setRestartError] = useState<string | null>(null);
@@ -60,7 +64,7 @@ export function SettingsModal({ preferences, onPreferencesChange, microphoneDevi
   }, []);
 
   const changeMemoryMode = async (mode: DesktopMemoryMode) => {
-    if (memoryLoading || !memoryStatus) return;
+    if (memoryLoading || memoryClearPending || !memoryStatus) return;
     setMemoryLoading(true);
     setMemoryError(null);
     try {
@@ -81,6 +85,67 @@ export function SettingsModal({ preferences, onPreferencesChange, microphoneDevi
       setMemoryError("No se pudo cambiar el modo de memoria.");
     } finally {
       setMemoryLoading(false);
+    }
+  };
+
+  const changeRelationshipLearning = async (enabled: boolean) => {
+    if (memoryLoading || memoryClearPending || !memoryStatus) return;
+    setMemoryLoading(true);
+    setMemoryError(null);
+    try {
+      const result = await window.nexaDesktop.memory.setRelationshipLearningEnabled(enabled);
+      if (result.ok) setMemoryStatus(result.status);
+      else {
+        setMemoryError("No se pudo actualizar el permiso de relaciones personales.");
+        setMemoryStatus(await window.nexaDesktop.memory.getStatus());
+      }
+    } catch {
+      setMemoryError("No se pudo actualizar el permiso de relaciones personales.");
+    } finally {
+      setMemoryLoading(false);
+    }
+  };
+
+  const changeThirdPartyLearning = async (enabled: boolean) => {
+    if (memoryLoading || memoryClearPending || !memoryStatus) return;
+    setMemoryLoading(true);
+    setMemoryError(null);
+    try {
+      const result = await window.nexaDesktop.memory.setThirdPartyLearningEnabled(enabled);
+      if (result.ok) setMemoryStatus(result.status);
+      else {
+        setMemoryError("No se pudo actualizar el permiso para información sobre otras personas.");
+        setMemoryStatus(await window.nexaDesktop.memory.getStatus());
+      }
+    } catch {
+      setMemoryError("No se pudo actualizar el permiso para información sobre otras personas.");
+    } finally {
+      setMemoryLoading(false);
+    }
+  };
+
+  const clearAllMemory = async () => {
+    if (memoryClearPending || memoryLoading || memoryStatus?.switching
+      || !memoryStatus?.memory2WriteAvailable) return;
+    setMemoryClearPending(true);
+    setMemoryClearError(null);
+    setMemoryClearSuccess(false);
+    try {
+      const result = await window.nexaDesktop.memory.clearAll();
+      if (result.ok) {
+        setMemoryClearConfirming(false);
+        setMemoryClearSuccess(true);
+      } else {
+        setMemoryClearError(result.error === "busy"
+          ? "Finaliza la operación activa antes de borrar los recuerdos."
+          : result.error === "memory2_write_unavailable"
+            ? "Selecciona Memory2 con escritura para borrar sus recuerdos."
+            : "No se pudieron borrar los recuerdos de Memory2.");
+      }
+    } catch {
+      setMemoryClearError("No se pudieron borrar los recuerdos de Memory2.");
+    } finally {
+      setMemoryClearPending(false);
     }
   };
 
@@ -118,7 +183,7 @@ export function SettingsModal({ preferences, onPreferencesChange, microphoneDevi
 
   const update = (patch: Partial<DesktopPreferences>) => onPreferencesChange({ ...preferences, ...patch });
   const confirmRestart = async () => {
-    if (restartInFlight.current || memoryLoading || memoryStatus?.switching || windowSettings?.transitioning) return;
+    if (restartInFlight.current || memoryLoading || memoryClearPending || memoryStatus?.switching || windowSettings?.transitioning) return;
     restartInFlight.current = true;
     setRestartPending(true);
     setRestartError(null);
@@ -221,7 +286,7 @@ export function SettingsModal({ preferences, onPreferencesChange, microphoneDevi
               <p>Memory1 es el modo predeterminado. La selección se conserva localmente. El aprendizaje orgánico solo está activo en Memory2 con escritura.</p></div></div>
             <label className="settings-field"><span>Backend activo</span>
               <select aria-label="Backend de memoria" value={memoryStatus?.mode ?? "memory1"}
-                disabled={!memoryStatus || memoryLoading || memoryStatus.switching}
+                disabled={!memoryStatus || memoryLoading || memoryClearPending || memoryStatus.switching}
                 onChange={event => { void changeMemoryMode(event.target.value as DesktopMemoryMode); }}>
                 <option value="memory1">Memory1 · predeterminado</option>
                 <option value="memory2-readonly" disabled={!memoryStatus?.memory2Available}>Memory2 · solo lectura (almacén sintético)</option>
@@ -239,12 +304,61 @@ export function SettingsModal({ preferences, onPreferencesChange, microphoneDevi
                   : memoryStatus?.memory2WriteAvailable
                     ? "Memory1 activo. Memory2 personal estará disponible al seleccionar escritura."
                     : "Memory1 activo. No hay un almacén Memory2 disponible."}</p>
+            <label className="settings-switch-row"><span><strong>Recordar relaciones personales</strong>
+              <small>Permite el aprendizaje orgánico de relaciones propias solo cuando Memory2 con escritura y el aprendizaje orgánico general están activos.</small></span>
+              <input type="checkbox" aria-label="Recordar relaciones personales"
+                disabled={!memoryStatus || memoryLoading || memoryClearPending || memoryStatus.switching}
+                checked={memoryStatus?.relationshipLearningEnabled ?? false}
+                onChange={(event) => { void changeRelationshipLearning(event.target.checked); }} />
+            </label>
+            <p className="settings-weather-note" role="status">{memoryStatus?.relationshipLearningEffective
+              ? "Permiso activo para relaciones personales propias. No modifica recuerdos existentes."
+              : memoryStatus?.relationshipLearningEnabled
+                ? "Permiso guardado, pero inactivo hasta seleccionar Memory2 con escritura. No habilita escrituras por sí solo."
+                : "Permiso desactivado. Los recuerdos existentes se conservan."}</p>
+            <label className="settings-switch-row"><span><strong>Recordar información sobre otras personas</strong>
+              <small>Aprende datos cotidianos no sensibles solo de personas ya identificadas sin ambigüedad en Memory2.</small></span>
+              <input type="checkbox" aria-label="Recordar información sobre otras personas"
+                disabled={!memoryStatus || memoryLoading || memoryClearPending || memoryStatus.switching}
+                checked={memoryStatus?.thirdPartyLearningEnabled ?? true}
+                onChange={event => { void changeThirdPartyLearning(event.target.checked); }} />
+            </label>
+            <p className="settings-weather-note" role="status">{memoryStatus?.thirdPartyLearningEffective
+              ? "Permiso activo para información no sensible sobre personas identificadas. No modifica recuerdos existentes."
+              : memoryStatus?.thirdPartyLearningEnabled
+                ? "Permiso guardado, pero inactivo hasta seleccionar Memory2 con escritura."
+                : "Permiso desactivado. Los recuerdos existentes se conservan."}</p>
             {memoryStatus?.fallbackReason && <p className="settings-weather-note" role="alert">
               {memoryStatus.fallbackReason === "invalid_preference"
                 ? "La selección guardada del modo de memoria no era válida. Se inició Memory1."
                 : "El modo de memoria guardado no está disponible. Se inició Memory1; no se cambió ningún almacén."}
             </p>}
             {memoryError && <p role="alert" className="settings-weather-note">{memoryError}</p>}
+            <div className="settings-restart-confirmation" aria-label="Mantenimiento de Memory2">
+              <p>Elimina únicamente los recuerdos persistidos por Memory2. Las conversaciones, personalidad y ajustes se conservan.</p>
+              {!memoryClearConfirming ? <button type="button" className="settings-restart-button"
+                disabled={!memoryStatus?.memory2WriteAvailable || memoryLoading
+                  || memoryStatus.switching || memoryClearPending}
+                onClick={() => { setMemoryClearError(null); setMemoryClearSuccess(false); setMemoryClearConfirming(true); }}>
+                Borrar recuerdos de Memory2
+              </button> : <div>
+                <p><strong>¿Borrar toda la memoria de Nexa?</strong></p>
+                <p>Se eliminarán permanentemente los recuerdos guardados, incluidos datos personales, preferencias, relaciones e historial de actividades.</p>
+                <p>Esta acción no se puede deshacer.</p>
+                <div className="settings-restart-actions">
+                  <button type="button" disabled={memoryClearPending} onClick={() => setMemoryClearConfirming(false)}>Cancelar</button>
+                  <button type="button" disabled={memoryClearPending || memoryLoading || memoryStatus?.switching}
+                    onClick={() => { void clearAllMemory(); }}>
+                    {memoryClearPending ? "Borrando…" : "Sí, borrar toda la memoria"}
+                  </button>
+                </div>
+              </div>}
+              {!memoryStatus?.memory2WriteAvailable && <p className="settings-weather-note" role="status">
+                El Store personal de Memory2 no está disponible para borrado.
+              </p>}
+              {memoryClearError && <p role="alert" className="settings-weather-note">{memoryClearError}</p>}
+              {memoryClearSuccess && <p role="status" className="settings-weather-note">Se borraron los recuerdos de Memory2. Las conversaciones y los ajustes se conservaron.</p>}
+            </div>
           </section>
           <section className="settings-section" aria-labelledby="settings-app-title">
             <div className="settings-section__heading"><span>07</span><div><h3 id="settings-app-title">Aplicación</h3>
@@ -259,7 +373,7 @@ export function SettingsModal({ preferences, onPreferencesChange, microphoneDevi
               <p>¿Reiniciar Nexa ahora? La ventana se cerrará y volverá a abrirse.</p>
               <div className="settings-restart-actions">
                 <button type="button" disabled={restartPending} onClick={() => setRestartConfirming(false)}>Cancelar</button>
-                <button type="button" disabled={restartPending || memoryLoading || !!memoryStatus?.switching || !!windowSettings?.transitioning}
+              <button type="button" disabled={restartPending || memoryLoading || memoryClearPending || !!memoryStatus?.switching || !!windowSettings?.transitioning}
                   onClick={() => { void confirmRestart(); }}>Confirmar reinicio</button>
               </div>
             </div>}

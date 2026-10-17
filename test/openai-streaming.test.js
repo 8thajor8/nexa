@@ -35,6 +35,15 @@ test('askOpenAI preserves the original non-streaming Responses API path without 
     assert.equal(result, response);
 });
 
+test('askOpenAI supports non-stored bounded Responses API verification calls', async () => {
+    let requestBody;
+    const client = { responses: { create: async body => { requestBody = body; return syntheticResponse('ok'); } } };
+    await askOpenAI({ instructions: 'verify only supplied data', input: [{ role: 'user', content: 'synthetic' }],
+        tools: [], store: false, maxOutputTokens: 160, client });
+    assert.equal(requestBody.store, false);
+    assert.equal(requestBody.max_output_tokens, 160);
+});
+
 test('askOpenAI rejects incomplete streams and honors cancellation between events', async () => {
     const incompleteClient = { responses: { create: async () => (async function* () {
         yield { type: 'response.output_text.delta', delta: 'parcial' };

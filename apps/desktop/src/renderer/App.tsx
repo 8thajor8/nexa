@@ -8,7 +8,7 @@ import { ASSISTANT_STATE_LABELS, createMockAssistantStateProvider } from "../sha
 import { loadDesktopPreferences, saveDesktopPreferences, type DesktopPreferences } from "./desktop-preferences";
 import type { PttVoiceControllerPort, PttVoiceSnapshot, PttVoiceStatus } from "./voice/ptt-voice-controller";
 import { VoiceFollowupController, type FollowupTranscript, type VoiceFollowupFailure } from "./voice/voice-followup-controller";
-import { ConversationPanel, type ConversationChatMessage, type VoiceTranscriptItem } from "./components/ConversationPanel";
+import { applyOrganicLearningEvent, ConversationPanel, type ConversationChatMessage, type VoiceTranscriptItem } from "./components/ConversationPanel";
 import { ConversationsPanel } from "./components/ConversationsPanel";
 import { PresencePanel } from "./components/PresencePanel";
 import { Sidebar } from "./components/Sidebar";
@@ -590,6 +590,11 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       if (!alreadyListed) void refreshConversationList();
       return;
     }
+    if (event.status === "organic_learning") {
+      if (event.conversationId !== chatConversationIdRef.current || !knownChatRequests.current.has(event.requestId)) return;
+      setChatMessages((current) => applyOrganicLearningEvent(current, event));
+      return;
+    }
     if (event.conversationId !== chatConversationIdRef.current || !knownChatRequests.current.has(event.requestId)
       || terminalChatRequests.current.has(event.requestId)) return;
     if (event.status === "text_delta") {
@@ -757,11 +762,13 @@ export default function App({ voiceController, microphoneDevices }: AppProps) {
       else if (!fromVoice) typedVoiceReplyRequests.current.delete(event.requestId);
     } else if (event.status === "cancelled") {
       setChatMessages((current) => current.map((entry) => entry.requestId === event.requestId
-        ? { ...entry, status: "cancelled" } : entry));
+        ? { ...entry, status: "cancelled", organicLearning: { conversationId: event.conversationId,
+          requestId: event.requestId, status: "organic_learning", state: "not_processed", reason: "cancelled" } } : entry));
     } else {
       const message = CHAT_ERROR_MESSAGES[event.error.code] ?? event.error.message;
       setChatMessages((current) => current.map((entry) => entry.requestId === event.requestId
-        ? { ...entry, status: "error", error: message } : entry));
+        ? { ...entry, status: "error", error: message, organicLearning: { conversationId: event.conversationId,
+          requestId: event.requestId, status: "organic_learning", state: "not_processed", reason: "request_failed" } } : entry));
       setChatNotice(message);
     }
   }, [discardStreamUpdate, refreshConversationList, releaseChatRequest, reportChatTiming, scheduleAcknowledgement]);

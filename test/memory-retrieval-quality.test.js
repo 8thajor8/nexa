@@ -57,7 +57,9 @@ function fixture() {
 
 function providerFor(data, options = {}) {
     const current = { snapshot: data.store, revision: 1, digest: 'a'.repeat(64) };
-    return createMemoryContextProvider({ repository: { readSnapshot: async () => current }, now: () => stamp, ...options });
+    const embeddings = options.embeddings ?? { model: 'synthetic-test-v1', async embedMany(texts) { return texts.map(() => [1, 0]); } };
+    return createMemoryContextProvider({ repository: { readSnapshot: async () => current }, now: () => stamp,
+        embeddings, authorizeSubject: () => true, authorizeRelationships: () => true, ...options });
 }
 
 async function payload(provider, input) {
@@ -99,109 +101,63 @@ function legacyBaselineOrder(items) {
         || a.id.localeCompare(b.id));
 }
 
-test('retrieval-quality synthetic benchmark: direct topics, follow-up, history, mixed topics and ambiguous mention', async () => {
+test('semantic owner search returns a bounded current candidate pool without lexical gating', async () => {
     const data = fixture();
-    data.add({ predicate: 'user.note', value: 'Disfruta caminar por el parque los domingos.' });
-    data.add({ predicate: 'user.preference', value: 'Prefiere café de filtro por la mañana.' });
-    data.add({ predicate: 'user.technology', value: 'Está aprendiendo TypeScript y prefiere React para proyectos personales.', confidence: 0.15, relevance: true });
-    data.add({ predicate: 'user.technology', value: 'Está aprendiendo TypeScript y prefiere React para proyectos personales.', confidence: 0.15, relevance: true });
-    data.add({ predicate: 'user.note', value: 'Le gustan las novelas de misterio.' });
+    const note = data.add({ predicate: 'user.note', value: 'Disfruta caminar por el parque los domingos.' });
+    const instrument = data.add({ predicate: 'user.hobby', value: 'Toca guitarra acústica desde hace años.' });
     data.add({ predicate: 'user.project', value: 'El proyecto sintético usa Rust y una API local.' });
-    data.add({ predicate: 'user.hobby', value: 'Toca guitarra acústica desde hace años.' , relevance: true });
-    const old = data.add({ predicate: 'user.employment', value: 'Trabajó en una biblioteca en 2021.',
-        validFrom: { value: '2021', precision: 'year' }, validTo: { value: '2022', precision: 'year' }, status: 'superseded' });
-    const history = data.add({ predicate: 'user.employment', value: 'Trabajaba en una biblioteca en 2021.',
-        validFrom: { value: '2021', precision: 'year' }, validTo: { value: '2022', precision: 'year' }, relevance: true });
-    const currentEmployment = data.add({ predicate: 'user.employment', value: 'Ahora trabaja en un estudio de diseño.',
-        validFrom: { value: '2023', precision: 'year' }, supersedes: [old], relevance: true });
-    data.add({ predicate: 'user.preference', value: 'No comparte datos de proyectos con terceros.' });
-    data.add({ entityId: friend, predicate: 'user.project', value: 'El proyecto de Coti usa React Native.' });
-    const relation = data.relate(self, friend);
-    validateMemoryStore(data.store);
-    const typeScript = [...data.relevant].find(([assertionId]) => data.store.assertions.find(item => item.id === assertionId).object.value.includes('TypeScript'))[0];
-    const guitar = [...data.relevant].find(([assertionId]) => data.store.assertions.find(item => item.id === assertionId).object.value.includes('guitarra'))[0];
-    const duplicateIds = [...data.relevant].filter(([assertionId]) => data.store.assertions.find(item => item.id === assertionId).object.value.includes('TypeScript')).map(([assertionId]) => assertionId);
+    const old = data.add({ predicate: 'user.employment', value: 'Trabajó en una biblioteca en 2021.', status: 'superseded' });
     const provider = providerFor(data);
-    const cases = [
-        ['topic-programming', { message: 'What do I use for TypeScript and React?' }, [typeScript]],
-        ['topic-hobby', { message: '¿Qué instrumento practico yo?' }, [guitar]],
-        ['historical', { message: '¿Dónde trabajaba yo en 2021?' }, [history]],
-        ['current', { message: '¿Dónde trabajo yo actualmente?' }, [currentEmployment]],
-        ['mixed', { message: 'Compara mi aprendizaje de TypeScript con mi afición musical.' }, [typeScript, guitar]],
-        ['follow-up', { message: 'Algo relacionado con eso.', recentUserMessages: ['¿Qué instrumento practico yo?'] }, [guitar]],
-        ['relationship', { message: 'Who is my partner Juan?' }, [relation]],
-        ['ambiguous', { message: '¿Qué proyectos tiene Juan?' }, []],
-    ];
-    const rows = new Map(), baselineRows = new Map(), outputs = new Map();
-    for (const [name, input, expected] of cases) {
-        const result = await payload(provider, input);
-        const items = result?.assertions ?? [];
-        const selected = [...items, ...(result?.relations ?? [])];
-        rows.set(name, selected.map(item => item.id));
-        outputs.set(name, result);
-        const baselineItems = [...items];
-        for (const record of data.store.assertions) {
-            if (items.some(item => item.id === record.id)) continue;
-            const duplicateOf = items.find(item => item.entityId === record.subject.id && item.predicate === record.predicate
-                && JSON.stringify(item.object) === JSON.stringify(record.object) && item.status === record.status
-                && JSON.stringify(item.validFrom) === JSON.stringify(record.valid_from)
-                && JSON.stringify(item.validTo) === JSON.stringify(record.valid_to));
-            if (duplicateOf) baselineItems.push({ ...structuredClone(duplicateOf), id: record.id });
-        }
-        baselineRows.set(name, legacyBaselineOrder([...baselineItems, ...(result?.relations ?? [])]).map(item => item.id));
-        for (const item of selected) {
-            rows.objects ??= new Map(); rows.statuses ??= new Map();
-            rows.objects.set(item.id, item.predicate + '\0' + JSON.stringify(item.object ?? [item.subjectEntityId, item.objectEntityId]));
-            rows.statuses.set(item.id, item.status);
-        }
-        if (name === 'historical') assert.ok(rows.get(name).includes(old));
-        if (name === 'ambiguous') assert.deepEqual(rows.get(name), []);
-        if (expected.length) assert.ok(rows.get(name).length, `${name} returned no context`);
-    }
-    baselineRows.objects = rows.objects; baselineRows.statuses = rows.statuses;
-    for (const record of data.store.assertions) {
-        baselineRows.objects.set(record.id, record.predicate + '\0' + JSON.stringify(record.object));
-        baselineRows.statuses.set(record.id, record.status);
-    }
-    const baseline = metrics(baselineRows, cases.map(([name, , expected]) => [name, expected]));
-    const result = metrics(rows, cases.map(([name, , expected]) => [name, expected]));
-    console.log('RETRIEVAL_QUALITY_METRICS', JSON.stringify({ baseline, after: result }));
-    assert.ok(result.precisionAt5 > baseline.precisionAt5);
-    assert.ok(result.recallAt5 > baseline.recallAt5);
-    assert.ok(result.mrr > baseline.mrr);
-    assert.equal(result.duplicateGroupsAt5, 0, 'exact duplicate facts should not occupy multiple context slots');
-    assert.equal(result.obsoleteAt5, 0, 'current/historical ranking must not leak replaced facts into current queries');
-    assert.equal(duplicateIds.length, 2);
-    const programming = outputs.get('topic-programming');
-    assert.equal(programming.assertions.filter(item => item.predicate === 'user.technology').length, 1);
-    assert.equal(programming.assertions.find(item => item.predicate === 'user.technology').evidence.items.length, 2);
+    const result = await provider.search({ query: '¿Qué actividad manual disfruto cuando paseo?' });
+    const ids = new Set(result.assertions.map(item => item.id));
+    assert.equal(result.status, 'found');
+    assert.ok(ids.has(note), 'a paraphrase with no shared topic word remains available to semantic selection');
+    assert.ok(ids.has(instrument));
+    assert.equal(ids.has(old), false, 'only active candidates are exposed by the approved search contract');
+    assert.ok(result.assertions.length <= 12);
+    assert.ok(JSON.stringify(result).length <= 6000);
 });
 
-test('Spanish broad self-queries keep owner context and specific “nota” queries match Schema v5 user.note', async () => {
+test('automatic context does not lexically activate owner memories; model-requested search remains semantic', async () => {
     const data = fixture();
     const note = data.add({ predicate: 'user.note', value: 'Synthetic only fixture value.' });
     data.add({ predicate: 'user.hobby', value: 'Practica escalada en interiores.' });
-    const provider = providerFor(data, { matchSpecificSelfQueries: true });
-
+    const provider = providerFor(data);
     const broad = await payload(provider, { message: '¿Qué sabés de mí?' });
-    assert.ok(broad.assertions.some(item => item.id === note),
-        'broad Spanish self-query must not become a false lexical filter through stemming');
-
-    const specific = await payload(provider, { message: '¿Qué dice mi nota?' });
-    assert.ok(specific.assertions.some(item => item.id === note),
-        'Spanish “nota” must match the existing Schema v5 predicate “note”');
-    assert.equal(specific.assertions.some(item => item.object?.value === 'Practica escalada en interiores.'), false);
+    assert.equal(broad, null, 'the local reader does not guess owner-memory relevance from words');
+    const semantic = await provider.search({ query: '¿Qué actividad me entretiene cuando estoy al aire libre?' });
+    assert.ok(semantic.assertions.some(item => item.id === note));
+    assert.ok(semantic.assertions.some(item => item.object.value === 'Practica escalada en interiores.'));
 });
 
-test('lexical ranking stays deterministic when Schema v5 collection order changes', async () => {
+test('semantic candidate ordering stays deterministic when Schema v5 collection order changes', async () => {
     const data = fixture();
     data.add({ predicate: 'user.note', value: 'Disfruta caminar por el parque.' });
     data.add({ predicate: 'user.technology', value: 'Prefiere TypeScript y React.' });
     data.add({ predicate: 'user.hobby', value: 'Toca guitarra acústica.' });
     validateMemoryStore(data.store);
-    const original = await payload(providerFor(data), { message: 'What do I use with React?' });
+    const original = await providerFor(data).search({ query: 'What do I use with React?' });
     const shuffled = { store: structuredClone(data.store) };
     shuffled.store.assertions.reverse(); shuffled.store.sources.reverse(); shuffled.store.evidence.reverse();
-    const reordered = await payload(providerFor(shuffled), { message: 'What do I use with React?' });
+    const reordered = await providerFor(shuffled).search({ query: 'What do I use with React?' });
     assert.deepEqual(reordered.assertions.map(item => item.id), original.assertions.map(item => item.id));
+});
+
+test('history search exposes at most twelve screened active or superseded records', async () => {
+    const data = fixture();
+    for (let index = 0; index < 18; index++) {
+        const year = 2020 + index;
+        data.add({ predicate: 'user.note', value: `Synthetic historical fact ${index}.`,
+            status: index % 2 === 0 ? 'superseded' : 'active',
+            recordedAt: `${year}-01-01T00:00:00.000Z` });
+    }
+    const provider = providerFor(data);
+    const current = await provider.search({ query: 'A paráfrasis sin palabras coincidentes', temporal: 'current' });
+    const history = await provider.search({ query: 'Qué era cierto antes', temporal: 'history' });
+    assert.ok(current.assertions.length <= 12);
+    assert.ok(current.assertions.every(item => item.status === 'active'));
+    assert.ok(history.assertions.length <= 12);
+    assert.ok(history.assertions.some(item => item.status === 'superseded'
+        && item.temporalStatus === 'historical'));
+    assert.equal(history.candidateScope, 'active_and_superseded_non_sensitive');
 });

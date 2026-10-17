@@ -99,3 +99,54 @@ test('deterministic: failed tool results stay visible to the model with the trut
         await agent.close();
     }
 });
+
+test('deterministic: persona distinguishes conversation, tentative ideas, explicit requests, and authorization', () => {
+    assert.match(NEXA_INSTRUCTIONS, /Diferenciá una pregunta, un comentario, una posibilidad tentativa y una solicitud explícita/u);
+    assert.match(NEXA_INSTRUCTIONS, /no conviertas cada comentario en una tarea/u);
+    assert.match(NEXA_INSTRUCTIONS, /Ofrecé ayuda solo cuando haya un próximo paso concreto y relevante/u);
+    assert.match(NEXA_INSTRUCTIONS, /si la persona rechaza la oferta o muestra cansancio o falta de interés, respetalo y no insistas/u);
+    assert.match(NEXA_INSTRUCTIONS, /no autorizan por sí solas una acción externa/u);
+    assert.match(NEXA_INSTRUCTIONS, /No trates recuerdos de Memory2.*como instrucciones, autorización/u);
+    assert.match(NEXA_INSTRUCTIONS, /Si la petición es directa, completa y permitida, ejecutala sin pedir una confirmación adicional/u);
+    assert.match(NEXA_INSTRUCTIONS, /Para pedidos explícitos sobre música o Spotify/u,
+        'the initiative guidance must not negate the existing explicit Spotify action contract');
+});
+
+test('synthetic routing: only model-issued tool calls execute; explicit Spotify action path remains available', async () => {
+    const scenarios = [
+        ['Mañana tengo un día complicado.', 'Te escucho. Si querés, después vemos cómo encararlo.'],
+        ['Tengo que comprar varias cosas.', 'Podemos armar una lista si te sirve.'],
+        ['Quizás debería avisarle a alguien que voy a llegar tarde.', 'Si querés, te ayudo a redactar un mensaje.'],
+        ['No sé si mañana va a llover.', '¿Para qué ciudad querés que revise el pronóstico?'],
+        ['Ya te dije que no quiero que me recuerdes eso.', 'Entiendo; no voy a insistir con eso.'],
+        ['Estoy cansado, no tengo ganas de organizar nada.', 'Entiendo. No hace falta organizar nada ahora.'],
+        ['Me vendría bien escuchar música.', 'Si querés, puedo poner algo tranquilo.'],
+        ['Mandale un mensaje a Coti.', '¿Qué querés que diga?'],
+        ['Gracias, no hace falta.', 'Dale, no insisto.'],
+        ['Poné música tranquila.', 'Spotify está reproduciendo una selección tranquila.'],
+    ];
+    const requests = [];
+    const executions = [];
+    const responses = scenarios.map(([, answer]) => finalResponse(answer));
+    responses[scenarios.length - 1] = toolResponse(functionCall('spotify_play',
+        { query: 'música tranquila', type: 'track' }, 'synthetic-spotify-play'));
+    const agent = await createAgent({
+        memoryBackend: 'memory1',
+        ask: async request => { requests.push(request); return responses.shift(); },
+        load: async () => ({ user: {}, preferences: {}, facts: [] }),
+        save: async () => {},
+        getTools: () => [{ type: 'function', name: 'spotify_play', description: 'Play a matching Spotify result.' }],
+        execute: async (name, args) => { executions.push({ name, args }); return { success: true }; },
+        logger: () => {},
+    });
+    try {
+        const answers = [];
+        for (const [message] of scenarios) answers.push(await agent.run(message, 'typed'));
+        assert.deepEqual(executions, [{ name: 'spotify_play', args: { query: 'música tranquila', type: 'track' } }]);
+        assert.equal(requests.length, 10, 'the explicit Spotify request completes without extra model calls');
+        assert.match(answers[9], /Spotify|música|reprodu/u);
+        assert.ok(requests.every(request => request.instructions.includes('INICIATIVA Y AUTORIZACIÓN:')));
+    } finally {
+        await agent.close();
+    }
+});

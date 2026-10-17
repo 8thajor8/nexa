@@ -97,7 +97,9 @@ export function validateTemporalInterval(start, end, path = 'temporal') {
     if (start !== null && end !== null) requireValue(temporalRange(start)[0] < temporalRange(end)[1], path);
 }
 function assertion(value, path) {
-    assertExactObject(value, ['id', 'kind', 'subject', 'predicate', 'object', 'status', 'valid_from', 'valid_to', 'recorded_at', 'supersedes', 'compatibility'], path);
+    const baseKeys = ['id', 'kind', 'subject', 'predicate', 'object', 'status', 'valid_from', 'valid_to', 'recorded_at', 'supersedes', 'compatibility'];
+    const keys = Object.hasOwn(value ?? {}, 'relationship_type') ? [...baseKeys, 'relationship_type'] : baseKeys;
+    assertExactObject(value, keys, path);
     validateId(value.id, 'assertions', path + '.id');
     requireValue(['fact', 'preference', 'legacy'].includes(value.kind), path + '.kind');
     const subjectType = Object.getOwnPropertyDescriptor(value.subject ?? {}, 'type')?.value;
@@ -122,7 +124,13 @@ function assertion(value, path) {
         requireValue(value.subject.type === 'entity', path + '.subject');
         if (!relationPredicate.allowSelf) requireValue(value.subject.id !== value.object.id, path + '.object.id');
         if (relationPredicate.symmetric) requireValue(value.subject.id < value.object.id, path + '.subject.id');
+        if (relationPredicate.requiresRelationshipType) {
+            validateRelationshipType(value.relationship_type, path + '.relationship_type');
+        } else {
+            requireValue(value.relationship_type === undefined, path + '.relationship_type');
+        }
     } else {
+        requireValue(value.relationship_type === undefined, path + '.relationship_type');
         assertExactObject(value.object, ['type', 'value'], path + '.object');
         requireValue(value.object.type === 'text', path + '.object.type');
         text(value.object.value, 1, 4000, path + '.object.value');
@@ -145,6 +153,20 @@ function assertion(value, path) {
         requireValue(COMPATIBILITY_CATEGORIES.includes(value.compatibility.category), path + '.compatibility.category');
         text(value.compatibility.key, 1, 128, path + '.compatibility.key');
     }
+}
+
+const RELATIONSHIP_TYPE_CATEGORIES = Object.freeze(['family', 'partner', 'friend', 'professional', 'other']);
+const RELATIONSHIP_TYPE_LABEL = /^(?=.{1,80}$)[\p{L}]+(?:[ '-][\p{L}]+){0,5}$/u;
+const INADMISSIBLE_RELATIONSHIP_LABEL = /\b(?:mi|mis|tu|tus|su|sus|y|que|es|era|fue|persona|historia|instrucci[oó]n|ignora|ignore|ejecuta|guarda|borra|env[ií]a|revela|debes|deber[ií]as|contrase[nñ]a|password|diagn[oó]stico|direcci[oó]n|tel[eé]fono|tarjeta|cr[eé]dito|secreto)\b/iu;
+
+export function validateRelationshipType(value, path = 'relationship_type') {
+    assertExactObject(value, ['category', 'label'], path);
+    requireValue(RELATIONSHIP_TYPE_CATEGORIES.includes(value.category), path + '.category');
+    requireValue(typeof value.label === 'string' && value.label === value.label.normalize('NFC').trim()
+        && value.label === value.label.replace(/\s+/gu, ' ')
+        && value.label === value.label.toLocaleLowerCase('es')
+        && RELATIONSHIP_TYPE_LABEL.test(value.label), path + '.label');
+    requireValue(!INADMISSIBLE_RELATIONSHIP_LABEL.test(value.label), path + '.label');
 }
 function entity(value, path) {
     assertExactObject(value, ['id', 'type', 'created_at'], path);
@@ -275,8 +297,10 @@ export function validateMemoryStore(store) {
         const relation = getRelationPredicate(record.predicate);
         if (relation) {
             requireValue(entities.get(record.object.id)?.type === record.object.entity_type, 'store.assertions[' + i + '].object');
+            if (relation.ownerSubject) requireValue(record.subject.id === store.self_person_id, 'store.assertions[' + i + '].subject');
             if (record.status === 'active') {
-                const key = JSON.stringify([record.predicate, record.subject.id, record.object.id, record.valid_from, record.valid_to]);
+                const key = JSON.stringify([record.predicate, record.relationship_type ?? null,
+                    record.subject.id, record.object.id, record.valid_from, record.valid_to]);
                 requireValue(!activeRelations.has(key), 'store.assertions[' + i + ']');
                 activeRelations.add(key);
             }

@@ -11,11 +11,12 @@ import { ORGANIC_PILOT_SENTINEL, createSyntheticOrganicPilotSession,
   isApprovedOrganicPilotPath, isApprovedOrganicPilotSnapshot } from "../src/main/organic-memory-pilot";
 
 const organicTool = "propose_organic_memory_facts";
+const verifierTool = "verify_organic_memory_facts";
 const roots: string[] = [];
 
 function fact(sourceQuote: string, attribute: string, value: string) {
   return { sourceQuote, attribute, value, confidence: "high", certainty: "explicit", subject: "owner",
-    temporal: "current", sensitivity: "none", ambiguous: false, thirdParty: false,
+    temporal: "current", validity: "current", priorAssertionId: "", sensitivity: "none", ambiguous: false, thirdParty: false,
     hypothetical: false, futureIntent: false };
 }
 
@@ -57,9 +58,49 @@ function modelStub(proposals: Map<string, unknown[]>, requests: any[]) {
   return async (request: any) => {
     requests.push(request);
     const userText = [...(request.input ?? [])].reverse().find((item: any) => item?.role === "user")?.content ?? "";
+    if (request.tools?.some((tool: any) => tool.name === verifierTool)) {
+      const encoded = (request.input ?? []).find((item: any) => item?.role === "user" && typeof item.content === "string")?.content ?? "{}";
+      const verification = JSON.parse(encoded);
+      const proposed = proposals.get(verification.currentUserMessage) ?? [];
+      return { status: "completed", output: [{ type: "function_call", name: verifierTool, call_id: randomUUID(),
+        arguments: JSON.stringify({ decisions: verification.candidates.map((candidate: any, candidateIndex: number) => {
+          const matches = proposed.some((fact: any) => fact.sourceQuote === candidate.quote
+            && fact.value === candidate.proposedFact && fact.attribute === candidate.topicKey);
+          const source = proposed.find((fact: any) => fact.sourceQuote === candidate.quote
+            && fact.value === candidate.proposedFact && fact.attribute === candidate.topicKey);
+          const checks = { supported: matches, explicit: source?.certainty === "explicit" && source?.hypothetical === false,
+            subjectMatches: source?.subject === "owner", temporalMatches: ["current", "past", "future", "hypothetical", "unknown"]
+              .includes(candidate.eventTime), nonSensitive: source?.sensitivity === "none", unambiguous: source?.ambiguous === false };
+          return { candidateIndex, decision: Object.values(checks).every(Boolean) ? "approved" : "rejected", ...checks,
+            correctedValue: "", correctedAttribute: "", correctedTemporal: candidate.eventTime,
+            correctedValidity: candidate.validity };
+        }) }) }], output_text: "" };
+    }
     if (!awaitingFinal && request.tools?.some((tool: any) => tool.name === organicTool) && proposals.has(userText)) {
       awaitingFinal = true;
-      return toolResponse(proposals.get(userText)!);
+      const antecedents: any[] = [];
+      for (const item of request.input ?? []) {
+        if (item?.role === "user" && typeof item.content === "string") {
+          const encoded = item.content.match(/(\[[\s\S]*\])\s*$/u)?.[1];
+          if (encoded) {
+            try {
+              const parsed = JSON.parse(encoded);
+              if (Array.isArray(parsed)) antecedents.push(...parsed);
+            } catch { /* Ignore unrelated user-provided JSON. */ }
+          }
+        }
+        if (item?.type !== "function_call_output" || typeof item.output !== "string") continue;
+        try {
+          const payload = JSON.parse(item.output);
+          if (Array.isArray(payload?.assertions)) antecedents.push(...payload.assertions);
+        } catch { /* Ignore non-Memory2 fixture outputs. */ }
+      }
+      const facts = proposals.get(userText)!.map((candidate: any) => {
+        const prior = antecedents.find(assertion => assertion.status === "active"
+          && assertion.compatibility?.key === candidate.attribute && assertion.subject?.type === "owner");
+        return prior ? { ...candidate, priorAssertionId: prior.id, priorStatement: prior.object?.value ?? "" } : candidate;
+      });
+      return toolResponse(facts);
     }
     if (awaitingFinal) { awaitingFinal = false; return finalResponse(); }
     if (userText.includes("editor")) return finalResponse("Tu editor habitual es Windsurf y preferís Zed para experimentar.");
@@ -79,12 +120,14 @@ async function withPilot(callback: (session: any) => Promise<void>, { grantConse
     const paths = await createSeedStore(root);
     expect(isApprovedOrganicPilotSnapshot(JSON.parse(await readFile(paths.storePath, "utf8")))).toBe(true);
     const requests: any[] = [];
+    const diagnostics: any[] = [];
     const proposals = new Map<string, unknown[]>();
     const repositoryFactory = injectedRepositoryFactory ?? ((options: any) => createJsonMemoryRepository(options));
     pilot = await createSyntheticOrganicPilotSession({ ...paths, grantConsent, now,
       repositoryFactory,
+      agentOptions: { logger: (event: string, details: Record<string, unknown>) => diagnostics.push({ event, ...details }) },
       ask: modelStub(proposals, requests) });
-    await callback({ ...pilot, ...paths, requests, proposals });
+    await callback({ ...pilot, ...paths, requests, proposals, diagnostics });
   } finally {
     await pilot?.close();
     await rm(root, { recursive: true, force: true });
@@ -129,23 +172,31 @@ describe("synthetic organic Memory2 pilot composition", () => {
 
   it("writes and updates synthetic preferences, then retrieves them in a fresh conversation without prior history", async () => {
     let clock = Date.now();
-    await withPilot(async ({ runtime, readStoreSnapshot, proposals, requests }) => {
+    await withPilot(async ({ runtime, readStoreSnapshot, proposals, requests, diagnostics }) => {
       const conversation = runtime.createConversation();
       const first = "Últimamente uso Cursor todos los días para trabajar. Zed me gusta para experimentar.";
-      proposals.set(first, [fact("Últimamente uso Cursor todos los días para trabajar", "editor.habitual", "Cursor"),
+      const initialSnapshot = (await readStoreSnapshot()).snapshot;
+      const seededHabit = initialSnapshot.assertions.find((item: any) => item.compatibility?.key === "editor.habitual");
+      proposals.set(first, [{ ...fact("Últimamente uso Cursor todos los días para trabajar", "editor.habitual", "Cursor"),
+        priorAssertionId: seededHabit.id, priorStatement: seededHabit.object.value },
         fact("Zed me gusta para experimentar", "editor.testing_favorite", "Zed")]);
       expect((await send(runtime, conversation, "pilot-first", first)).status).toBe("completed");
       clock += 61_000;
       const update = "Ahora uso Windsurf como editor habitual.";
-      proposals.set(update, [fact(update, "editor.habitual", "Windsurf")]);
+      const afterFirstSnapshot = (await readStoreSnapshot()).snapshot;
+      const activeHabit = afterFirstSnapshot.assertions.find((item: any) => item.compatibility?.key === "editor.habitual"
+        && item.status === "active");
+      proposals.set(update, [{ ...fact(update, "editor.habitual", "Windsurf"),
+        priorAssertionId: activeHabit.id, priorStatement: activeHabit.object.value }]);
       expect((await send(runtime, conversation, "pilot-update", update)).status).toBe("completed");
       const snapshot = (await readStoreSnapshot()).snapshot;
       const habitual = snapshot.assertions.filter((item: any) => item.compatibility?.key === "editor.habitual");
       expect(habitual.filter((item: any) => item.status === "active")).toHaveLength(1);
-      expect(habitual.find((item: any) => item.status === "active").object.value).toBe("Mi editor habitual es Windsurf.");
+      expect(habitual.find((item: any) => item.status === "active").object.value,
+        JSON.stringify(diagnostics.filter((item: any) => item.event.startsWith("organic_memory")))).toBe("Windsurf");
       expect(habitual.find((item: any) => item.status === "superseded").object.value).toBe(ORGANIC_PILOT_SENTINEL);
       expect(snapshot.assertions.find((item: any) => item.compatibility?.key === "editor.testing_favorite")?.object.value)
-        .toBe("Mi editor favorito para hacer pruebas es Zed.");
+        .toBe("Zed");
 
       const revision = snapshot.revision;
       const nextConversation = runtime.createConversation();
@@ -155,9 +206,12 @@ describe("synthetic organic Memory2 pilot composition", () => {
       expect(response.text).toContain("Zed");
       expect((await readStoreSnapshot()).snapshot.revision).toBe(revision);
       const context = requests.flatMap(request => request.input ?? []).find((item: any) => item?.type === "function_call_output"
-        && typeof item.output === "string" && item.output.includes("Mi editor habitual es Windsurf."));
+        && typeof item.output === "string" && item.output.includes('"value":"Windsurf"'));
       expect(context).toBeDefined();
-      expect(requests.every(request => (request.tools ?? []).every((tool: any) => tool.name === organicTool))).toBe(true);
+      expect(requests.every(request => (request.tools ?? []).every((tool: any) =>
+        [organicTool, verifierTool, "search_memory2", "search_conversation_history", "compose_memory_history_answer",
+          "interpret_memory_intent", "verify_organic_relationship_evidence"].includes(tool.name))), JSON.stringify(requests.map(request =>
+            (request.tools ?? []).map((tool: any) => tool.name)))).toBe(true);
     }, { now: () => clock });
   });
 
@@ -199,11 +253,15 @@ describe("synthetic organic Memory2 pilot composition", () => {
     }, { repositoryFactory: failingFactory });
   });
 
-  it("offers no tools beyond the organic proposal and host evidence cannot be model-issued", async () => {
+  it("offers only built-in Memory2 tools and host evidence cannot be model-issued", async () => {
     await withPilot(async ({ runtime, host, requests }) => {
       const conversation = runtime.createConversation();
       expect((await send(runtime, conversation, "pilot-tools", "Hola Nexa.")).status).toBe("completed");
-      expect(requests.every(request => (request.tools ?? []).every((tool: any) => tool.name === organicTool))).toBe(true);
+      const internalMemoryTools = [organicTool, verifierTool, "search_memory2", "search_conversation_history",
+        "compose_memory_history_answer", "interpret_memory_intent", "verify_organic_relationship_evidence"];
+      const offeredTools = requests.map(request => (request.tools ?? []).map((tool: any) => tool.name));
+      expect(requests.every(request => (request.tools ?? []).every((tool: any) => internalMemoryTools.includes(tool.name))),
+        JSON.stringify(offeredTools)).toBe(true);
       expect(host.evidenceCapabilityFactory({ origin: "direct_user", subject: "owner", explicit: true,
         certain: true, sensitive: false, ambiguous: false, thirdParty: false, modelOriginated: true,
         attribute: "editor.habitual", operation: "remember", sourceQuote: "uso Cursor", userMessage: "uso Cursor",

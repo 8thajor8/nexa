@@ -1,8 +1,10 @@
 import { ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from "electron";
 import {
-  MEMORY_MODE_GET_CHANNEL, MEMORY_MODE_SET_CHANNEL,
+  MEMORY_MODE_GET_CHANNEL, MEMORY_MODE_SET_CHANNEL, MEMORY_RELATIONSHIP_LEARNING_SET_CHANNEL,
+  MEMORY_THIRD_PARTY_LEARNING_SET_CHANNEL,
+  MEMORY_CLEAR_ALL_CHANNEL,
   isDesktopMemoryMode, type DesktopMemoryMode, type DesktopMemoryModeResult,
-  type DesktopMemoryModeStatus,
+  type DesktopMemoryModeStatus, type DesktopMemoryClearResult,
 } from "../shared/ipc-contract.js";
 import { isTrustedIpcSender } from "../shared/ipc-security.js";
 import type { MemoryModeFallbackReason } from "./memory-mode-preferences.js";
@@ -10,7 +12,8 @@ import type { MemoryModeFallbackReason } from "./memory-mode-preferences.js";
 const SYNTHETIC_EDITOR_FACT = "El usuario ficticio prefiere VS Code como editor de código.";
 const SYNTHETIC_EDITOR_QUERY = "¿Qué editor de código prefiero?";
 
-export interface MemoryModeRuntime { close(): Promise<void>; getMemoryMode?(): string; }
+export interface MemoryModeRuntime { close(): Promise<void>; getMemoryMode?(): string; clearAllMemory?(): Promise<boolean>; setRelationshipLearningEnabled?(enabled: boolean): boolean;
+  setThirdPartyLearningEnabled?(enabled: boolean): boolean; }
 export interface MemoryModeReader {
   readContext(options: { message: string }): Promise<{ items: Array<{ type: string; output?: string }> }>;
   close(): Promise<void>;
@@ -61,6 +64,7 @@ export function registerMemoryModeIpcHandlers({
   resolveStorePath,
   resolveWriteStorePath,
   prepareWriteStore,
+  clearMemoryStore,
   openReader,
   beginRuntimeSwitch,
   refreshRuntimeAfterSwitch,
@@ -68,6 +72,7 @@ export function registerMemoryModeIpcHandlers({
   initialMode = "memory2-confirmed-write",
   initialFallbackReason = null,
   preferencesStore,
+  relationshipPreferencesStore,
   ipc = ipcMain,
 }: {
   getWindow: () => BrowserWindow | null;
@@ -77,6 +82,7 @@ export function registerMemoryModeIpcHandlers({
   resolveStorePath: () => string | null;
   resolveWriteStorePath: () => string | null;
   prepareWriteStore: (storePath: string) => Promise<void>;
+  clearMemoryStore: () => Promise<boolean>;
   openReader: (options: { storePath: string }) => Promise<MemoryModeReader>;
   beginRuntimeSwitch: () => boolean;
   refreshRuntimeAfterSwitch: () => void;
@@ -84,6 +90,8 @@ export function registerMemoryModeIpcHandlers({
   initialMode?: DesktopMemoryMode;
   initialFallbackReason?: MemoryModeFallbackReason;
   preferencesStore?: { write(mode: DesktopMemoryMode): void };
+  relationshipPreferencesStore?: { readRelationshipLearningEnabled(): boolean; writeRelationshipLearningEnabled(enabled: boolean): void;
+    readThirdPartyLearningEnabled(): boolean; writeThirdPartyLearningEnabled(enabled: boolean): void };
   ipc?: MemoryModeIpc;
 }) {
   let mode: DesktopMemoryMode = initialMode;
@@ -95,10 +103,19 @@ export function registerMemoryModeIpcHandlers({
       mode: isDesktopMemoryMode(runtimeMode) ? runtimeMode : mode,
       memory2Available: await isApprovedSyntheticStore(resolveStorePath(), openReader),
       memory2WriteAvailable: Boolean(resolveWriteStorePath()), switching, fallbackReason,
+      relationshipLearningEnabled: relationshipPreferencesStore?.readRelationshipLearningEnabled() ?? false,
+      relationshipLearningEffective: (relationshipPreferencesStore?.readRelationshipLearningEnabled() ?? false)
+        && (isDesktopMemoryMode(runtimeMode) ? runtimeMode : mode) === "memory2-confirmed-write",
+      thirdPartyLearningEnabled: relationshipPreferencesStore?.readThirdPartyLearningEnabled() ?? true,
+      thirdPartyLearningEffective: (relationshipPreferencesStore?.readThirdPartyLearningEnabled() ?? true)
+        && (isDesktopMemoryMode(runtimeMode) ? runtimeMode : mode) === "memory2-confirmed-write",
     };
   };
   ipc.removeHandler(MEMORY_MODE_GET_CHANNEL);
   ipc.removeHandler(MEMORY_MODE_SET_CHANNEL);
+  ipc.removeHandler(MEMORY_RELATIONSHIP_LEARNING_SET_CHANNEL);
+  ipc.removeHandler(MEMORY_THIRD_PARTY_LEARNING_SET_CHANNEL);
+  ipc.removeHandler(MEMORY_CLEAR_ALL_CHANNEL);
   ipc.handle(MEMORY_MODE_GET_CHANNEL, async event => {
     const window = getWindow();
     if (!window || !isTrustedIpcSender(event as never, window as never)) throw new Error("untrusted_ipc_sender");
@@ -175,8 +192,76 @@ export function registerMemoryModeIpcHandlers({
       endRuntimeSwitch();
     }
   });
+  ipc.handle(MEMORY_RELATIONSHIP_LEARNING_SET_CHANNEL, async (event, value) => {
+    const window = getWindow();
+    if (!window || !isTrustedIpcSender(event as never, window as never)) throw new Error("untrusted_ipc_sender");
+    if (switching) return { ok: false, error: "busy" } satisfies DesktopMemoryModeResult;
+    if (typeof value !== "boolean" || !relationshipPreferencesStore)
+      return { ok: false, error: "operation_failed" } satisfies DesktopMemoryModeResult;
+    const runtime = getRuntime();
+    const runtimeMode = runtime?.getMemoryMode?.();
+    const effective = (isDesktopMemoryMode(runtimeMode) ? runtimeMode : mode) === "memory2-confirmed-write";
+    const previous = relationshipPreferencesStore.readRelationshipLearningEnabled();
+    try {
+      if (effective && (!runtime || typeof runtime.setRelationshipLearningEnabled !== "function"))
+        return { ok: false, error: "operation_failed" } satisfies DesktopMemoryModeResult;
+      if (effective) runtime?.setRelationshipLearningEnabled?.(value);
+      relationshipPreferencesStore.writeRelationshipLearningEnabled(value);
+      return { ok: true, status: await status() } satisfies DesktopMemoryModeResult;
+    } catch {
+      if (effective) try { runtime?.setRelationshipLearningEnabled?.(previous); } catch { /* Fail closed if rollback fails. */ }
+      return { ok: false, error: "operation_failed" } satisfies DesktopMemoryModeResult;
+    }
+  });
+  ipc.handle(MEMORY_THIRD_PARTY_LEARNING_SET_CHANNEL, async (event, value) => {
+    const window = getWindow();
+    if (!window || !isTrustedIpcSender(event as never, window as never)) throw new Error("untrusted_ipc_sender");
+    if (switching) return { ok: false, error: "busy" } satisfies DesktopMemoryModeResult;
+    if (typeof value !== "boolean" || !relationshipPreferencesStore)
+      return { ok: false, error: "operation_failed" } satisfies DesktopMemoryModeResult;
+    const runtime = getRuntime();
+    const runtimeMode = runtime?.getMemoryMode?.();
+    const effective = (isDesktopMemoryMode(runtimeMode) ? runtimeMode : mode) === "memory2-confirmed-write";
+    const previous = relationshipPreferencesStore.readThirdPartyLearningEnabled();
+    try {
+      if (effective && (!runtime || typeof runtime.setThirdPartyLearningEnabled !== "function"))
+        return { ok: false, error: "operation_failed" } satisfies DesktopMemoryModeResult;
+      if (effective) runtime?.setThirdPartyLearningEnabled?.(value);
+      relationshipPreferencesStore.writeThirdPartyLearningEnabled(value);
+      return { ok: true, status: await status() } satisfies DesktopMemoryModeResult;
+    } catch {
+      if (effective) try { runtime?.setThirdPartyLearningEnabled?.(previous); } catch { /* Fail closed if rollback fails. */ }
+      return { ok: false, error: "operation_failed" } satisfies DesktopMemoryModeResult;
+    }
+  });
+  ipc.handle(MEMORY_CLEAR_ALL_CHANNEL, async (event, value): Promise<DesktopMemoryClearResult> => {
+    const window = getWindow();
+    if (!window || !isTrustedIpcSender(event as never, window as never)) throw new Error("untrusted_ipc_sender");
+    if (value !== undefined || switching) return { ok: false, error: "busy" };
+    const runtime = getRuntime();
+    const runtimeMode = runtime?.getMemoryMode?.();
+    if (!resolveWriteStorePath()) return { ok: false, error: "memory2_write_unavailable" };
+    if (!beginRuntimeSwitch()) return { ok: false, error: "busy" };
+    switching = true;
+    try {
+      const cleared = runtimeMode === "memory2-confirmed-write"
+        ? typeof runtime?.clearAllMemory === "function" && await runtime.clearAllMemory()
+        : await clearMemoryStore();
+      return cleared
+        ? { ok: true }
+        : { ok: false, error: "operation_failed" };
+    } catch {
+      return { ok: false, error: "operation_failed" };
+    } finally {
+      switching = false;
+      endRuntimeSwitch();
+    }
+  });
   return () => {
     ipc.removeHandler(MEMORY_MODE_GET_CHANNEL);
     ipc.removeHandler(MEMORY_MODE_SET_CHANNEL);
+    ipc.removeHandler(MEMORY_RELATIONSHIP_LEARNING_SET_CHANNEL);
+    ipc.removeHandler(MEMORY_THIRD_PARTY_LEARNING_SET_CHANNEL);
+    ipc.removeHandler(MEMORY_CLEAR_ALL_CHANNEL);
   };
 }

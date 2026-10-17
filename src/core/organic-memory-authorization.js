@@ -1,9 +1,52 @@
 const ALLOWED_SCOPES = new Set(['daily_preferences', 'tool_preferences', 'technologies_used', 'declared_projects',
     'entertainment_preferences', 'food_activity_preferences', 'interaction_preferences', 'daily_routines',
-    'work_patterns', 'recurring_activities', 'active_projects', 'interests', 'goals']);
-const ALLOWED_OPERATIONS = new Set(['remember', 'update']);
+    'work_patterns', 'recurring_activities', 'active_projects', 'interests', 'goals', 'personal_relationships',
+    'biography', 'hobbies', 'decisions', 'third_party_facts', 'everyday_facts']);
+export const ORGANIC_THIRD_PARTY_SCOPE = 'third_party_facts';
+const ALLOWED_OPERATIONS = new Set(['remember', 'update', 'remember_relationship']);
+export const ORGANIC_RELATIONSHIP_SCOPE = 'personal_relationships';
+export const ORGANIC_RELATIONSHIP_ATTRIBUTE = 'relationship.partner';
+// Reserved for the future verified semantic extractor; no production issuer
+// currently mints evidence for this attribute.
+export const ORGANIC_TYPED_RELATIONSHIP_ATTRIBUTE = 'relationship.personal';
+const ORGANIC_RELATIONSHIP_ATTRIBUTES = new Set([ORGANIC_RELATIONSHIP_ATTRIBUTE, ORGANIC_TYPED_RELATIONSHIP_ATTRIBUTE]);
+
+/** Accept only a direct, narrowly phrased owner statement; not a third-party relation or inference. */
+export function parseDirectOwnerPartnerStatement(quote) {
+    if (typeof quote !== 'string' || quote.length > 300 || /[\p{Cc}\p{Cf}]/u.test(quote)) return null;
+    const patterns = [
+        /^\s*(.+?)\s+es\s+mi\s+pareja\s*[.!]?\s*$/iu,
+        /^\s*mi\s+pareja\s+es\s+(.+?)\s*[.!]?\s*$/iu,
+        /^\s*mi\s+pareja\s+se\s+llama\s+(.+?)\s*[.!]?\s*$/iu,
+        /^\s*soy\s+pareja\s+de\s+(.+?)\s*[.!]?\s*$/iu,
+    ];
+    for (const pattern of patterns) {
+        const match = pattern.exec(quote);
+        if (!match) continue;
+        const preferredName = match[1].trim();
+        try {
+            if (preferredName && [...preferredName].length <= 120 && normalizeOrganicName(preferredName))
+                return Object.freeze({ preferredName });
+        } catch { return null; }
+    }
+    return null;
+}
+
+function normalizeOrganicName(value) {
+    return value.normalize('NFC').trim().replace(/\s+/gu, ' ').toLowerCase().normalize('NFC');
+}
 
 const ATTRIBUTE_GROUPS = Object.freeze({
+    general: Object.freeze({ scope: 'everyday_facts', kind: 'fact', category: 'fact', predicate: 'personal.fact',
+        render: (_key, value) => value }),
+    biography: Object.freeze({ scope: 'biography', kind: 'fact', category: 'fact', predicate: 'user.biography',
+        render: (_key, value) => `Mi ocupación es ${value}.` }),
+    hobby: Object.freeze({ scope: 'hobbies', kind: 'fact', category: 'fact', predicate: 'user.hobby',
+        render: (key, value) => key.startsWith('hobby.instrument_') ? `Toco ${value}.` : `Practico ${value}.` }),
+    practice: Object.freeze({ scope: 'hobbies', kind: 'fact', category: 'fact', predicate: 'user.practice',
+        render: (_key, value) => `Practico ${value}.` }),
+    decision: Object.freeze({ scope: 'decisions', kind: 'fact', category: 'project', predicate: 'user.decision',
+        render: (_key, value) => `Decidí ${value}.` }),
     editor: Object.freeze({ scope: 'tool_preferences', kind: 'preference', category: 'preference', predicate: 'user.preference',
         render: (key, value) => key === 'editor.habitual' ? `Mi editor habitual es ${value}.`
             : key === 'editor.testing_favorite' ? `Mi editor favorito para hacer pruebas es ${value}.`
@@ -17,7 +60,8 @@ const ATTRIBUTE_GROUPS = Object.freeze({
     entertainment: Object.freeze({ scope: 'entertainment_preferences', kind: 'preference', category: 'preference', predicate: 'user.preference',
         render: (_key, value) => `Mi preferencia de entretenimiento es ${value}.` }),
     food: Object.freeze({ scope: 'food_activity_preferences', kind: 'preference', category: 'preference', predicate: 'user.preference',
-        render: (_key, value) => `Mi preferencia de comida es ${value}.` }),
+        render: (key, value) => key === 'food.beverage_favorite' ? `Mi bebida favorita es ${value}.`
+            : `Mi preferencia de comida es ${value}.` }),
     activity: Object.freeze({ scope: 'food_activity_preferences', kind: 'preference', category: 'preference', predicate: 'user.preference',
         render: (_key, value) => `Mi actividad preferida es ${value}.` }),
     interaction: Object.freeze({ scope: 'interaction_preferences', kind: 'preference', category: 'preference', predicate: 'user.preference',
@@ -39,10 +83,15 @@ const ATTRIBUTE_GROUPS = Object.freeze({
 /** Bounded attribute namespaces shared by Runtime and the trusted Desktop host. */
 export function getOrganicMemoryAttributePolicy(attribute) {
     if (typeof attribute !== 'string' || attribute.length > 96
-        || !/^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*){1,3}$/u.test(attribute)) return null;
+        || !/^\p{L}[\p{L}\p{N}_-]*(?:\.\p{L}[\p{L}\p{N}_-]*){1,3}$/u.test(attribute)) return null;
     const namespace = attribute.split('.')[0];
-    const group = Object.hasOwn(ATTRIBUTE_GROUPS, namespace) ? ATTRIBUTE_GROUPS[namespace] : null;
-    if (!group) return null;
+    // Relationship facts have a dedicated consent scope and typed graph write
+    // path. They must never fall through to the generic everyday-facts scope.
+    if (namespace === 'relationship') return null;
+    // The namespace remains a bounded storage key for compatibility, not a
+    // vocabulary gate. Previously unseen semantic topics use the generic fact
+    // representation and the existing everyday-facts consent scope.
+    const group = Object.hasOwn(ATTRIBUTE_GROUPS, namespace) ? ATTRIBUTE_GROUPS[namespace] : ATTRIBUTE_GROUPS.general;
     return Object.freeze({ ...group, key: attribute, scope: group.scope, category: group.category,
         predicate: group.predicate, render: (value) => group.render(attribute, value) });
 }
@@ -51,10 +100,14 @@ function denied(reason, scope = null) {
     return Object.freeze({ allowed: false, status: 'denied', scope, authorizationId: null, reason });
 }
 
-function eligibleEvidence(evidence, attribute, ownerId = null) {
-    return Boolean(evidence && evidence.origin === 'direct_user' && evidence.subject === 'owner'
+function eligibleEvidence(evidence, attribute, ownerId = null, scope = null) {
+    const thirdParty = scope === ORGANIC_THIRD_PARTY_SCOPE;
+    return Boolean(evidence && evidence.origin === 'direct_user'
+        && evidence.subject === (thirdParty ? 'third_party' : 'owner')
         && evidence.explicit === true && evidence.certain === true && evidence.sensitive === false
-        && evidence.ambiguous === false && evidence.thirdParty === false && evidence.modelOriginated === false
+        && evidence.ambiguous === false && evidence.thirdParty === thirdParty && evidence.modelOriginated === false
+        && (!thirdParty || (typeof evidence.subjectName === 'string' && evidence.subjectName.length > 0
+            && evidence.proposal?.subject?.type === 'entity' && evidence.proposal.subject.entity_type === 'person'))
         && evidence.attribute === attribute && (ownerId === null || evidence.ownerId === ownerId));
 }
 
@@ -172,7 +225,10 @@ export function createOrganicMemoryAuthorization({
             ? 'synthetic_store_required' : 'organic_store_not_authorized', input?.scope ?? null);
         if (!exactDataRecord(input, ['scope', 'operation', 'attribute', 'evidenceCapability']))
             return denied('authorization_input_invalid');
-        if (!ALLOWED_SCOPES.has(input.scope) || !ALLOWED_OPERATIONS.has(input.operation) || !validKey(input.attribute))
+        if (!ALLOWED_SCOPES.has(input.scope) || !ALLOWED_OPERATIONS.has(input.operation) || !validKey(input.attribute)
+            || (input.operation === 'remember_relationship'
+                && (input.scope !== ORGANIC_RELATIONSHIP_SCOPE || !ORGANIC_RELATIONSHIP_ATTRIBUTES.has(input.attribute)))
+            || (input.scope === ORGANIC_RELATIONSHIP_SCOPE && input.operation !== 'remember_relationship'))
             return denied('operation_out_of_scope', input.scope ?? null);
         const current = activeConsent();
         if (current.status !== 'granted') return denied(`consent_${current.status}`, input.scope);
@@ -181,7 +237,7 @@ export function createOrganicMemoryAuthorization({
         let evidence;
         try { evidence = verifyEvidenceCapability(input.evidenceCapability); }
         catch { return denied('evidence_verification_failed', input.scope); }
-        if (!eligibleEvidence(evidence, input.attribute, store.authorizationKind === 'personal' ? store.ownerId : null))
+        if (!eligibleEvidence(evidence, input.attribute, store.authorizationKind === 'personal' ? store.ownerId : null, input.scope))
             return denied('evidence_not_eligible', input.scope);
 
         return Object.freeze({ allowed: true, status: 'granted', scope: input.scope,
@@ -199,7 +255,7 @@ export function createOrganicMemoryAuthorization({
         try { evidence = verifyEvidenceCapability(input.evidenceCapability); }
         catch { evidence = null; }
         const store = verifyStore();
-        if (!eligibleEvidence(evidence, input.attribute, store?.authorizationKind === 'personal' ? store.ownerId : null)) return Object.freeze({ success: false,
+        if (!eligibleEvidence(evidence, input.attribute, store?.authorizationKind === 'personal' ? store.ownerId : null, input.scope)) return Object.freeze({ success: false,
             authorization: denied('evidence_not_eligible', input.scope), error: { code: 'evidence_not_eligible' } });
         try {
             const result = await persist(input, Object.freeze({ scope: authorization.scope,
